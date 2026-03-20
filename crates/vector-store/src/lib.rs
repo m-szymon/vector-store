@@ -77,6 +77,34 @@ use utoipa::openapi::schema::Type;
 use uuid::Uuid;
 pub use vector::Vector;
 
+/// A CQL string literal that is always properly single-quoted when formatted
+/// for use in CQL statements.
+///
+/// The inner value stores the already-quoted form of the string.
+/// The [`Display`](std::fmt::Display) implementation outputs it in single quotes
+/// with embedded single-quote characters escaped by doubling them
+/// (`'` -> `''`), following the CQL grammar for string constants.
+pub(crate) struct CqlLiteral {
+    quoted: String,
+}
+
+impl CqlLiteral {
+    /// Creates a new `CqlLiteral`, preserving the value exactly as given.
+    ///
+    /// The value will be single-quoted when formatted, with any embedded
+    /// single quotes escaped by doubling.
+    pub(crate) fn new(value: impl AsRef<str>) -> Self {
+        let quoted = format!("'{}'", value.as_ref().replace('\'', "''"));
+        Self { quoted }
+    }
+}
+
+impl std::fmt::Display for CqlLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.quoted)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub vector_store_addr: std::net::SocketAddr,

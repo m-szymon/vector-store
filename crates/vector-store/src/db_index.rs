@@ -36,6 +36,7 @@ use scylla::routing::Token;
 use scylla::statement::prepared::PreparedStatement;
 use scylla::value::CqlValue;
 use scylla::value::Row;
+use scylla_cdc::CqlIdentifier;
 use std::collections::HashMap;
 use std::iter;
 use std::num::NonZeroUsize;
@@ -317,12 +318,22 @@ impl Statements {
                 .collect(),
         );
 
-        let st_partition_key_list = table.partition_key.iter().join(", ");
-        let st_primary_key_list = primary_key_columns.iter().join(", ");
+        let st_partition_key_list = table
+            .partition_key
+            .iter()
+            .map(|c| CqlIdentifier::new(c.as_str()))
+            .join(", ");
+        let st_primary_key_list = primary_key_columns
+            .iter()
+            .map(|c| CqlIdentifier::new(c.as_ref()))
+            .join(", ");
+
+        let keyspace_cql = CqlIdentifier::new(metadata.keyspace_name.as_ref());
+        let table_cql = CqlIdentifier::new(metadata.table_name.as_ref());
         let query = index_backend::new(&metadata.keyspace_name, metadata.target_column.clone())
             .range_scan_query(
-                &metadata.keyspace_name,
-                &metadata.table_name,
+                &keyspace_cql,
+                &table_cql,
                 &st_primary_key_list,
                 &st_partition_key_list,
             );
@@ -337,7 +348,6 @@ impl Statements {
 
         Ok(Self {
             primary_key_columns,
-
             table_columns,
             st_range_scan,
             session_rx,
