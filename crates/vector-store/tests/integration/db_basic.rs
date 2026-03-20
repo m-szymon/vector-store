@@ -347,6 +347,7 @@ fn process_db(db: &DbBasic, msg: Db, node_state: Sender<NodeState>) {
             table,
             target_column,
             tx,
+            ..
         } => tx
             .send(Ok(db
                 .0

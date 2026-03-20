@@ -23,6 +23,7 @@ use crate::SpaceType;
 use crate::TableName;
 use crate::db_index;
 use crate::db_index::DbIndex;
+use crate::index_backend;
 use crate::internals::Internals;
 use crate::internals::InternalsExt;
 use crate::node_state::Event;
@@ -46,7 +47,6 @@ use scylla::statement::prepared::PreparedStatement;
 use scylla::value::CqlTimeuuid;
 use secrecy::ExposeSecret;
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tap::Pipe;
@@ -110,6 +110,7 @@ pub enum Db {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
         tx: oneshot::Sender<GetIndexTargetTypeR>,
     },
 
@@ -152,6 +153,7 @@ pub(crate) trait DbExt {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
     ) -> GetIndexTargetTypeR;
 
     async fn get_index_params(
@@ -205,12 +207,14 @@ impl DbExt for mpsc::Sender<Db> {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
     ) -> GetIndexTargetTypeR {
         let (tx, rx) = oneshot::channel();
         self.send(Db::GetIndexTargetType {
             keyspace,
             table,
             target_column,
+            index,
             tx,
         })
         .await?;
@@ -437,11 +441,12 @@ async fn process(
             keyspace,
             table,
             target_column,
+            index,
             tx,
         } => tx
             .send(
                 statements
-                    .get_index_target_type(keyspace, table, target_column)
+                    .get_index_target_type(keyspace, table, target_column, index)
                     .await,
             )
             .unwrap_or_else(|_| trace!("process: Db::GetIndexTargetType: unable to send response")),
@@ -743,29 +748,27 @@ impl Statements {
         keyspace: KeyspaceName,
         table: TableName,
         target_column: ColumnName,
+        index: IndexName,
     ) -> GetIndexTargetTypeR {
         let session = self
             .session_rx
             .borrow()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-        Ok(session
-            .execute_iter(
-                self.st_get_index_target_type.clone(),
-                (keyspace, table, target_column),
+
+        index_backend::new(&keyspace, target_column)
+            .get_dimensions(
+                &session,
+                &self.st_get_index_target_type,
+                &self.re_get_index_target_type,
+                &self.st_get_index_options,
+                index_backend::IndexLocation {
+                    keyspace,
+                    table,
+                    index,
+                },
             )
-            .await?
-            .rows_stream::<(String,)>()?
-            .try_next()
-            .await?
-            .and_then(|(typ,)| {
-                self.re_get_index_target_type
-                    .captures(&typ)
-                    .and_then(|captures| captures["dimensions"].parse::<usize>().ok())
-            })
-            .and_then(|dimensions| {
-                NonZeroUsize::new(dimensions).map(|dimensions| dimensions.into())
-            }))
+            .await
     }
 
     const ST_GET_INDEX_OPTIONS: &str = "
@@ -1004,6 +1007,7 @@ pub(crate) mod tests {
             keyspace: KeyspaceName,
             table: TableName,
             target_column: ColumnName,
+            index: IndexName,
             tx: oneshot::Sender<GetIndexTargetTypeR>,
         ) -> impl Future<Output = ()> + Send + 'static;
 
@@ -1052,9 +1056,10 @@ pub(crate) mod tests {
                             keyspace,
                             table,
                             target_column,
+                            index,
                             tx,
                         } => {
-                            sim.get_index_target_type(keyspace, table, target_column, tx)
+                            sim.get_index_target_type(keyspace, table, target_column, index, tx)
                                 .await
                         }
 
