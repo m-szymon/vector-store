@@ -8,13 +8,13 @@ use crate::ColumnName;
 use crate::Config;
 use crate::DbEmbedding;
 use crate::IndexMetadata;
-use crate::KeyspaceName;
 use crate::Percentage;
 use crate::Progress;
-use crate::TableName;
 use crate::Timestamp;
+use crate::Vector;
 use crate::db_cdc;
 use crate::db_cdc::CdcReaderConfig;
+use crate::index_backend;
 use crate::internals::Internals;
 use crate::invariant_key::InvariantKey;
 use crate::node_state::Event;
@@ -319,27 +319,27 @@ impl Statements {
 
         let st_partition_key_list = table.partition_key.iter().join(", ");
         let st_primary_key_list = primary_key_columns.iter().join(", ");
+        let query = index_backend::new(&metadata.keyspace_name, metadata.target_column.clone())
+            .range_scan_query(
+                &metadata.keyspace_name,
+                &metadata.table_name,
+                &st_primary_key_list,
+                &st_partition_key_list,
+            );
+        let st_range_scan = session
+            .prepare(query)
+            .await
+            .context("range_scan_query")?
+            .pipe(|mut stmt| {
+                stmt.set_is_idempotent(true);
+                stmt
+            });
 
         Ok(Self {
             primary_key_columns,
 
             table_columns,
-
-            st_range_scan: session
-                .prepare(Self::range_scan_query(
-                    &metadata.keyspace_name,
-                    &metadata.table_name,
-                    &st_primary_key_list,
-                    &st_partition_key_list,
-                    &metadata.target_column,
-                ))
-                .await
-                .context("range_scan_query")?
-                .pipe(|mut stmt| {
-                    stmt.set_is_idempotent(true);
-                    stmt
-                }),
-
+            st_range_scan,
             session_rx,
         })
     }
@@ -350,25 +350,6 @@ impl Statements {
 
     fn get_table_columns(&self) -> GetTableColumnsR {
         self.table_columns.clone()
-    }
-
-    fn range_scan_query(
-        keyspace: &KeyspaceName,
-        table: &TableName,
-        st_primary_key_list: &str,
-        st_partition_key_list: &str,
-        embedding: &ColumnName,
-    ) -> String {
-        format!(
-            "
-            SELECT {st_primary_key_list}, {embedding}, writetime({embedding})
-            FROM {keyspace}.{table}
-            WHERE
-                token({st_partition_key_list}) >= ?
-                AND token({st_partition_key_list}) <= ?
-            BYPASS CACHE
-            "
-        )
     }
 
     async fn preform_range_scan(&self, begin: Token, end: Token) -> RangeScanResult {
@@ -570,24 +551,16 @@ impl Statements {
                 };
                 let timestamp = Timestamp::UNIX_EPOCH + Duration::from_micros(timestamp as u64);
 
-                let Some(CqlValue::Vector(embedding)) = row.columns.pop().unwrap() else {
-                    debug!("range_scan_stream: bad type of an embedding");
+                let Some(embedding_value) = row.columns.pop().unwrap() else {
+                    debug!("range_scan_stream: missing embedding column");
                     return None;
                 };
-                let Ok(embedding) = embedding
-                    .into_iter()
-                    .map(|value| {
-                        let CqlValue::Float(value) = value else {
-                            bail!("range_scan_stream: bad type of an embedding element");
-                        };
-                        Ok(value)
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()
+                let Ok(embedding) = Vector::try_from(embedding_value)
                     .inspect_err(|err| debug!("range_scan_stream: {err}"))
                 else {
                     return None;
                 };
-                let embedding = Some(embedding.into());
+                let embedding = Some(embedding);
 
                 let Ok(primary_key) = row
                     .columns

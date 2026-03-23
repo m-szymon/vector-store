@@ -26,6 +26,7 @@ mod primary_key;
 mod similarity;
 mod table;
 mod timestamp;
+mod vector;
 
 pub use crate::distance::Distance;
 pub use crate::index_key::IndexKey;
@@ -74,6 +75,7 @@ use utoipa::openapi::Schema;
 use utoipa::openapi::SchemaFormat;
 use utoipa::openapi::schema::Type;
 use uuid::Uuid;
+pub use vector::Vector;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -411,25 +413,6 @@ impl FromStr for Quantization {
 
 #[derive(
     Clone,
-    Debug,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    derive_more::AsRef,
-    derive_more::From,
-    utoipa::ToSchema,
-)]
-/// The vector to use for the Approximate Nearest Neighbor search. The format of data must match the data_type of the index.
-pub struct Vector(Vec<f32>);
-
-impl Vector {
-    pub fn dim(&self) -> Option<Dimensions> {
-        NonZeroUsize::new(self.0.len()).map(Dimensions)
-    }
-}
-
-#[derive(
-    Clone,
     serde::Serialize,
     serde::Deserialize,
     derive_more::AsRef,
@@ -545,6 +528,10 @@ pub struct IndexMetadata {
 impl IndexMetadata {
     pub fn key(&self) -> IndexKey {
         IndexKey::new(&self.keyspace_name, &self.index_name)
+    }
+
+    pub(crate) fn backend(&self) -> Box<dyn index_backend::IndexBackend> {
+        index_backend::new(&self.keyspace_name, self.target_column.clone())
     }
 }
 

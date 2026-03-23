@@ -8,6 +8,7 @@ use crate::ColumnName;
 use crate::Config;
 use crate::DbEmbedding;
 use crate::IndexMetadata;
+use crate::index_backend;
 use crate::internals::Internals;
 use crate::internals::InternalsExt;
 use ::time::Date;
@@ -21,7 +22,6 @@ use anyhow::bail;
 use async_trait::async_trait;
 use futures::FutureExt;
 use scylla::client::session::Session;
-use scylla::value::CqlValue;
 use scylla_cdc::consumer::CDCRow;
 use scylla_cdc::consumer::Consumer;
 use scylla_cdc::consumer::ConsumerFactory;
@@ -484,7 +484,7 @@ fn spawn_handler_task(
 
 struct CdcConsumerData {
     primary_key_columns: Vec<ColumnName>,
-    target_column: ColumnName,
+    embedding_source: Box<dyn index_backend::IndexBackend>,
     tx: mpsc::Sender<(DbEmbedding, Option<AsyncInProgress>)>,
     gregorian_epoch: PrimitiveDateTime,
 }
@@ -499,28 +499,16 @@ impl Consumer for CdcConsumer {
             return Ok(());
         }
 
-        let target_column = self.0.target_column.as_ref();
-        if !row.column_deletable(target_column) {
-            bail!("CDC error: target column {target_column} should be deletable");
+        let source = &self.0.embedding_source;
+        let column = source.vector_column_name();
+        if !row.column_deletable(column) {
+            bail!("CDC error: column {column} should be deletable");
         }
-
         let embedding = row
-            .take_value(target_column)
-            .map(|value| {
-                let CqlValue::Vector(value) = value else {
-                    bail!("CDC error: target column {target_column} should be VECTOR type");
-                };
-                value
-                    .into_iter()
-                    .map(|value| {
-                        value.as_float().ok_or(anyhow!(
-                            "CDC error: target column {target_column} should be VECTOR<float> type"
-                        ))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()
-            })
+            .take_value(column)
+            .map(|v| source.extract_vector(v))
             .transpose()?
-            .map(|embedding| embedding.into());
+            .flatten();
 
         let primary_key = self
             .0
@@ -603,9 +591,11 @@ impl CdcConsumerFactory {
             Time::MIDNIGHT,
         );
 
+        let embedding_source = metadata.backend();
+
         Ok(Self(Arc::new(CdcConsumerData {
             primary_key_columns,
-            target_column: metadata.target_column.clone(),
+            embedding_source,
             tx,
             gregorian_epoch,
         })))
