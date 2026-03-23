@@ -146,6 +146,18 @@ pub(crate) async fn new(
     let (tx_index, mut rx_index) = mpsc::channel(CHANNEL_SIZE);
     let (tx_embeddings, rx_embeddings) = mpsc::channel(CHANNEL_SIZE);
 
+    // Wait for initial session to create statements.
+    let mut statements_session_rx = session_rx.clone();
+    while statements_session_rx.borrow().is_none() {
+        if statements_session_rx.changed().await.is_err() {
+            return Err(anyhow::anyhow!(
+                "Session sender dropped before initialization"
+            ));
+        }
+    }
+
+    let statements = Arc::new(Statements::new(statements_session_rx, metadata.clone()).await?);
+
     // Create wide-framed CDC actor
     let cdc_wide = db_cdc::new(
         config_rx.clone(),
@@ -174,18 +186,6 @@ pub(crate) async fn new(
         }
         cdc_error_notify.notify_one();
     });
-
-    // Wait for initial session to create statements
-    let mut statements_session_rx = session_rx.clone();
-    while statements_session_rx.borrow().is_none() {
-        if statements_session_rx.changed().await.is_err() {
-            return Err(anyhow::anyhow!(
-                "Session sender dropped before initialization"
-            ));
-        }
-    }
-
-    let statements = Arc::new(Statements::new(statements_session_rx, metadata.clone()).await?);
 
     // Spawn main task for full scan and message processing
     tokio::spawn(
