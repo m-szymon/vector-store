@@ -865,7 +865,121 @@ fn try_to_json(value: CqlValue) -> anyhow::Result<Value> {
             })?,
         )),
 
+        CqlValue::Blob(value) => {
+            use std::fmt::Write;
+            let mut hex = String::with_capacity(2 + value.len() * 2);
+            hex.push_str("0x");
+            for b in &value {
+                write!(hex, "{b:02x}").expect("writing to String never fails");
+            }
+            Ok(Value::String(hex))
+        }
+
+        CqlValue::Decimal(value) => {
+            // Alternator stores DynamoDB N-typed keys as CQL decimal.
+            // Serialize as a decimal string matching the original DynamoDB number.
+            let (varint_bytes, scale) = value.as_signed_be_bytes_slice_and_exponent();
+            Ok(Value::String(decimal_to_string(varint_bytes, scale)))
+        }
+
         _ => unimplemented!(),
+    }
+}
+
+/// Convert a CQL `varint` (two's-complement big-endian bytes) to a decimal string.
+///
+/// The algorithm:
+/// 1. Treat the bytes as a two's-complement signed big-endian integer.
+/// 2. If negative, negate the value and prepend `"-"`.
+/// 3. Convert the resulting unsigned magnitude to a decimal string by
+///    repeatedly multiplying each digit position by 256 and adding the
+///    next byte (big-endian positional notation in base 256 → base 10).
+fn varint_to_decimal_string(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "0".to_string();
+    }
+
+    // Determine sign and compute the absolute value as a big-endian byte vec.
+    let (negative, magnitude): (bool, Vec<u8>) = if bytes[0] & 0x80 != 0 {
+        // Negative: negate via two's-complement (flip bits, add 1).
+        let mut mag: Vec<u8> = bytes.iter().map(|b| !b).collect();
+        let mut carry = 1u16;
+        for byte in mag.iter_mut().rev() {
+            let sum = u16::from(*byte) + carry;
+            *byte = sum as u8;
+            carry = sum >> 8;
+        }
+        (true, mag)
+    } else {
+        (false, bytes.to_vec())
+    };
+
+    // Convert the big-endian magnitude bytes to a decimal digit array.
+    // `digits` holds base-10 digits, least-significant first.
+    let mut digits: Vec<u8> = vec![0]; // start with 0
+
+    for &byte in &magnitude {
+        // Multiply existing digits by 256 and add the new byte.
+        let mut carry = u32::from(byte);
+        for digit in digits.iter_mut() {
+            let val = u32::from(*digit) * 256 + carry;
+            *digit = (val % 10) as u8;
+            carry = val / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+
+    // Build the string (digits are least-significant first, so reverse).
+    let mut s = String::with_capacity(digits.len() + 1);
+    if negative {
+        s.push('-');
+    }
+    for &d in digits.iter().rev() {
+        s.push((b'0' + d) as char);
+    }
+    s
+}
+
+/// Convert a CQL `decimal` (two's-complement big-endian integer bytes + scale exponent) to a
+/// decimal string.
+///
+/// A CQL decimal is stored as `unscaled_value * 10^(-scale)`.  For integer keys (scale=0) this
+/// is just the integer string.  For non-zero scales, a decimal point is inserted or trailing
+/// zeros are added.
+fn decimal_to_string(varint_bytes: &[u8], scale: i32) -> String {
+    let int_str = varint_to_decimal_string(varint_bytes);
+
+    // Separate sign from digits for decimal-point insertion.
+    let (sign, digits) = if let Some(stripped) = int_str.strip_prefix('-') {
+        ("-", stripped)
+    } else {
+        ("", int_str.as_str())
+    };
+
+    if scale == 0 {
+        // Pure integer — no decimal point needed.
+        return int_str;
+    }
+
+    if scale < 0 {
+        // Negative scale means multiply by 10^|scale| — append zeros.
+        let zeros = "0".repeat((-scale) as usize);
+        return format!("{sign}{digits}{zeros}");
+    }
+
+    // Positive scale: divide by 10^scale — insert decimal point.
+    let scale = scale as usize;
+    if scale >= digits.len() {
+        // Result is "0.000...digits"
+        let leading_zeros = scale - digits.len();
+        format!("{sign}0.{}{digits}", "0".repeat(leading_zeros))
+    } else {
+        // Insert decimal point within the digit string.
+        let (integer_part, fractional_part) = digits.split_at(digits.len() - scale);
+        format!("{sign}{integer_part}.{fractional_part}")
     }
 }
 
@@ -1645,5 +1759,45 @@ mod tests {
             IndexStatus::from(crate::node_state::IndexStatus::Serving),
             IndexStatus::Serving
         );
+    }
+
+    #[test]
+    fn varint_to_decimal_string_converts_correctly() {
+        // Zero
+        assert_eq!(varint_to_decimal_string(&[0x00]), "0");
+        assert_eq!(varint_to_decimal_string(&[]), "0");
+
+        // Positive: 1 → [0x01]
+        assert_eq!(varint_to_decimal_string(&[0x01]), "1");
+
+        // Positive: 127 → [0x7F]
+        assert_eq!(varint_to_decimal_string(&[0x7F]), "127");
+
+        // Positive: 128 needs leading zero byte → [0x00, 0x80]
+        assert_eq!(varint_to_decimal_string(&[0x00, 0x80]), "128");
+
+        // Positive: 1234 → [0x04, 0xD2]
+        assert_eq!(varint_to_decimal_string(&[0x04, 0xD2]), "1234");
+
+        // Positive: 2 → [0x02]
+        assert_eq!(varint_to_decimal_string(&[0x02]), "2");
+
+        // Positive: 3 → [0x03]
+        assert_eq!(varint_to_decimal_string(&[0x03]), "3");
+
+        // Negative: -1 → [0xFF]
+        assert_eq!(varint_to_decimal_string(&[0xFF]), "-1");
+
+        // Negative: -128 → [0x80]
+        assert_eq!(varint_to_decimal_string(&[0x80]), "-128");
+
+        // Negative: -129 → [0xFF, 0x7F]
+        assert_eq!(varint_to_decimal_string(&[0xFF, 0x7F]), "-129");
+
+        // Large positive: 256 → [0x01, 0x00]
+        assert_eq!(varint_to_decimal_string(&[0x01, 0x00]), "256");
+
+        // Large positive: 65535 → [0x00, 0xFF, 0xFF]  (leading zero because MSB would be set)
+        assert_eq!(varint_to_decimal_string(&[0x00, 0xFF, 0xFF]), "65535");
     }
 }

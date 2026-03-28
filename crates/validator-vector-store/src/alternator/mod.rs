@@ -550,18 +550,64 @@ fn av_to_key_string(av: &AttributeValue) -> String {
 ///
 /// The VS HTTP layer serialises key column values as JSON scalars:
 /// - CQL `text` / `ascii` → `Value::String`  → `AttributeValue::S`
+/// - CQL `blob` (DynamoDB `B` key type) → `Value::String` (`"0x<lowercase hex>"`) → `AttributeValue::B`
 /// - CQL `int` / `bigint` / `float` / `double` → `Value::Number` → `AttributeValue::N`
+/// - CQL `decimal` / `varint` (DynamoDB `N` key type) → `Value::String` (decimal string) → `AttributeValue::N`
 ///
-/// CQL `blob` (DynamoDB `B` key type) is not yet serialised by the VS HTTP
-/// layer (`try_to_json` hits `unimplemented!()` for `CqlValue::Blob`); a
-/// test that reaches this path will panic at the server side before this
-/// function is called.
+/// Both `S`-typed and `B`-typed DynamoDB keys arrive as `Value::String`.  The
+/// blob case is distinguished by a `"0x"` prefix, matching the encoding
+/// produced by `try_to_json` in `httproutes.rs` and required by the CQL JSON
+/// layer (`cql3/type_json.cc`) when Alternator calls `from_json_object`.
+///
+/// DynamoDB `N`-typed keys are stored as CQL `decimal` by Alternator, which
+/// `try_to_json` serialises as a decimal number string (e.g. `"1"`, `"2.5"`).
+/// These are detected by `is_decimal_number_string` and mapped to `AttributeValue::N`.
 fn json_value_to_av(v: &serde_json::Value) -> AttributeValue {
     match v {
-        serde_json::Value::String(s) => AttributeValue::S(s.clone()),
+        serde_json::Value::String(s) => {
+            if let Some(hex) = s.strip_prefix("0x") {
+                let bytes: Result<Vec<u8>, _> = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                    .collect();
+                match bytes {
+                    Ok(b) => AttributeValue::B(aws_sdk_dynamodb::primitives::Blob::new(b)),
+                    Err(_) => AttributeValue::S(s.clone()),
+                }
+            } else if is_decimal_number_string(s) {
+                AttributeValue::N(s.clone())
+            } else {
+                AttributeValue::S(s.clone())
+            }
+        }
         serde_json::Value::Number(n) => AttributeValue::N(n.to_string()),
         other => panic!("unexpected ANN key JSON value: {other:?}"),
     }
+}
+
+/// Returns `true` if `s` is a valid decimal number string of the form
+/// optionally signed integer with optional fractional part: `-?[0-9]+(\.[0-9]+)?`.
+///
+/// This is used to detect CQL `decimal`/`varint` values serialised as strings
+/// by `try_to_json`, which should map to DynamoDB `N`-typed `AttributeValue`.
+fn is_decimal_number_string(s: &str) -> bool {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    if s.is_empty() {
+        return false;
+    }
+    let (integer_part, fractional_part) = match s.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (s, None),
+    };
+    if integer_part.is_empty() || !integer_part.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(frac) = fractional_part
+        && (frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    true
 }
 
 /// Creates an Alternator table with the given key schema and optional vector

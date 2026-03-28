@@ -16,6 +16,7 @@ use anyhow::bail;
 use itertools::Itertools;
 use scylla::cluster::metadata::NativeType;
 use scylla::value::CqlDate;
+use scylla::value::CqlDecimal;
 use scylla::value::CqlTime;
 use scylla::value::CqlTimestamp;
 use scylla::value::CqlTimeuuid;
@@ -350,6 +351,7 @@ enum Column {
     Timeuuid(ColumnVec<PrimaryId, TValue<CqlTimeuuid>>),
     TinyInt(ColumnVec<PrimaryId, TValue<i8>>),
     Uuid(ColumnVec<PrimaryId, TValue<Uuid>>),
+    Decimal(ColumnVec<PrimaryId, TValue<CqlDecimal>>),
     PrimaryKey(KeyOffset),
 }
 
@@ -372,6 +374,7 @@ impl Column {
             NativeType::Timeuuid => Self::Timeuuid(ColumnVec::new()),
             NativeType::TinyInt => Self::TinyInt(ColumnVec::new()),
             NativeType::Uuid => Self::Uuid(ColumnVec::new()),
+            NativeType::Decimal => Self::Decimal(ColumnVec::new()),
             _ => bail!("Unsupported native type: {native_type:?}"),
         })
     }
@@ -395,6 +398,7 @@ impl Column {
             Self::Timeuuid(vec) => vec.resize_with(size, || TValue::None(timestamp)),
             Self::TinyInt(vec) => vec.resize_with(size, || TValue::None(timestamp)),
             Self::Uuid(vec) => vec.resize_with(size, || TValue::None(timestamp)),
+            Self::Decimal(vec) => vec.resize_with(size, || TValue::None(timestamp)),
             Self::PrimaryKey(_) => {}
         }
     }
@@ -503,6 +507,12 @@ impl Column {
                 };
                 vec.update(primary_id, TValue::Some(timestamp, value))
             }
+            Self::Decimal(vec) => {
+                let CqlValue::Decimal(value) = value else {
+                    bail!("Failed to convert value to Decimal");
+                };
+                vec.update(primary_id, TValue::Some(timestamp, value))
+            }
             Self::PrimaryKey(_) => bail!("Cannot insert value into PrimaryKey column"),
         }
     }
@@ -593,6 +603,11 @@ impl Column {
                 .and_then(|val| val.get())
                 .cloned()
                 .map(CqlValue::Uuid),
+            Self::Decimal(vec) => vec
+                .get(primary_id)
+                .and_then(|val| val.get())
+                .cloned()
+                .map(CqlValue::Decimal),
             Self::PrimaryKey(key_offset) => primary_keys
                 .get(primary_id)
                 .and_then(|opt_key| opt_key.as_ref())

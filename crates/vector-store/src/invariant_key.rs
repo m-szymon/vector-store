@@ -25,6 +25,7 @@
 
 use scylla::value::Counter;
 use scylla::value::CqlDate;
+use scylla::value::CqlDecimal;
 use scylla::value::CqlTime;
 use scylla::value::CqlTimestamp;
 use scylla::value::CqlTimeuuid;
@@ -62,6 +63,7 @@ const TAG_INET_V4: u8 = 15;
 const TAG_INET_V6: u8 = 16;
 const TAG_COUNTER: u8 = 17;
 const TAG_BLOB: u8 = 18;
+const TAG_DECIMAL: u8 = 20;
 
 /// Size of the leading count byte that stores the number of values.
 const COUNT_SIZE: usize = std::mem::size_of::<u8>();
@@ -318,6 +320,10 @@ fn encoded_size(value: &CqlValue) -> usize {
         CqlValue::Text(s) => TAG_SIZE + VAR_LEN_SIZE + s.len(),
         CqlValue::Ascii(s) => TAG_SIZE + VAR_LEN_SIZE + s.len(),
         CqlValue::Blob(b) => TAG_SIZE + VAR_LEN_SIZE + b.len(),
+        CqlValue::Decimal(v) => {
+            let (varint_bytes, _scale) = v.as_signed_be_bytes_slice_and_exponent();
+            TAG_SIZE + std::mem::size_of::<i32>() + VAR_LEN_SIZE + varint_bytes.len()
+        }
         _ => unsupported(value),
     }
 }
@@ -419,6 +425,19 @@ fn encode_value(buf: &mut Vec<u8>, value: &CqlValue) {
             buf.extend_from_slice(&v.0.to_le_bytes());
         }
 
+        CqlValue::Decimal(v) => {
+            buf.push(TAG_DECIMAL);
+            let (varint_bytes, scale) = v.as_signed_be_bytes_slice_and_exponent();
+            // Write scale as i32 LE (4 bytes), then varint byte length (u32 LE), then varint bytes.
+            buf.extend_from_slice(&scale.to_le_bytes());
+            let len: u32 = varint_bytes
+                .len()
+                .try_into()
+                .expect("Decimal varint too large for InvariantKey encoding");
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(varint_bytes);
+        }
+
         _ => unsupported(value),
     }
 }
@@ -459,6 +478,17 @@ fn skip_value(data: &[u8]) -> usize {
         }
         TAG_UUID | TAG_TIMEUUID | TAG_INET_V6 => TAG_SIZE + UUID_SIZE,
         TAG_TEXT | TAG_ASCII | TAG_BLOB => VAR_DATA_OFFSET + read_var_len(data),
+        TAG_DECIMAL => {
+            // Layout: [tag][scale: i32 4 bytes][len: u32 4 bytes][varint_bytes...]
+            let scale_size = std::mem::size_of::<i32>();
+            let len_offset = DATA_OFFSET + scale_size;
+            let varint_len = u32::from_le_bytes(
+                data[len_offset..len_offset + VAR_LEN_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            TAG_SIZE + scale_size + VAR_LEN_SIZE + varint_len
+        }
         other => panic!("Unknown tag in InvariantKey data: {other}"),
     }
 }
@@ -577,6 +607,31 @@ fn decode_value(data: &[u8]) -> (CqlValue, usize) {
             (
                 CqlValue::Counter(Counter(v)),
                 TAG_SIZE + std::mem::size_of::<i64>(),
+            )
+        }
+
+        TAG_DECIMAL => {
+            // Layout: [tag][scale: i32 LE 4 bytes][len: u32 LE 4 bytes][varint_bytes...]
+            let scale_size = std::mem::size_of::<i32>();
+            let scale = i32::from_le_bytes(
+                data[DATA_OFFSET..DATA_OFFSET + scale_size]
+                    .try_into()
+                    .unwrap(),
+            );
+            let len_offset = DATA_OFFSET + scale_size;
+            let varint_len = u32::from_le_bytes(
+                data[len_offset..len_offset + VAR_LEN_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let varint_start = len_offset + VAR_LEN_SIZE;
+            let varint_bytes = data[varint_start..varint_start + varint_len].to_vec();
+            (
+                CqlValue::Decimal(CqlDecimal::from_signed_be_bytes_and_exponent(
+                    varint_bytes,
+                    scale,
+                )),
+                TAG_SIZE + scale_size + VAR_LEN_SIZE + varint_len,
             )
         }
 
@@ -754,5 +809,42 @@ mod tests {
     fn more_than_255_columns_panics() {
         let values: Vec<CqlValue> = (0..256).map(CqlValue::Int).collect();
         let _ik = InvariantKey::new(values);
+    }
+
+    #[test]
+    fn roundtrip_decimal() {
+        // Integer value 1 as decimal (scale=0, varint bytes = [0x01])
+        let dec1 = CqlDecimal::from_signed_be_bytes_and_exponent(vec![0x01u8], 0);
+        let ik = InvariantKey::new(vec![CqlValue::Decimal(dec1.clone())]);
+        assert_eq!(ik.len(), 1);
+        assert_eq!(ik.get(0), Some(CqlValue::Decimal(dec1)));
+
+        // Integer value 2 as decimal (scale=0, varint bytes = [0x02])
+        let dec2 = CqlDecimal::from_signed_be_bytes_and_exponent(vec![0x02u8], 0);
+        let ik2 = InvariantKey::new(vec![CqlValue::Decimal(dec2.clone())]);
+        assert_eq!(ik2.len(), 1);
+        assert_eq!(ik2.get(0), Some(CqlValue::Decimal(dec2)));
+
+        // Non-integer decimal 1.5 = 15 * 10^(-1) → varint=[0x0F], scale=1
+        let dec15 = CqlDecimal::from_signed_be_bytes_and_exponent(vec![0x0Fu8], 1);
+        let ik3 = InvariantKey::new(vec![CqlValue::Decimal(dec15.clone())]);
+        assert_eq!(ik3.len(), 1);
+        assert_eq!(ik3.get(0), Some(CqlValue::Decimal(dec15)));
+
+        // Negative scale: 1000 = 1 * 10^3 → varint=[0x01], scale=-3
+        let dec1000 = CqlDecimal::from_signed_be_bytes_and_exponent(vec![0x01u8], -3);
+        let ik4 = InvariantKey::new(vec![CqlValue::Decimal(dec1000.clone())]);
+        assert_eq!(ik4.len(), 1);
+        assert_eq!(ik4.get(0), Some(CqlValue::Decimal(dec1000)));
+
+        // Multi-column key: Decimal PK alongside a Text column
+        let dec_multi = CqlDecimal::from_signed_be_bytes_and_exponent(vec![0x2Au8], 0); // 42
+        let ik5 = InvariantKey::new(vec![
+            CqlValue::Decimal(dec_multi.clone()),
+            CqlValue::Text("world".to_string()),
+        ]);
+        assert_eq!(ik5.len(), 2);
+        assert_eq!(ik5.get(0), Some(CqlValue::Decimal(dec_multi)));
+        assert_eq!(ik5.get(1), Some(CqlValue::Text("world".to_string())));
     }
 }

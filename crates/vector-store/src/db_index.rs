@@ -436,6 +436,11 @@ impl Statements {
                     drop(permit);
                 });
             } else {
+                range_scan
+                    .inspect_err(|err| {
+                        warn!("initial_scan: range ({begin:?}, {end:?}) failed: {err}");
+                    })
+                    .ok();
                 drop(permit);
             }
         }
