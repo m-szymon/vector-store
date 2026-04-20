@@ -34,6 +34,7 @@ use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+use aws_smithy_types::base64;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::config_bag::ConfigBag;
 use e2etest::TestCase;
@@ -775,6 +776,34 @@ impl TableContext {
             req = req.item(attr_name, attr_val.clone());
         }
         req.send().await.expect("PutItem should succeed");
+    }
+
+    async fn put_vector(&self, pk_value: &AttributeValue, vector: [f32; Item::VEC_DIMS]) {
+        let pk_attr = self.shape.pk();
+        let vec_attr = self
+            .shape
+            .vec()
+            .expect("shape has no vec attr for put_vector");
+        let pk_ddb = match pk_value {
+            AttributeValue::S(s) => serde_json::json!({ "S": s }),
+            AttributeValue::N(n) => serde_json::json!({ "N": n }),
+            AttributeValue::B(b) => {
+                serde_json::json!({ "B": base64::encode(b.as_ref()) })
+            }
+            other => panic!("unsupported pk AttributeValue in put_vector: {other:?}"),
+        };
+        let item_json = serde_json::json!({
+            pk_attr: pk_ddb,
+            vec_attr: { "FLOAT32VECTOR": vector },
+        });
+        self.client
+            .put_item()
+            .table_name(&self.table_name)
+            .customize()
+            .interceptor(JsonBodyInjectInterceptor::new([("Item", item_json)]))
+            .send()
+            .await
+            .expect("PutItem with FLOAT32VECTOR should succeed");
     }
 
     /// Inserts an item, asserting that Scylla rejects it with `expected_err`.

@@ -135,6 +135,99 @@ async fn query_with_binary_key(actors: TestActors) {
     info!("finished");
 }
 
+/// Verifies queries work with both FLOAT32VECTOR-encoded items and query vectors.
+#[framed]
+async fn query_with_optimized_vector_type(actors: TestActors) {
+    info!("started");
+
+    let shape = TableShape {
+        table_prefix: None,
+        index_prefix: None,
+        pk_name: "Pk-VecType".into(),
+        sk_name: None,
+        vec_name: Some("Vec-VecType".into()),
+        pk_type: ScalarAttributeType::S,
+    };
+
+    let pk_name = shape.pk();
+    let vec_name = shape.vec().unwrap();
+    let pk_l_scan = "pk-l-scan";
+    let pk_v_scan = "pk-v-scan";
+    let pk_l_live = "pk-l-live";
+    let pk_v_live = "pk-v-live";
+
+    // Both L-type and FLOAT32VECTOR-type items inserted before index creation go through
+    // the initial scan path.
+    let initial =
+        [Item::new(pk_name, AttributeValue::S(pk_l_scan.into())).vec(vec_name, [1.0, 0.0, 0.0])];
+    let ctx = TableContext::create_with_data(&actors, &shape, &initial).await;
+    ctx.put_vector(&AttributeValue::S(pk_v_scan.into()), [1.0, 0.0, 0.0])
+        .await;
+
+    ctx.wait_for_count(2).await;
+
+    // Both L-type and FLOAT32VECTOR-type items inserted after index creation go through
+    // the live path.
+    ctx.put(
+        &Item::new(pk_name, AttributeValue::S(pk_l_live.into())).vec(vec_name, [1.0, 0.0, 0.0]),
+    )
+    .await;
+    ctx.put_vector(&AttributeValue::S(pk_v_live.into()), [1.0, 0.0, 0.0])
+        .await;
+
+    ctx.wait_for_count(4).await;
+
+    // Query with standard L-type vector encoding.
+    let items = ctx
+        .client
+        .query()
+        .table_name(&ctx.table_name)
+        .index_name(ctx.index.index.as_ref())
+        .limit(4)
+        .vector_search([1.0_f32, 0.0, 0.0])
+        .send()
+        .await
+        .expect("Query with L-type vector should succeed")
+        .items()
+        .to_vec();
+
+    for pk in [pk_l_scan, pk_v_scan, pk_l_live, pk_v_live] {
+        assert!(
+            items
+                .iter()
+                .any(|item| item.get(pk_name) == Some(&AttributeValue::S(pk.into()))),
+            "L-type query should return '{pk}'"
+        );
+    }
+
+    // Query with optimized FLOAT32VECTOR vector encoding.
+    let items = ctx
+        .client
+        .query()
+        .table_name(&ctx.table_name)
+        .index_name(ctx.index.index.as_ref())
+        .limit(4)
+        .vector_search_optimized([1.0_f32, 0.0, 0.0])
+        .send()
+        .await
+        .expect("Query with FLOAT32VECTOR vector should succeed")
+        .items()
+        .to_vec();
+
+    for pk in [pk_l_scan, pk_v_scan, pk_l_live, pk_v_live] {
+        assert!(
+            items
+                .iter()
+                .any(|item| item.get(pk_name) == Some(&AttributeValue::S(pk.into()))),
+            "FLOAT32VECTOR query should return '{pk}'"
+        );
+    }
+
+    ctx.done().await;
+
+    info!("finished");
+}
+
 pub(super) async fn new() -> TestCase<TestActors> {
     TestCase::empty()
         .with_init(common::DEFAULT_TEST_TIMEOUT, alternator::init)
@@ -153,5 +246,10 @@ pub(super) async fn new() -> TestCase<TestActors> {
             "query_with_binary_key",
             common::DEFAULT_TEST_TIMEOUT,
             query_with_binary_key,
+        )
+        .with_test(
+            "query_with_optimized_vector_type",
+            common::DEFAULT_TEST_TIMEOUT,
+            query_with_optimized_vector_type,
         )
 }

@@ -30,6 +30,11 @@ pub(super) trait QueryBuilderExt {
         self,
         vector: impl IntoIterator<Item = f32>,
     ) -> CustomizableOperation<QueryOutput, QueryError, QueryFluentBuilder>;
+
+    fn vector_search_optimized(
+        self,
+        vector: impl IntoIterator<Item = f32>,
+    ) -> CustomizableOperation<QueryOutput, QueryError, QueryFluentBuilder>;
 }
 
 impl QueryBuilderExt for QueryFluentBuilder {
@@ -43,6 +48,19 @@ impl QueryBuilderExt for QueryFluentBuilder {
                     .into_iter()
                     .map(|v| serde_json::json!({ "N": v.to_string() }))
                     .collect::<Vec<_>>()
+            }
+        });
+        self.customize()
+            .interceptor(JsonBodyInjectInterceptor::new([("VectorSearch", json)]))
+    }
+
+    fn vector_search_optimized(
+        self,
+        vector: impl IntoIterator<Item = f32>,
+    ) -> CustomizableOperation<QueryOutput, QueryError, QueryFluentBuilder> {
+        let json = serde_json::json!({
+            "QueryVector": {
+                "FLOAT32VECTOR": vector.into_iter().collect::<Vec<_>>()
             }
         });
         self.customize()
