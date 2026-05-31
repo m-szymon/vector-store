@@ -10,7 +10,7 @@ use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::types::ScalarAttributeType;
 use e2etest::TestCase;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use tracing::info;
 
 use crate::alternator;
@@ -19,54 +19,70 @@ use crate::alternator::TableContext;
 use crate::alternator::TableShape;
 use crate::alternator::query::QueryBuilderExt;
 
-/// Shared logic for all key-type tests: creates a table with 2 initial items,
-/// adds a 3rd via PutItem, then queries with a keys-only projection and asserts
-/// that only the pk attribute is returned.
+/// Shared logic for all key-type tests: creates a table with initial items,
+/// adds extra items via PutItem, then queries with both L-type and FLOAT32VECTOR
+/// encodings and asserts that all expected pk values are returned with correct
+/// projection.
 async fn query_with_key_type(
     actors: &TestActors,
     shape: &TableShape,
     initial: &[Item],
-    extra: Item,
+    extra: &[Item],
 ) {
-    let vec_attr = shape.vec().unwrap();
     let ctx = TableContext::create_with_data(actors, shape, initial).await;
 
-    ctx.put(&extra).await;
-    ctx.wait_for_count(3).await;
+    for item in extra {
+        ctx.put(item).await;
+    }
+    let total = initial.len() + extra.len();
+    ctx.wait_for_count(total).await;
 
-    let items = ctx
-        .client
-        .query()
-        .table_name(&ctx.table_name)
-        .index_name(ctx.index.index.as_ref())
-        .limit(3)
-        .projection_expression("#pk")
-        .expression_attribute_names("#pk", shape.pk())
+    let expected_pks: Vec<&AttributeValue> = initial
+        .iter()
+        .chain(extra.iter())
+        .map(|item| item.0.get(shape.pk()).expect("item has no pk"))
+        .collect();
+
+    let base_query = || {
+        ctx.client
+            .query()
+            .table_name(&ctx.table_name)
+            .index_name(ctx.index.index.as_ref())
+            .limit(total as i32)
+            .projection_expression("#pk")
+            .expression_attribute_names("#pk", shape.pk())
+    };
+
+    let assert_results = |items: &[HashMap<String, AttributeValue>], label: &str| {
+        let mut expected: Vec<HashMap<String, AttributeValue>> = expected_pks
+            .iter()
+            .map(|pk| HashMap::from([(shape.pk().to_string(), (*pk).clone())]))
+            .collect();
+
+        let mut got = items.to_vec();
+        got.sort_by_key(|m| format!("{:?}", m.get(shape.pk())));
+        expected.sort_by_key(|m| format!("{:?}", m.get(shape.pk())));
+
+        assert_eq!(got, expected, "{label} query returned unexpected results");
+    };
+
+    let items = base_query()
         .vector_search([1.0, 1.0, 1.0])
         .send()
         .await
-        .expect("Query with VectorSearch should succeed")
+        .expect("Query with L-type vector should succeed")
         .items()
         .to_vec();
+    assert_results(&items, "L-type");
 
-    assert!(
-        !items.is_empty(),
-        "keys-only query should return at least one item"
-    );
-    let expected_keys: HashSet<&str> = [shape.pk()].into();
-    for item in &items {
-        let got_keys: HashSet<&str> = item.keys().map(String::as_str).collect();
-        assert_eq!(
-            got_keys,
-            expected_keys,
-            "projected item should contain only pk '{}'",
-            shape.pk()
-        );
-        assert!(
-            !item.contains_key(vec_attr),
-            "projected item should NOT contain vector '{vec_attr}'"
-        );
-    }
+    let items = base_query()
+        .vector_search_optimized([1.0, 1.0, 1.0])
+        .send()
+        .await
+        .expect("Query with FLOAT32VECTOR vector should succeed")
+        .items()
+        .to_vec();
+    assert_results(&items, "FLOAT32VECTOR");
 
     ctx.done().await;
 }
@@ -87,8 +103,8 @@ async fn query_with_string_key(actors: TestActors) {
         Item::new(shape.pk(), AttributeValue::S("str-a".into())).vec(v, [1.0, 1.0, 1.0]),
         Item::new(shape.pk(), AttributeValue::S("str-b".into())).vec(v, [1.0, 2.0, 4.0]),
     ];
-    let extra = Item::new(shape.pk(), AttributeValue::S("str-c".into())).vec(v, [1.0, 4.0, 8.0]);
-    query_with_key_type(&actors, &shape, &initial, extra).await;
+    let extra = [Item::new(shape.pk(), AttributeValue::S("str-c".into())).vec(v, [1.0, 4.0, 8.0])];
+    query_with_key_type(&actors, &shape, &initial, &extra).await;
     info!("finished");
 }
 
@@ -108,8 +124,8 @@ async fn query_with_number_key(actors: TestActors) {
         Item::new(shape.pk(), AttributeValue::N("1".into())).vec(v, [1.0, 1.0, 1.0]),
         Item::new(shape.pk(), AttributeValue::N("2".into())).vec(v, [1.0, 2.0, 4.0]),
     ];
-    let extra = Item::new(shape.pk(), AttributeValue::N("3".into())).vec(v, [1.0, 4.0, 8.0]);
-    query_with_key_type(&actors, &shape, &initial, extra).await;
+    let extra = [Item::new(shape.pk(), AttributeValue::N("3".into())).vec(v, [1.0, 4.0, 8.0])];
+    query_with_key_type(&actors, &shape, &initial, &extra).await;
     info!("finished");
 }
 
@@ -129,9 +145,10 @@ async fn query_with_binary_key(actors: TestActors) {
         Item::new(shape.pk(), AttributeValue::B(Blob::new(vec![0x01u8]))).vec(v, [1.0, 1.0, 1.0]),
         Item::new(shape.pk(), AttributeValue::B(Blob::new(vec![0x02u8]))).vec(v, [1.0, 2.0, 4.0]),
     ];
-    let extra =
-        Item::new(shape.pk(), AttributeValue::B(Blob::new(vec![0x03u8]))).vec(v, [1.0, 4.0, 8.0]);
-    query_with_key_type(&actors, &shape, &initial, extra).await;
+    let extra = [
+        Item::new(shape.pk(), AttributeValue::B(Blob::new(vec![0x03u8]))).vec(v, [1.0, 4.0, 8.0]),
+    ];
+    query_with_key_type(&actors, &shape, &initial, &extra).await;
     info!("finished");
 }
 
@@ -149,81 +166,18 @@ async fn query_with_optimized_vector_type(actors: TestActors) {
         pk_type: ScalarAttributeType::S,
     };
 
-    let pk_name = shape.pk();
-    let vec_name = shape.vec().unwrap();
-    let pk_l_scan = "pk-l-scan";
-    let pk_v_scan = "pk-v-scan";
-    let pk_l_live = "pk-l-live";
-    let pk_v_live = "pk-v-live";
-
-    // Both L-type and FLOAT32VECTOR-type items inserted before index creation go through
-    // the initial scan path.
-    let initial =
-        [Item::new(pk_name, AttributeValue::S(pk_l_scan.into())).vec(vec_name, [1.0, 0.0, 0.0])];
-    let ctx = TableContext::create_with_data(&actors, &shape, &initial).await;
-    ctx.put_vector(&AttributeValue::S(pk_v_scan.into()), [1.0, 0.0, 0.0])
-        .await;
-
-    ctx.wait_for_count(2).await;
-
-    // Both L-type and FLOAT32VECTOR-type items inserted after index creation go through
-    // the live path.
-    ctx.put(
-        &Item::new(pk_name, AttributeValue::S(pk_l_live.into())).vec(vec_name, [1.0, 0.0, 0.0]),
-    )
-    .await;
-    ctx.put_vector(&AttributeValue::S(pk_v_live.into()), [1.0, 0.0, 0.0])
-        .await;
-
-    ctx.wait_for_count(4).await;
-
-    // Query with standard L-type vector encoding.
-    let items = ctx
-        .client
-        .query()
-        .table_name(&ctx.table_name)
-        .index_name(ctx.index.index.as_ref())
-        .limit(4)
-        .vector_search([1.0_f32, 0.0, 0.0])
-        .send()
-        .await
-        .expect("Query with L-type vector should succeed")
-        .items()
-        .to_vec();
-
-    for pk in [pk_l_scan, pk_v_scan, pk_l_live, pk_v_live] {
-        assert!(
-            items
-                .iter()
-                .any(|item| item.get(pk_name) == Some(&AttributeValue::S(pk.into()))),
-            "L-type query should return '{pk}'"
-        );
-    }
-
-    // Query with optimized FLOAT32VECTOR vector encoding.
-    let items = ctx
-        .client
-        .query()
-        .table_name(&ctx.table_name)
-        .index_name(ctx.index.index.as_ref())
-        .limit(4)
-        .vector_search_optimized([1.0_f32, 0.0, 0.0])
-        .send()
-        .await
-        .expect("Query with FLOAT32VECTOR vector should succeed")
-        .items()
-        .to_vec();
-
-    for pk in [pk_l_scan, pk_v_scan, pk_l_live, pk_v_live] {
-        assert!(
-            items
-                .iter()
-                .any(|item| item.get(pk_name) == Some(&AttributeValue::S(pk.into()))),
-            "FLOAT32VECTOR query should return '{pk}'"
-        );
-    }
-
-    ctx.done().await;
+    let v = shape.vec().unwrap();
+    let initial = [
+        Item::new(shape.pk(), AttributeValue::S("pk-l-scan".into())).vec(v, [1.0, 1.0, 1.0]),
+        Item::new(shape.pk(), AttributeValue::S("pk-v-scan".into()))
+            .vec_optimized(v, [1.0, 1.0, 1.0]),
+    ];
+    let extra = [
+        Item::new(shape.pk(), AttributeValue::S("pk-l-live".into())).vec(v, [1.0, 1.0, 1.0]),
+        Item::new(shape.pk(), AttributeValue::S("pk-v-live".into()))
+            .vec_optimized(v, [1.0, 1.0, 1.0]),
+    ];
+    query_with_key_type(&actors, &shape, &initial, &extra).await;
 
     info!("finished");
 }
