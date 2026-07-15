@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# Copyright 2025-present ScyllaDB
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+
+# Install vector-store from source on a host machine.
+# Designed to run on a provisioned VS node (base VS AMI or plain Ubuntu)
+# during SCT test setup.
+#
+# Usage:
+#   install-from-source --repo <url> --commit <sha> [--arch amd64|arm64]
+#
+# This script:
+#   1. Installs build prerequisites (Rust toolchain, system libs)
+#   2. Clones the repo and checks out the exact commit
+#   3. Builds the native vector-store binary (release mode)
+#   4. Installs the binary into /home/ubuntu/vector-store/
+#   5. Installs/refreshes the systemd service unit
+#
+# It does NOT start the service — SCT handles that after writing .env config.
+
+set -euo pipefail
+
+INSTALL_DIR="/home/ubuntu/vector-store"
+SERVICE_FILE="/etc/systemd/system/vector-store.service"
+USER="ubuntu"
+
+# Defaults
+ARCH=""
+REPO=""
+COMMIT=""
+VERBOSE=false
+
+usage() {
+    echo "Usage: $0 --repo <url> --commit <sha> [--arch amd64|arm64] [--verbose]"
+    exit 1
+}
+
+log() {
+    echo "[install-from-source] $*"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --repo) REPO="$2"; shift 2 ;;
+        --commit) COMMIT="$2"; shift 2 ;;
+        --arch) ARCH="$2"; shift 2 ;;
+        --verbose) VERBOSE=true; shift ;;
+        *) usage ;;
+    esac
+done
+
+[[ -z "$REPO" ]] && { echo "error: --repo is required"; usage; }
+[[ -z "$COMMIT" ]] && { echo "error: --commit is required"; usage; }
+
+# Auto-detect architecture if not provided
+if [[ -z "$ARCH" ]]; then
+    case "$(uname -m)" in
+        x86_64) ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        *) echo "error: unsupported architecture $(uname -m)"; exit 1 ;;
+    esac
+fi
+
+if [[ "$VERBOSE" == "true" ]]; then
+    set -x
+fi
+
+# --- Step 1: Install build prerequisites ---
+log "Installing build prerequisites..."
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    git \
+    curl \
+    protobuf-compiler
+
+# Install Rust toolchain for the user
+log "Installing Rust toolchain..."
+if [[ ! -d "/home/${USER}/.rustup" ]]; then
+    sudo -u "$USER" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none'
+fi
+
+# --- Step 2: Clone repo and checkout commit ---
+log "Cloning repo and checking out commit ${COMMIT}..."
+
+CLONE_DIR="/home/${USER}/vector-store-src"
+rm -rf "$CLONE_DIR"
+sudo -u "$USER" git clone "$REPO" "$CLONE_DIR"
+cd "$CLONE_DIR"
+sudo -u "$USER" git checkout "$COMMIT"
+
+# Install the exact toolchain version specified in the repo
+RUST_CHANNEL=$(grep channel rust-toolchain.toml 2>/dev/null | cut -d '"' -f 2 || echo "stable")
+log "Installing Rust toolchain: ${RUST_CHANNEL}"
+sudo -u "$USER" bash -c "source /home/${USER}/.cargo/env && rustup install ${RUST_CHANNEL} && rustup default ${RUST_CHANNEL}"
+
+# --- Step 3: Build native binary ---
+log "Building vector-store (release mode, arch=${ARCH})..."
+
+sudo -u "$USER" bash -c "source /home/${USER}/.cargo/env && cd ${CLONE_DIR} && cargo build --release --bin vector-store"
+
+# --- Step 4: Install binary ---
+log "Installing binary to ${INSTALL_DIR}..."
+
+mkdir -p "$INSTALL_DIR"
+cp "${CLONE_DIR}/target/release/vector-store" "${INSTALL_DIR}/vector-store"
+chown -R "${USER}:${USER}" "$INSTALL_DIR"
+chmod +x "${INSTALL_DIR}/vector-store"
+
+# Write commit info for version reporting
+echo "$COMMIT" > "${INSTALL_DIR}/.source-commit"
+chown "${USER}:${USER}" "${INSTALL_DIR}/.source-commit"
+
+# --- Step 5: Install/refresh systemd service ---
+log "Installing vector-store.service..."
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Vector Rust Service
+After=network.target
+
+[Service]
+User=${USER}
+WorkingDirectory=${INSTALL_DIR}/
+ExecStart=${INSTALL_DIR}/vector-store
+Restart=on-failure
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cp "$SERVICE_FILE" /usr/lib/systemd/system/vector-store.service 2>/dev/null || true
+systemctl daemon-reload
+
+# --- Cleanup ---
+log "Cleaning up source directory..."
+rm -rf "$CLONE_DIR"
+
+log "Done. vector-store installed from commit ${COMMIT}"
