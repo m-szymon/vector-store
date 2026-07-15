@@ -13,6 +13,7 @@ use scylla::client::session::Session;
 use scylla::response::query_result::QueryRowsResult;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Instant;
 use tracing::info;
 
 e2etest::group!(name = fts, fixtures = (Cluster), parent = crate::validator);
@@ -63,13 +64,18 @@ impl e2etest::Fixture for Fixture {
 
 impl Fixture {
     #[framed]
-    async fn insert_documents(&self, docs: &[(i32, &str)]) {
+    async fn insert_documents<S: Into<String>>(&self, docs: impl IntoIterator<Item = (i32, S)>) {
+        let stmt = self
+            .session
+            .prepare(format!(
+                "INSERT INTO {} (pk, content) VALUES (?, ?)",
+                self.table
+            ))
+            .await
+            .expect("failed to prepare insert statement");
         for (pk, content) in docs {
             self.session
-                .query_unpaged(
-                    format!("INSERT INTO {} (pk, content) VALUES (?, ?)", self.table),
-                    (pk, content),
-                )
+                .execute_unpaged(&stmt, (pk, content.into()))
                 .await
                 .expect("failed to insert data");
         }
@@ -207,6 +213,17 @@ async fn drop_fts_keyspace(session: &Session, keyspace: &KeyspaceName) {
         .expect("failed to drop a keyspace");
 }
 
+async fn measure_duration<F, Fut, T>(label: impl std::fmt::Display, f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let start = Instant::now();
+    let result = f().await;
+    info!("{label} took {:?}", start.elapsed());
+    result
+}
+
 #[e2etest::test(group = fts)]
 async fn fts_index_lifecycle(actors: Arc<TestActors>) {
     info!("started");
@@ -245,7 +262,7 @@ async fn bm25_search_returns_matching_docs(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -265,7 +282,7 @@ async fn bm25_boolean_and_query(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -284,7 +301,7 @@ async fn bm25_boolean_or_query(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -305,7 +322,7 @@ async fn bm25_boolean_not_query(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -324,7 +341,7 @@ async fn bm25_phrase_query(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -347,7 +364,7 @@ async fn fts_crud_insert(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[(1, "searchable document about databases")])
+        .insert_documents([(1, "searchable document about databases")])
         .await;
 
     let pks = fixture.bm25_search_pks("databases", 1).await;
@@ -362,12 +379,12 @@ async fn fts_crud_update(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[(1, "original content about alpha")])
+        .insert_documents([(1, "original content about alpha")])
         .await;
 
     info!("Updating document content");
     fixture
-        .insert_documents(&[(1, "updated content about beta")])
+        .insert_documents([(1, "updated content about beta")])
         .await;
 
     let pks = fixture.bm25_search_pks("beta", 1).await;
@@ -386,7 +403,7 @@ async fn fts_crud_delete(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -410,7 +427,7 @@ async fn bm25_empty_results_for_nonexistent_term(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -431,7 +448,7 @@ async fn bm25_case_insensitive_search(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -453,7 +470,7 @@ async fn bm25_stop_word_filtering(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -479,7 +496,7 @@ async fn bm25_tokenizes_by_punctuation(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[(1, "fox-runs fast, or: jumps!")])
+        .insert_documents([(1, "fox-runs fast, or: jumps!")])
         .await;
 
     let fox_pks = fixture.bm25_search_pks("fox", 1).await;
@@ -498,7 +515,7 @@ async fn bm25_relevance_ranking_order(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "fox fox fox jumps"),
             (2, "fox runs across the meadow"),
             (3, "a slow turtle walks through the garden"),
@@ -520,10 +537,9 @@ async fn bm25_relevance_ranking_order(fixture: Arc<Fixture>) {
 async fn bm25_limit_restricts_result_count(fixture: Arc<Fixture>) {
     info!("started");
 
-    let docs: Vec<(i32, &str)> = (1..=10)
-        .map(|pk| (pk, "searchable document about databases"))
-        .collect();
-    fixture.insert_documents(&docs).await;
+    fixture
+        .insert_documents((1..=10).map(|pk| (pk, "searchable document about databases")))
+        .await;
     // Wait for all documents to be indexed
     fixture.bm25_search("databases", 10).await;
 
@@ -543,7 +559,7 @@ async fn bm25_grouped_boolean_query(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a slow turtle walks through the meadow"),
             (3, "the fox runs across the meadow"),
@@ -573,7 +589,7 @@ async fn fts_recreate_index_serves_existing_data(fixture: Arc<Fixture>) {
 
     info!("Inserting documents");
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "a fox walks through the garden"),
             (3, "the fox runs across the meadow"),
@@ -603,7 +619,7 @@ async fn fts_query_without_limit_returns_error(fixture: Arc<Fixture>) {
     info!("started");
 
     fixture
-        .insert_documents(&[
+        .insert_documents([
             (1, "the quick brown fox jumps over the lazy dog"),
             (2, "the fox runs across the meadow"),
         ])
@@ -658,6 +674,60 @@ async fn fts_index_on_int_column_returns_error(actors: Arc<TestActors>) {
     );
 
     drop_fts_keyspace(&session, &keyspace).await;
+
+    info!("finished");
+}
+
+#[e2etest::test(group = fts)]
+async fn fts_large_document_set(fixture: Arc<Fixture>) {
+    info!("started");
+
+    let needle_pks = [1234, 5678, 9012];
+    const LARGE_DATASET_SIZE: i32 = 10_000;
+    const MAX_SEARCH_LIMIT: usize = 1000;
+
+    info!("Inserting {LARGE_DATASET_SIZE} documents");
+    let docs = (1..=LARGE_DATASET_SIZE).map(|pk| {
+        let content = if needle_pks.contains(&pk) {
+            format!("haystack needle document number {pk}")
+        } else {
+            format!("haystack document number {pk}")
+        };
+        (pk, content)
+    });
+    fixture.insert_documents(docs).await;
+
+    info!("Waiting for all documents to be indexed");
+    let index = Arc::clone(&fixture.index.read().unwrap());
+    measure_duration(
+        format!("Index build for {LARGE_DATASET_SIZE} documents"),
+        || wait_for_index_count(&fixture.clients, &index, LARGE_DATASET_SIZE as usize),
+    )
+    .await;
+
+    info!("Step 1: Verifying rare term matches only the expected documents");
+    let pks = measure_duration(
+        format!("BM25 needle search over {LARGE_DATASET_SIZE} documents"),
+        || fixture.bm25_search_pks("needle", needle_pks.len()),
+    )
+    .await;
+    for pk in needle_pks {
+        assert!(pks.contains(&pk), "expected needle pk {pk} in results");
+    }
+
+    info!("Step 2: Verifying common term matches all documents, but is capped by LIMIT");
+    let common_hits = measure_duration(
+        format!(
+            "BM25 haystack search (LIMIT {MAX_SEARCH_LIMIT}) over {LARGE_DATASET_SIZE} documents"
+        ),
+        || fixture.bm25_search_with_limit("haystack", MAX_SEARCH_LIMIT),
+    )
+    .await;
+    assert_eq!(
+        common_hits.rows_num(),
+        MAX_SEARCH_LIMIT,
+        "LIMIT should cap common-term results at {MAX_SEARCH_LIMIT}"
+    );
 
     info!("finished");
 }

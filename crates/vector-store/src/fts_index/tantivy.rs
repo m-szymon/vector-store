@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use tantivy::IndexWriter;
@@ -68,7 +69,33 @@ impl FtsIndexFactory for TantivyIndexFactory {
         table: Arc<RwLock<Table>>,
         memory: mpsc::Sender<Memory>,
     ) -> mpsc::Sender<FtsIndex> {
-        new(key, table, self.worker.clone(), memory)
+        new(key, table, self.worker.clone(), memory, COMMIT_INTERVAL)
+    }
+}
+
+#[derive(Default)]
+struct PendingCommit {
+    bytes: usize,
+    dirty: bool,
+}
+
+impl PendingCommit {
+    fn append(&mut self, added_bytes: usize) -> bool {
+        self.bytes += added_bytes;
+        self.dirty = true;
+        self.bytes > MAX_PENDING_BYTES
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -77,9 +104,12 @@ struct IndexState {
     writer: RwLock<IndexWriter>,
     reader: tantivy::IndexReader,
     schema: Schema,
+    pending: RwLock<PendingCommit>,
 }
 
 const TOKENIZER_NAME: &str = "standard";
+const COMMIT_INTERVAL: Duration = Duration::from_secs(3);
+const MAX_PENDING_BYTES: usize = 15 * 1024 * 1024;
 
 impl IndexState {
     fn new() -> anyhow::Result<Self> {
@@ -102,6 +132,7 @@ impl IndexState {
             writer: RwLock::new(writer),
             reader,
             schema,
+            pending: RwLock::new(PendingCommit::default()),
         })
     }
 }
@@ -139,6 +170,20 @@ fn create_doc(schema: &Schema, primary_id: PrimaryId, document: &str) -> Tantivy
     doc
 }
 
+fn commit_and_reload(state: &IndexState, key: &IndexKey) {
+    let mut writer = state.writer.write().unwrap();
+    if let Err(err) = writer.commit() {
+        error!("fts: failed to commit for {key}: {err}");
+        return;
+    }
+    drop(writer);
+    if let Err(err) = state.reader.reload() {
+        error!("fts: failed to reload reader for {key}: {err}");
+        return;
+    }
+    state.pending.write().unwrap().reset();
+}
+
 fn handle_add_document(
     state: &IndexState,
     key: &IndexKey,
@@ -150,12 +195,8 @@ fn handle_add_document(
         error!("fts: failed to add document {primary_id:?}: {err}");
         return;
     }
-    if let Err(err) = state.writer.write().unwrap().commit() {
-        error!("fts: failed to commit add for {key}: {err}");
-        return;
-    }
-    if let Err(err) = state.reader.reload() {
-        error!("fts: failed to reload reader for {key}: {err}");
+    if state.pending.write().unwrap().append(document.len()) {
+        commit_and_reload(state, key);
     }
 }
 
@@ -164,16 +205,10 @@ fn create_term(schema: &Schema, primary_id: PrimaryId) -> tantivy::Term {
     tantivy::Term::from_field_u64(primary_id_field, u64::from(primary_id))
 }
 
-fn handle_remove_document(state: &IndexState, key: &IndexKey, primary_id: PrimaryId) {
+fn handle_remove_document(state: &IndexState, primary_id: PrimaryId) {
     let term = create_term(&state.schema, primary_id);
     state.writer.read().unwrap().delete_term(term);
-    if let Err(err) = state.writer.write().unwrap().commit() {
-        error!("fts: failed to commit remove for {key}: {err}");
-        return;
-    }
-    if let Err(err) = state.reader.reload() {
-        error!("fts: failed to reload reader for {key}: {err}");
-    }
+    state.pending.write().unwrap().mark_dirty();
 }
 
 fn make_query(
@@ -295,6 +330,7 @@ pub(crate) fn new(
     table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    commit_interval: Duration,
 ) -> mpsc::Sender<FtsIndex> {
     let (tx, mut rx) = mpsc::channel::<FtsIndex>(perf::channel_size().into());
     tokio::spawn(async move {
@@ -304,66 +340,96 @@ pub(crate) fn new(
         let mut allocate_prev = Allocate::Can;
         let allocate_rx = memory.subscribe_allocate().await;
 
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                FtsIndex::AddDocument {
-                    primary_id,
-                    document,
-                    in_progress,
-                } => {
-                    let Some(state) = get_or_create_state(&mut states, table.as_ref(), &key) else {
-                        continue;
+        let mut interval = tokio::time::interval(commit_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else {
+                        break;
                     };
-                    if !can_allocate_memory(&allocate_rx, &mut allocate_prev, &key) {
-                        continue;
+                    match msg {
+                        FtsIndex::AddDocument {
+                            primary_id,
+                            document,
+                            in_progress,
+                        } => {
+                            let Some(state) =
+                                get_or_create_state(&mut states, table.as_ref(), &key)
+                            else {
+                                continue;
+                            };
+                            if !can_allocate_memory(&allocate_rx, &mut allocate_prev, &key) {
+                                continue;
+                            }
+                            let key = key.clone();
+                            worker
+                                .spawn_blocking(move || {
+                                    handle_add_document(&state, &key, primary_id, document);
+                                    drop(in_progress);
+                                })
+                                .await;
+                        }
+                        FtsIndex::RemoveDocument {
+                            primary_id,
+                            in_progress,
+                        } => {
+                            let Some(state) =
+                                get_or_create_state(&mut states, table.as_ref(), &key)
+                            else {
+                                continue;
+                            };
+                            worker
+                                .spawn_blocking(move || {
+                                    handle_remove_document(&state, primary_id);
+                                    drop(in_progress);
+                                })
+                                .await;
+                        }
+                        FtsIndex::Count { tx, index_key, .. } => {
+                            let result = get_state(&states, table.as_ref(), &index_key)
+                                .map(|s| s.reader.searcher().num_docs() as usize)
+                                .unwrap_or(0);
+                            _ = tx.send(Ok(result));
+                        }
+                        FtsIndex::Search {
+                            index_key,
+                            query,
+                            limit,
+                            tx,
+                        } => {
+                            let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
+                                _ = tx.send(Ok((vec![], vec![])));
+                                continue;
+                            };
+                            let table = Arc::clone(&table);
+                            worker
+                                .spawn_blocking(move || {
+                                    let result = handle_search(
+                                        &state,
+                                        table.as_ref(),
+                                        &index_key,
+                                        &query,
+                                        limit,
+                                    );
+                                    _ = tx.send(result);
+                                })
+                                .await;
+                        }
                     }
-                    let key = key.clone();
-                    worker
-                        .spawn_blocking(move || {
-                            handle_add_document(&state, &key, primary_id, document);
-                            drop(in_progress);
-                        })
-                        .await;
                 }
-                FtsIndex::RemoveDocument {
-                    primary_id,
-                    in_progress,
-                } => {
-                    let Some(state) = get_or_create_state(&mut states, table.as_ref(), &key) else {
-                        continue;
-                    };
-                    let key = key.clone();
-                    worker
-                        .spawn_blocking(move || {
-                            handle_remove_document(&state, &key, primary_id);
-                            drop(in_progress);
-                        })
-                        .await;
-                }
-                FtsIndex::Count { tx, index_key, .. } => {
-                    let result = get_state(&states, table.as_ref(), &index_key)
-                        .map(|s| s.reader.searcher().num_docs() as usize)
-                        .unwrap_or(0);
-                    _ = tx.send(Ok(result));
-                }
-                FtsIndex::Search {
-                    index_key,
-                    query,
-                    limit,
-                    tx,
-                } => {
-                    let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
-                        _ = tx.send(Ok((vec![], vec![])));
-                        continue;
-                    };
-                    let table = Arc::clone(&table);
-                    worker
-                        .spawn_blocking(move || {
-                            let result =
-                                handle_search(&state, table.as_ref(), &index_key, &query, limit);
-                            _ = tx.send(result);
-                        })
-                        .await;
+                _ = interval.tick() => {
+                    for state in states.values() {
+                        if !state.pending.read().unwrap().is_dirty() {
+                            continue;
+                        }
+                        let state = Arc::clone(state);
+                        let key = key.clone();
+                        worker
+                            .spawn_blocking(move || commit_and_reload(&state, &key))
+                            .await;
+                    }
                 }
             }
         }
@@ -382,6 +448,7 @@ mod tests {
     use crate::table::MockTableSearch;
     use crate::table::PartitionId;
     use scylla::value::CqlValue;
+    use std::time::Duration;
 
     use super::super::actor::FtsIndexExt;
 
@@ -420,10 +487,27 @@ mod tests {
         tx
     }
 
+    const TEST_COMMIT_INTERVAL: Duration = Duration::from_millis(50);
+    const TEST_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+    const TEST_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    async fn wait_for_value<T>(mut producer: impl AsyncFnMut() -> Option<T>, msg: &str) -> T {
+        tokio::time::timeout(TEST_POLL_TIMEOUT, async {
+            loop {
+                if let Some(value) = producer().await {
+                    break value;
+                }
+                tokio::time::sleep(TEST_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Timeout on: {msg}"))
+    }
+
     fn make_sender(table: Arc<RwLock<MockTableSearch>>) -> mpsc::Sender<FtsIndex> {
         let key = make_index_key();
         let memory = make_memory_actor();
-        new(key, table, worker::new(), memory)
+        new(key, table, worker::new(), memory, TEST_COMMIT_INTERVAL)
     }
 
     async fn add_doc(sender: &mpsc::Sender<FtsIndex>, primary: u64, content: &str) {
@@ -444,6 +528,43 @@ mod tests {
             .remove_document(primary.into(), AsyncInProgress::Fullscan(tx))
             .await;
         rx.recv().await;
+    }
+
+    async fn search(sender: &mpsc::Sender<FtsIndex>, query: &str) -> (Vec<PrimaryKey>, Vec<f32>) {
+        sender
+            .search(
+                make_index_key(),
+                query.into(),
+                Limit::from(std::num::NonZeroUsize::new(10).unwrap()),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_count(sender: &mpsc::Sender<FtsIndex>, expected: usize) -> usize {
+        wait_for_value(
+            async || {
+                let count = sender.count(make_index_key()).await.unwrap();
+                (count == expected).then_some(count)
+            },
+            &format!("expected count {expected}"),
+        )
+        .await
+    }
+
+    async fn wait_for_search(
+        sender: &mpsc::Sender<FtsIndex>,
+        query: &str,
+        expected_len: usize,
+    ) -> (Vec<PrimaryKey>, Vec<f32>) {
+        wait_for_value(
+            async || {
+                let result = search(sender, query).await;
+                (result.0.len() == expected_len).then_some(result)
+            },
+            &format!("expected {expected_len} results for '{query}'"),
+        )
+        .await
     }
 
     fn make_memory_actor_cannot_allocate() -> mpsc::Sender<Memory> {
@@ -479,8 +600,7 @@ mod tests {
         add_doc(&sender, 1, "hello world").await;
         add_doc(&sender, 2, "foo bar").await;
 
-        let key = make_index_key();
-        let count = sender.count(key).await.unwrap();
+        let count = wait_for_count(&sender, 2).await;
 
         assert_eq!(count, 2);
     }
@@ -494,8 +614,7 @@ mod tests {
         add_doc(&sender, 2, "world").await;
         rm_doc(&sender, 2).await;
 
-        let key = make_index_key();
-        let count = sender.count(key).await.unwrap();
+        let count = wait_for_count(&sender, 1).await;
 
         assert_eq!(count, 1);
     }
@@ -508,15 +627,7 @@ mod tests {
         add_doc(&sender, 1, "the quick brown fox").await;
         add_doc(&sender, 2, "lazy dog sleeps").await;
 
-        let key = make_index_key();
-        let (keys, scores) = sender
-            .search(
-                key,
-                "fox".into(),
-                Limit::from(std::num::NonZeroUsize::new(10).unwrap()),
-            )
-            .await
-            .unwrap();
+        let (keys, scores) = wait_for_search(&sender, "fox", 1).await;
 
         assert_eq!(keys.len(), 1);
         assert_eq!(scores.len(), 1);
@@ -531,15 +642,7 @@ mod tests {
         add_doc(&sender, 1, "rust rust rust programming language").await;
         add_doc(&sender, 2, "rust is a systems programming language").await;
 
-        let key = make_index_key();
-        let (keys, scores) = sender
-            .search(
-                key,
-                "rust".into(),
-                Limit::from(std::num::NonZeroUsize::new(10).unwrap()),
-            )
-            .await
-            .unwrap();
+        let (keys, scores) = wait_for_search(&sender, "rust", 2).await;
 
         assert!(keys.len() >= 2);
         for i in 1..scores.len() {
@@ -553,16 +656,9 @@ mod tests {
         let sender = make_sender(table);
 
         add_doc(&sender, 1, "hello world").await;
+        wait_for_count(&sender, 1).await;
 
-        let key = make_index_key();
-        let (keys, scores) = sender
-            .search(
-                key,
-                "nonexistentterm".into(),
-                Limit::from(std::num::NonZeroUsize::new(10).unwrap()),
-            )
-            .await
-            .unwrap();
+        let (keys, scores) = search(&sender, "nonexistentterm").await;
 
         assert!(keys.is_empty());
         assert!(scores.is_empty());
@@ -578,15 +674,7 @@ mod tests {
 
         rm_doc(&sender, 1).await;
 
-        let key = make_index_key();
-        let (keys, scores) = sender
-            .search(
-                key,
-                "unique".into(),
-                Limit::from(std::num::NonZeroUsize::new(10).unwrap()),
-            )
-            .await
-            .unwrap();
+        let (keys, scores) = wait_for_search(&sender, "unique", 1).await;
 
         assert_eq!(keys.len(), 1);
         assert_eq!(scores.len(), 1);
@@ -597,7 +685,7 @@ mod tests {
         let table = make_table_with_keys();
         let key = make_index_key();
         let memory = make_memory_actor_cannot_allocate();
-        let sender = new(key, table, worker::new(), memory);
+        let sender = new(key, table, worker::new(), memory, TEST_COMMIT_INTERVAL);
 
         add_doc(&sender, 1, "should not be indexed").await;
 
