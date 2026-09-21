@@ -8,12 +8,12 @@ mod factory;
 mod tantivy;
 
 use crate::memory::Memory;
+pub(crate) use crate::tantivy_common::QueryError;
 use crate::worker::Worker;
 pub(crate) use actor::FtsIndex;
 pub(crate) use actor::FtsIndexExt;
 pub(crate) use factory::FtsIndexConfiguration;
 pub(crate) use factory::FtsIndexFactory;
-pub(crate) use tantivy::QueryError;
 use tantivy::TantivyIndexFactory;
 use tokio::sync::mpsc;
 

@@ -8,6 +8,7 @@ use crate::IndexKey;
 use crate::Limit;
 use crate::PrimaryKey;
 use crate::table::PrimaryId;
+use crate::tantivy_common::TantivyStatsR;
 use crate::vs_index::CountR;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -15,14 +16,7 @@ use tokio::sync::oneshot;
 pub(crate) type FtsSearchR = anyhow::Result<(Vec<PrimaryKey>, Vec<f32>)>;
 pub(crate) type FtsHighlightR = anyhow::Result<Vec<Option<String>>>;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FtsStats {
-    pub(crate) num_docs: u64,
-    pub(crate) size_bytes: u64,
-    pub(crate) segment_count: usize,
-}
-
-pub(crate) type FtsStatsR = anyhow::Result<FtsStats>;
+pub(crate) type FtsStatsR = TantivyStatsR;
 
 pub(crate) enum FtsIndex {
     AddDocument {
