@@ -19,6 +19,7 @@ mod opensearch;
 mod quantization;
 mod routing;
 mod status;
+mod substring;
 mod tls_utils;
 mod vs_index;
 

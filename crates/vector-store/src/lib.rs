@@ -33,6 +33,7 @@ mod partition_key;
 mod perf;
 mod primary_key;
 mod similarity;
+mod substring_index;
 mod table;
 mod tantivy_common;
 mod timestamp;
@@ -217,6 +218,7 @@ pub struct Config {
     pub diskann_backend: Option<DiskannBackendKind>,
     pub alter_index_simulator: bool,
     pub fulltext_indexes: bool,
+    pub substring_indexes: bool,
     pub cql_connection_timeout: Option<Duration>,
     pub cql_keepalive_interval: Option<Duration>,
     pub cql_keepalive_timeout: Option<Duration>,
@@ -253,6 +255,7 @@ impl Default for Config {
             diskann_backend: None,
             alter_index_simulator: false,
             fulltext_indexes: true,
+            substring_indexes: true,
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
@@ -593,6 +596,83 @@ impl FromStr for Positions {
     }
 }
 
+/// Upper bound of `min_gram` and `max_gram` of a substring index. Every substring of a value up
+/// to `max_gram` characters becomes an indexed term, so the bound keeps the index size sane.
+pub const MAX_GRAM_LIMIT: usize = 8;
+
+fn parse_gram(s: &str, name: &str) -> anyhow::Result<NonZeroUsize> {
+    let value: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Unknown {name} value: {s}"))?;
+    if value == 0 || value > MAX_GRAM_LIMIT {
+        anyhow::bail!("{name} must be in 1..={MAX_GRAM_LIMIT}, got {value}");
+    }
+    Ok(NonZeroUsize::new(value).unwrap())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Length in characters of the shortest term a substring index stores for a value.
+/// A query shorter than this cannot be answered by the index.
+pub struct MinGram(NonZeroUsize);
+
+impl Default for MinGram {
+    fn default() -> Self {
+        Self(NonZeroUsize::new(1).unwrap())
+    }
+}
+
+impl FromStr for MinGram {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_gram(s, "min_gram").map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Length in characters of the longest term a substring index stores for a value.
+/// A query up to this length is a single exact term lookup; a longer one is answered by
+/// intersecting its `max_gram`-long substrings and verifying the candidates.
+pub struct MaxGram(NonZeroUsize);
+
+impl Default for MaxGram {
+    fn default() -> Self {
+        Self(NonZeroUsize::new(3).unwrap())
+    }
+}
+
+impl FromStr for MaxGram {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_gram(s, "max_gram").map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Whether a substring index matches letter case exactly (the CQL `LIKE` semantics) or
+/// lowercases both the indexed values and the queries.
+pub struct CaseSensitive(bool);
+
+impl Default for CaseSensitive {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+impl FromStr for CaseSensitive {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "true" => Ok(Self(true)),
+            "false" => Ok(Self(false)),
+            _ => Err(anyhow::anyhow!("Unknown case_sensitive value: {s}")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
 pub struct Limit(NonZeroUsize);
@@ -706,25 +786,58 @@ pub struct IndexOptionsFts {
     pub positions: Positions,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// Substring-search-specific index configuration.
+pub struct IndexOptionsSubstring {
+    pub min_gram: MinGram,
+    pub max_gram: MaxGram,
+    pub case_sensitive: CaseSensitive,
+}
+
+impl IndexOptionsSubstring {
+    /// Checks the cross-option invariant `min_gram <= max_gram`. ScyllaDB rejects such an index
+    /// at creation, so a violation here means the options were tampered with; fall back to the
+    /// defaults with a warning, the same way an unparsable single option is handled.
+    pub fn validated(self) -> Self {
+        if self.min_gram.as_ref().get() > self.max_gram.as_ref().get() {
+            tracing::warn!(
+                "substring index options min_gram={} > max_gram={}, using the defaults",
+                self.min_gram.as_ref(),
+                self.max_gram.as_ref()
+            );
+            return Self::default();
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-/// Discriminates between vector-search and full-text-search index.
+/// Discriminates between vector-search, full-text-search and substring-search index.
 pub enum IndexKind {
     Vs(IndexOptionsVs),
     Fts(IndexOptionsFts),
+    Substring(IndexOptionsSubstring),
 }
 
 impl IndexKind {
     pub fn as_vs(&self) -> Option<&IndexOptionsVs> {
         match self {
             IndexKind::Vs(vs) => Some(vs),
-            IndexKind::Fts(_) => None,
+            IndexKind::Fts(_) | IndexKind::Substring(_) => None,
         }
     }
 
     pub fn as_fts(&self) -> Option<&IndexOptionsFts> {
         match self {
             IndexKind::Fts(fts) => Some(fts),
-            IndexKind::Vs(_) => None,
+            IndexKind::Vs(_) | IndexKind::Substring(_) => None,
+        }
+    }
+
+    pub fn as_substring(&self) -> Option<&IndexOptionsSubstring> {
+        match self {
+            IndexKind::Substring(substring) => Some(substring),
+            IndexKind::Vs(_) | IndexKind::Fts(_) => None,
         }
     }
 }
@@ -786,6 +899,10 @@ impl IndexMetadata {
         self.kind.as_fts()
     }
 
+    pub fn substring(&self) -> Option<&IndexOptionsSubstring> {
+        self.kind.as_substring()
+    }
+
     /// The NativeType to treat `column` as, if it's a virtual Alternator
     /// attribute (see alternator_attribute_types) - None otherwise.
     pub fn alternator_native_type(&self, column: &ColumnName) -> Option<NativeType> {
@@ -830,6 +947,7 @@ pub enum DbIndexPartitioning {
 pub enum DbIndexKind {
     VectorSearch,
     FullTextSearch,
+    Substring,
 }
 
 #[derive(Debug)]
@@ -937,12 +1055,16 @@ pub async fn run(
 
     let index_engine_version = vs_index_factory.index_engine_version();
     let indexes = Arc::new(RwLock::new(Indexes::new()));
-    let fts_index_factory = fts_index::new_fts_index_factory_tantivy(worker, memory);
+    let fts_index_factory =
+        fts_index::new_fts_index_factory_tantivy(worker.clone(), memory.clone());
+    let substring_index_factory =
+        substring_index::new_substring_index_factory_tantivy(worker, memory);
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {
             vs: vs_index_factory,
             fts: fts_index_factory,
+            substring: substring_index_factory,
         },
         node_state.clone(),
         metrics.clone(),
@@ -1134,6 +1256,46 @@ mod tests {
     #[test]
     fn positions_defaults_to_enabled() {
         assert!(*Positions::default().as_ref());
+    }
+
+    #[test]
+    fn grams_parse_within_bounds_only() {
+        assert_eq!("3".parse::<MinGram>().unwrap().as_ref().get(), 3);
+        assert_eq!(" 8 ".parse::<MaxGram>().unwrap().as_ref().get(), 8);
+        assert!("0".parse::<MinGram>().is_err());
+        assert!("9".parse::<MaxGram>().is_err());
+        assert!("three".parse::<MaxGram>().is_err());
+    }
+
+    #[test]
+    fn grams_default_to_one_and_three() {
+        assert_eq!(MinGram::default().as_ref().get(), 1);
+        assert_eq!(MaxGram::default().as_ref().get(), 3);
+    }
+
+    #[test]
+    fn case_sensitive_parses_booleans_and_defaults_to_true() {
+        assert!(*"true".parse::<CaseSensitive>().unwrap().as_ref());
+        assert!(!*"FALSE".parse::<CaseSensitive>().unwrap().as_ref());
+        assert!("yes".parse::<CaseSensitive>().is_err());
+        assert!(*CaseSensitive::default().as_ref());
+    }
+
+    #[test]
+    fn substring_options_fall_back_to_defaults_when_min_exceeds_max() {
+        let inverted = IndexOptionsSubstring {
+            min_gram: "4".parse().unwrap(),
+            max_gram: "3".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+        };
+        assert_eq!(inverted.validated(), IndexOptionsSubstring::default());
+
+        let valid = IndexOptionsSubstring {
+            min_gram: "2".parse().unwrap(),
+            max_gram: "2".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+        };
+        assert_eq!(valid.validated(), valid);
     }
 
     #[test]

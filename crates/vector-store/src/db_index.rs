@@ -927,7 +927,7 @@ fn parse_indexed_value(value: DbValue, kind: &IndexKind) -> anyhow::Result<DbInd
                 .map_err(|err| anyhow!("parse_indexed_value: {err}"))
                 .map(DbIndexedValue::Vector),
         },
-        IndexKind::Fts(_) => match value {
+        IndexKind::Fts(_) | IndexKind::Substring(_) => match value {
             DbValue::Value(CqlValue::Text(s) | CqlValue::Ascii(s)) => {
                 Ok(DbIndexedValue::Document(s))
             }

@@ -193,6 +193,17 @@ pub struct FulltextIndexOptions {
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Options a substring index was created with.
+pub struct SubstringIndexOptions {
+    /// Length in characters of the shortest indexed substring; queries shorter than this are rejected.
+    pub min_gram: usize,
+    /// Length in characters of the longest indexed substring; longer queries are answered by intersecting their substrings and verifying candidates.
+    pub max_gram: usize,
+    /// Whether matching is case-sensitive (the CQL `LIKE` semantics) or lowercases both values and queries.
+    pub case_sensitive: bool,
+}
+
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 /// Options an index was created with, tagged with the index's type.
 pub enum IndexOptions {
@@ -200,6 +211,8 @@ pub enum IndexOptions {
     Vector(VectorIndexOptions),
     /// Full-text search index options.
     Fulltext(FulltextIndexOptions),
+    /// Substring search index options.
+    Substring(SubstringIndexOptions),
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -496,6 +509,26 @@ pub struct PostIndexBm25Request {
 pub struct PostIndexBm25Response {
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
     pub scores: Vec<f32>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Request body for substring (infix containment) search.
+pub struct PostIndexContainsRequest {
+    /// The text every returned row's indexed value must contain.
+    pub query: String,
+    /// The maximum number of primary keys to return.
+    #[serde(default)]
+    pub limit: Limit,
+    /// The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes.
+    #[serde(default)]
+    pub offset: usize,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Response for substring (infix containment) search.
+pub struct PostIndexContainsResponse {
+    /// Primary keys of the matching rows, one array of values per primary key column.
+    pub primary_keys: HashMap<ColumnName, Vec<Value>>,
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]

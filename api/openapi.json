@@ -328,6 +328,100 @@
         }
       }
     },
+    "/api/v1/indexes/{keyspace}/{index}/contains": {
+      "post": {
+        "tags": [
+          "scylla-vector-store-index"
+        ],
+        "description": "Performs a substring (infix containment) search against the specified index. Returns the primary keys of the rows whose indexed value contains the query text, the way SQL `LIKE '%query%'` matches. Matching is exact: no ranking, no scoring, and case-sensitive unless the index was created with `case_sensitive` set to false. Rows come in index order. The 'limit' and 'offset' parameters in the payload page through them; the order may change as the index is updated, so paging by offset is only stable between writes. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+        "operationId": "post_index_contains",
+        "parameters": [
+          {
+            "name": "keyspace",
+            "in": "path",
+            "description": "The name of the ScyllaDB keyspace containing the index.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/KeyspaceName"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "The name of the substring index within the specified keyspace to search.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/IndexName"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostIndexContainsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful substring search. Returns the primary keys of the matching rows.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PostIndexContainsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. Possible causes: malformed input, an empty query, or a query shorter than the index's min_gram.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error while searching. Possible causes: internal error, or search engine issues.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/IndexNotReadyResponse"
+          }
+        }
+      }
+    },
     "/api/v1/indexes/{keyspace}/{index}/highlight": {
       "post": {
         "tags": [
@@ -711,6 +805,29 @@
               }
             ],
             "description": "Full-text search index options."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SubstringIndexOptions",
+                "description": "Substring search index options."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "substring"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "Substring search index options."
           }
         ],
         "description": "Options an index was created with, tagged with the index's type."
@@ -1206,6 +1323,49 @@
           }
         }
       },
+      "PostIndexContainsRequest": {
+        "type": "object",
+        "description": "Request body for substring (infix containment) search.",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "limit": {
+            "$ref": "#/components/schemas/Limit",
+            "description": "The maximum number of primary keys to return."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes.",
+            "minimum": 0
+          },
+          "query": {
+            "type": "string",
+            "description": "The text every returned row's indexed value must contain."
+          }
+        }
+      },
+      "PostIndexContainsResponse": {
+        "type": "object",
+        "description": "Response for substring (infix containment) search.",
+        "required": [
+          "primary_keys"
+        ],
+        "properties": {
+          "primary_keys": {
+            "type": "object",
+            "description": "Primary keys of the matching rows, one array of values per primary key column.",
+            "additionalProperties": {
+              "type": "array",
+              "items": {}
+            },
+            "propertyNames": {
+              "type": "string",
+              "description": "Name of the column in a db table."
+            }
+          }
+        }
+      },
       "PostIndexHighlightRequest": {
         "type": "object",
         "description": "Request body for highlighting.",
@@ -1260,6 +1420,31 @@
         "type": "number",
         "format": "float",
         "description": "Similarity score between vectors derived from the distance. Higher score means more similar."
+      },
+      "SubstringIndexOptions": {
+        "type": "object",
+        "description": "Options a substring index was created with.",
+        "required": [
+          "min_gram",
+          "max_gram",
+          "case_sensitive"
+        ],
+        "properties": {
+          "case_sensitive": {
+            "type": "boolean",
+            "description": "Whether matching is case-sensitive (the CQL `LIKE` semantics) or lowercases both values and queries."
+          },
+          "max_gram": {
+            "type": "integer",
+            "description": "Length in characters of the longest indexed substring; longer queries are answered by intersecting their substrings and verifying candidates.",
+            "minimum": 0
+          },
+          "min_gram": {
+            "type": "integer",
+            "description": "Length in characters of the shortest indexed substring; queries shorter than this are rejected.",
+            "minimum": 0
+          }
+        }
       },
       "Vector": {
         "type": "array",

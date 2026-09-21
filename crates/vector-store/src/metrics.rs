@@ -27,6 +27,8 @@ pub(crate) struct Metrics {
     pub cdc_last_processed_timestamp_seconds: GaugeVec,
     pub fts_index_size_bytes: GaugeVec,
     pub fts_segment_count: GaugeVec,
+    pub substring_index_size_bytes: GaugeVec,
+    pub substring_segment_count: GaugeVec,
     dirty_indexes: Arc<DashSet<(String, String)>>,
 }
 
@@ -159,6 +161,24 @@ impl Metrics {
         )
         .unwrap();
 
+        let substring_index_size_bytes = GaugeVec::new(
+            prometheus::Opts::new(
+                "substring_index_size_bytes",
+                "Total size of a substring search index (bytes)",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
+        let substring_segment_count = GaugeVec::new(
+            prometheus::Opts::new(
+                "substring_segment_count",
+                "Number of segments in a substring search index",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
         registry.register(Box::new(latency.clone())).unwrap();
         registry.register(Box::new(size.clone())).unwrap();
         registry.register(Box::new(modified.clone())).unwrap();
@@ -179,6 +199,12 @@ impl Metrics {
         registry
             .register(Box::new(fts_segment_count.clone()))
             .unwrap();
+        registry
+            .register(Box::new(substring_index_size_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(substring_segment_count.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -192,6 +218,8 @@ impl Metrics {
             cdc_last_processed_timestamp_seconds,
             fts_index_size_bytes,
             fts_segment_count,
+            substring_index_size_bytes,
+            substring_segment_count,
             dirty_indexes: Arc::new(DashSet::new()),
         }
     }
@@ -224,6 +252,12 @@ impl Metrics {
             .remove_label_values(&[keyspace, index_name]);
         let _ = self
             .fts_segment_count
+            .remove_label_values(&[keyspace, index_name]);
+        let _ = self
+            .substring_index_size_bytes
+            .remove_label_values(&[keyspace, index_name]);
+        let _ = self
+            .substring_segment_count
             .remove_label_values(&[keyspace, index_name]);
         for op in OPERATIONS {
             let _ = self
@@ -542,6 +576,42 @@ mod tests {
         assert!(
             output.contains(r#"fts_index_size_bytes{index_name="idx",keyspace="ks"} 1024"#),
             "expected observed value in export:\n{output}"
+        );
+    }
+
+    #[test]
+    fn substring_gauges_are_exported_and_removed_with_the_index() {
+        let metrics = Metrics::new();
+
+        metrics
+            .substring_index_size_bytes
+            .with_label_values(&["ks", "idx"])
+            .set(2048.0);
+        metrics
+            .substring_segment_count
+            .with_label_values(&["ks", "idx"])
+            .set(2.0);
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            output.contains("# TYPE substring_index_size_bytes gauge"),
+            "substring_index_size_bytes gauge missing from export:\n{output}"
+        );
+        assert!(
+            output.contains(r#"substring_index_size_bytes{index_name="idx",keyspace="ks"} 2048"#),
+            "expected observed value in export:\n{output}"
+        );
+        assert!(
+            output.contains(r#"substring_segment_count{index_name="idx",keyspace="ks"} 2"#),
+            "expected observed value in export:\n{output}"
+        );
+
+        metrics.remove_index_labels("ks", "idx");
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            !output.contains(r#"index_name="idx""#),
+            "the index's series should be removed, got:\n{output}"
         );
     }
 

@@ -40,6 +40,8 @@ service supports also `.env` files.
 | `VECTOR_STORE_DISKANN_ALPHA`               | DiskANN parameter that controls the trade-off between index quality and build time. | (DiskANN default)                    |
 | `VECTOR_STORE_DISKANN_MAX_POINTS`          | Maximum number of vectors a single DiskANN partition index can hold. | `1M (1_000_000)`                    |
 | `VECTOR_STORE_ALTER_INDEX_SIMULATOR`       | Enable simulator for missing `ALTER INDEX`. When enable indexes aren't deleted and their version is not checked.                                                                     | `false`                  |
+| `VECTOR_STORE_FULLTEXT_INDEXES`            | Serve full-text (`fulltext_index`) indexes. When disabled they are ignored and left to other nodes.                                                                                  | `true`                   |
+| `VECTOR_STORE_SUBSTRING_INDEXES`           | Serve substring (`substring_index`) indexes. When disabled they are ignored and left to other nodes.                                                                                 | `true`                   |
 
 ## Development builds
 

@@ -24,6 +24,7 @@ mod reconnect;
 mod routing;
 mod serde;
 mod similarity_functions;
+mod substring;
 mod tls_reload;
 
 use clap::Parser;

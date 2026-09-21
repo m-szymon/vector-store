@@ -23,6 +23,9 @@ use crate::monitor_items;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
 use crate::perf;
+use crate::substring_index::SubstringIndex;
+use crate::substring_index::SubstringIndexConfiguration;
+use crate::substring_index::SubstringIndexFactory;
 use crate::table::Table;
 use crate::vs_index::VsIndexConfiguration;
 use crate::vs_index::VsIndexFactory;
@@ -46,6 +49,7 @@ use tracing::trace;
 type AddIndexR = anyhow::Result<()>;
 type GetVsIndexR = Option<(mpsc::Sender<VsIndexSearch>, mpsc::Sender<DbIndex>)>;
 type GetFtsIndexR = Option<(mpsc::Sender<FtsIndex>, mpsc::Sender<DbIndex>)>;
+type GetSubstringIndexR = Option<(mpsc::Sender<SubstringIndex>, mpsc::Sender<DbIndex>)>;
 
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum Engine {
@@ -64,6 +68,10 @@ pub(crate) enum Engine {
         key: IndexKey,
         tx: oneshot::Sender<GetFtsIndexR>,
     },
+    GetSubstringIndex {
+        key: IndexKey,
+        tx: oneshot::Sender<GetSubstringIndexR>,
+    },
 }
 
 pub(crate) trait EngineExt {
@@ -71,6 +79,7 @@ pub(crate) trait EngineExt {
     async fn del_index(&self, key: IndexKey);
     async fn get_vs_index(&self, key: IndexKey) -> GetVsIndexR;
     async fn get_fts_index(&self, key: IndexKey) -> GetFtsIndexR;
+    async fn get_substring_index(&self, key: IndexKey) -> GetSubstringIndexR;
 }
 
 impl EngineExt for mpsc::Sender<Engine> {
@@ -106,11 +115,21 @@ impl EngineExt for mpsc::Sender<Engine> {
         rx.await
             .expect("EngineExt::get_fts_index: internal actor should send response")
     }
+
+    async fn get_substring_index(&self, key: IndexKey) -> GetSubstringIndexR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Engine::GetSubstringIndex { key, tx })
+            .await
+            .expect("EngineExt::get_substring_index: internal actor should receive request");
+        rx.await
+            .expect("EngineExt::get_substring_index: internal actor should send response")
+    }
 }
 
 pub(crate) struct IndexFactories {
     pub(crate) vs: Box<dyn VsIndexFactory + Send + Sync>,
     pub(crate) fts: Box<dyn FtsIndexFactory + Send + Sync>,
+    pub(crate) substring: Box<dyn SubstringIndexFactory + Send + Sync>,
 }
 
 pub(crate) async fn new(
@@ -165,6 +184,10 @@ pub(crate) async fn new(
 
                             Engine::GetFtsIndex { key, tx } => {
                                 get_fts_index(key, tx, &indexes).await
+                            }
+
+                            Engine::GetSubstringIndex { key, tx } => {
+                                get_substring_index(key, tx, &indexes).await
                             }
 
                         }
@@ -258,10 +281,10 @@ async fn add_index(
         metadata,
     };
 
-    let result = if let IndexKind::Vs(_) = ctx.metadata.kind {
-        add_index_vs(ctx).await
-    } else {
-        add_index_fts(ctx).await
+    let result = match ctx.metadata.kind {
+        IndexKind::Vs(_) => add_index_vs(ctx).await,
+        IndexKind::Fts(_) => add_index_fts(ctx).await,
+        IndexKind::Substring(_) => add_index_substring(ctx).await,
     };
 
     match result {
@@ -351,6 +374,41 @@ async fn add_index_fts(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn add_index_substring(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
+    let options = ctx.metadata.substring().ok_or_else(|| {
+        anyhow::anyhow!("add_index_substring must be called with a substring-search index")
+    })?;
+    let substring_sender = ctx.index_factories.substring.create_index(
+        SubstringIndexConfiguration {
+            key: ctx.key.clone(),
+            options: *options,
+        },
+        Arc::clone(&ctx.table),
+    );
+
+    let monitor_actor = monitor_items::new(
+        ctx.key.clone(),
+        ctx.table,
+        ctx.embeddings_stream,
+        substring_sender.clone(),
+        ctx.metrics,
+    )
+    .await?;
+
+    let entry = crate::indexes::SubstringIndexEntry::new(
+        ctx.metadata,
+        substring_sender,
+        monitor_actor,
+        ctx.db_index,
+    )
+    .await?;
+    ctx.indexes
+        .write()
+        .unwrap()
+        .insert_substring(ctx.key, entry);
+    Ok(())
+}
+
 async fn del_index(key: IndexKey, indexes: &RwLock<Indexes>, metrics: &Metrics) {
     if indexes.write().unwrap().remove(&key) {
         info!("removed the index {key}");
@@ -382,6 +440,20 @@ async fn get_fts_index(
     );
 }
 
+async fn get_substring_index(
+    key: IndexKey,
+    tx: oneshot::Sender<GetSubstringIndexR>,
+    indexes: &RwLock<Indexes>,
+) {
+    _ = tx.send(
+        indexes
+            .read()
+            .unwrap()
+            .get_substring(&key)
+            .map(|entry| (entry.index().clone(), entry.db_index())),
+    );
+}
+
 async fn update_indexes(node_state: &Sender<NodeState>, indexes: &RwLock<Indexes>) {
     let actual_indexes: Vec<_> = {
         let indexes = indexes.read().unwrap();
@@ -396,6 +468,14 @@ async fn update_indexes(node_state: &Sender<NodeState>, indexes: &RwLock<Indexes
                 )
             })
             .chain(indexes.iter_fts().map(|(key, entry)| {
+                (
+                    key.clone(),
+                    entry.db_index(),
+                    entry.progress(),
+                    entry.status(),
+                )
+            }))
+            .chain(indexes.iter_substring().map(|(key, entry)| {
                 (
                     key.clone(),
                     entry.db_index(),
@@ -420,6 +500,9 @@ async fn update_indexes(node_state: &Sender<NodeState>, indexes: &RwLock<Indexes
                 entry.set_progress(new_progress);
                 entry.set_status(new_status);
             } else if let Some(entry) = indexes.get_fts_mut(&key) {
+                entry.set_progress(new_progress);
+                entry.set_status(new_status);
+            } else if let Some(entry) = indexes.get_substring_mut(&key) {
                 entry.set_progress(new_progress);
                 entry.set_status(new_status);
             }
@@ -453,6 +536,12 @@ pub(crate) mod tests {
             key: IndexKey,
             tx: oneshot::Sender<GetFtsIndexR>,
         ) -> impl Future<Output = ()> + Send + 'static;
+
+        fn get_substring_index(
+            &self,
+            key: IndexKey,
+            tx: oneshot::Sender<GetSubstringIndexR>,
+        ) -> impl Future<Output = ()> + Send + 'static;
     }
 
     pub(crate) fn new(sim: impl SimEngine + Send + 'static) -> mpsc::Sender<Engine> {
@@ -475,6 +564,9 @@ pub(crate) mod tests {
                         Engine::DelIndex { key } => sim.del_index(key).await,
                         Engine::GetVsIndex { key, tx } => sim.get_vs_index(key, tx).await,
                         Engine::GetFtsIndex { key, tx } => sim.get_fts_index(key, tx).await,
+                        Engine::GetSubstringIndex { key, tx } => {
+                            sim.get_substring_index(key, tx).await
+                        }
                     }
                 }
 

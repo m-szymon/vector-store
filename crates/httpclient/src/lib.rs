@@ -16,6 +16,8 @@ use httpapi::PostIndexAnnRequest;
 use httpapi::PostIndexAnnResponse;
 use httpapi::PostIndexBm25Request;
 use httpapi::PostIndexBm25Response;
+use httpapi::PostIndexContainsRequest;
+use httpapi::PostIndexContainsResponse;
 use httpapi::PostIndexHighlightRequest;
 use httpapi::PostIndexHighlightResponse;
 use httpapi::SimilarityScore;
@@ -142,6 +144,46 @@ impl HttpClient {
         self.client
             .post(format!(
                 "{}/indexes/{}/{}/bm25",
+                self.url_api, keyspace_name, index_name
+            ))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    pub async fn contains(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        query: String,
+        limit: Limit,
+        offset: usize,
+    ) -> HashMap<ColumnName, Vec<Value>> {
+        self.post_contains(keyspace_name, index_name, query, limit, offset)
+            .await
+            .json::<PostIndexContainsResponse>()
+            .await
+            .unwrap()
+            .primary_keys
+    }
+
+    pub async fn post_contains(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        query: String,
+        limit: Limit,
+        offset: usize,
+    ) -> reqwest::Response {
+        let request = PostIndexContainsRequest {
+            query,
+            limit,
+            offset,
+        };
+        self.client
+            .post(format!(
+                "{}/indexes/{}/{}/contains",
                 self.url_api, keyspace_name, index_name
             ))
             .json(&request)

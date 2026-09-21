@@ -7,6 +7,7 @@ use crate::Filter;
 use crate::IndexKey;
 use crate::IndexName;
 use crate::IndexOptionsFts;
+use crate::IndexOptionsSubstring;
 use crate::IndexOptionsVs;
 use crate::KeyspaceName;
 use crate::Progress;
@@ -30,6 +31,8 @@ use crate::metrics::Metrics;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
 use crate::perf;
+use crate::substring_index::SubstringIndex;
+use crate::substring_index::SubstringIndexExt;
 use crate::vector;
 use crate::vs_index;
 use crate::vs_index::VsIndexSearch;
@@ -56,6 +59,7 @@ use httpapi::FulltextIndexOptions;
 use httpapi::IndexInfo;
 use httpapi::IndexOptions;
 use httpapi::SimilarityFunction;
+use httpapi::SubstringIndexOptions;
 use httpapi::VectorIndexOptions;
 use itertools::Itertools;
 use prometheus::Encoder;
@@ -166,6 +170,7 @@ fn new_open_api_router() -> (Router<RoutesInnerState>, utoipa::openapi::OpenApi)
                 .routes(routes!(get_index_info))
                 .routes(routes!(post_index_ann))
                 .routes(routes!(post_index_bm25))
+                .routes(routes!(post_index_contains))
                 .routes(routes!(post_index_highlight))
                 .routes(routes!(get_info))
                 .routes(routes!(get_status)),
@@ -250,6 +255,16 @@ impl From<&IndexOptionsFts> for FulltextIndexOptions {
         FulltextIndexOptions {
             analyzer: options.analyzer.to_string(),
             positions: *options.positions.as_ref(),
+        }
+    }
+}
+
+impl From<&IndexOptionsSubstring> for SubstringIndexOptions {
+    fn from(options: &IndexOptionsSubstring) -> Self {
+        SubstringIndexOptions {
+            min_gram: options.min_gram.as_ref().get(),
+            max_gram: options.max_gram.as_ref().get(),
+            case_sensitive: *options.case_sensitive.as_ref(),
         }
     }
 }
@@ -344,6 +359,15 @@ async fn get_indexes(State(state): State<RoutesInnerState>) -> Response {
                     entry.progress(),
                 )
             }))
+            .chain(indexes.iter_substring().map(|(key, entry)| {
+                (
+                    key.clone(),
+                    IndexOptions::Substring(entry.options().into()),
+                    IndexSender::Substring(entry.index().clone()),
+                    entry.status(),
+                    entry.progress(),
+                )
+            }))
             .collect()
     };
 
@@ -380,6 +404,7 @@ struct ErrorMessage(#[allow(dead_code)] String);
 enum IndexSender {
     Vs(Sender<VsIndexSearch>),
     Fts(Sender<FtsIndex>),
+    Substring(Sender<SubstringIndex>),
 }
 
 impl IndexSender {
@@ -387,6 +412,7 @@ impl IndexSender {
         match self {
             IndexSender::Vs(index) => index.count(index_key).await,
             IndexSender::Fts(index) => index.count(index_key).await,
+            IndexSender::Substring(index) => index.count(index_key).await,
         }
     }
 }
@@ -528,6 +554,13 @@ async fn get_index_info(
                 entry.status(),
                 entry.progress(),
             )
+        } else if let Some(entry) = indexes.get_substring(&index_key) {
+            (
+                IndexOptions::Substring(entry.options().into()),
+                IndexSender::Substring(entry.index().clone()),
+                entry.status(),
+                entry.progress(),
+            )
         } else {
             let msg = format!("missing index: {keyspace_name}.{index_name}");
             debug!("get_index_info: {msg}");
@@ -576,7 +609,7 @@ async fn refresh_index_metrics(
     }
 
     if let Some((index, _)) = state.engine.get_fts_index(key.clone()).await
-        && let Ok(stats) = index.stats(key).await
+        && let Ok(stats) = index.stats(key.clone()).await
     {
         state
             .metrics
@@ -591,6 +624,27 @@ async fn refresh_index_metrics(
         state
             .metrics
             .fts_segment_count
+            .with_label_values(&labels)
+            .set(stats.segment_count as f64);
+        return;
+    }
+
+    if let Some((index, _)) = state.engine.get_substring_index(key.clone()).await
+        && let Ok(stats) = index.stats(key).await
+    {
+        state
+            .metrics
+            .size
+            .with_label_values(&labels)
+            .set(stats.num_docs as f64);
+        state
+            .metrics
+            .substring_index_size_bytes
+            .with_label_values(&labels)
+            .set(stats.size_bytes as f64);
+        state
+            .metrics
+            .substring_segment_count
             .with_label_values(&labels)
             .set(stats.segment_count as f64);
     }
@@ -1132,6 +1186,146 @@ async fn post_index_bm25(
                         primary_keys,
                         scores,
                     }),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/indexes/{keyspace}/{index}/contains",
+    tag = "scylla-vector-store-index",
+    description = "Performs a substring (infix containment) search against the specified index. \
+Returns the primary keys of the rows whose indexed value contains the query text, the way SQL `LIKE '%query%'` matches. \
+Matching is exact: no ranking, no scoring, and case-sensitive unless the index was created with `case_sensitive` set to false. \
+Rows come in index order. The 'limit' and 'offset' parameters in the payload page through them; the order may change as the index is updated, so paging by offset is only stable between writes. \
+If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+    params(
+        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
+        ("index" = httpapi::IndexName, Path, description = "The name of the substring index within the specified keyspace to search.")
+    ),
+    request_body = httpapi::PostIndexContainsRequest,
+    responses(
+        (
+            status = 200,
+            description = "Successful substring search. Returns the primary keys of the matching rows.",
+            body = httpapi::PostIndexContainsResponse
+        ),
+        (
+            status = 400,
+            description = "Bad request. Possible causes: malformed input, an empty query, or a query shorter than the index's min_gram.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 403,
+            description = "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 404,
+            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 500,
+            description = "Error while searching. Possible causes: internal error, or search engine issues.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 503,
+            response = httpapi::IndexNotReadyResponse
+        )
+    )
+)]
+async fn post_index_contains(
+    State(state): State<RoutesInnerState>,
+    extensions: Extensions,
+    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+    extract::Json(request): extract::Json<httpapi::PostIndexContainsRequest>,
+) -> Response {
+    let keyspace: crate::KeyspaceName = keyspace.into();
+    let index_name: crate::IndexName = index_name.into();
+    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_contains") {
+        return resp;
+    }
+
+    let timer = state
+        .metrics
+        .latency
+        .with_label_values(&[keyspace.as_ref(), index_name.as_ref()])
+        .start_timer();
+
+    let index_key = IndexKey::new(&keyspace, &index_name);
+
+    let serving_or_progress = {
+        let indexes = state.indexes.read().unwrap();
+        let Some(entry) = indexes.get_substring(&index_key) else {
+            timer.observe_duration();
+
+            let msg = format!("missing index: {keyspace}.{index_name}");
+            debug!("post_index_contains: {msg}");
+            return (StatusCode::NOT_FOUND, msg).into_response();
+        };
+        if entry.status() == crate::node_state::IndexStatus::Serving {
+            Ok((entry.index().clone(), entry.primary_key_columns().clone()))
+        } else {
+            Err(entry.progress())
+        }
+    };
+
+    let (substring_sender, primary_key_columns) = match check_fts_serving(
+        serving_or_progress,
+        &state.node_state,
+        &keyspace,
+        &index_name,
+        "post_index_contains",
+    )
+    .await
+    {
+        Ok(serving) => serving,
+        Err(resp) => {
+            timer.observe_duration();
+            return resp;
+        }
+    };
+
+    let search_result = substring_sender
+        .search(
+            index_key,
+            request.query,
+            request.limit.into(),
+            request.offset,
+        )
+        .await;
+
+    timer.observe_duration();
+
+    match search_result {
+        Err(err) => {
+            let msg = format!("index.contains request error: {err}");
+            debug!("post_index_contains: {msg}");
+            let status = if err.downcast_ref::<QueryError>().is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg).into_response()
+        }
+        Ok(primary_keys) => {
+            match try_collect_primary_keys(primary_key_columns.as_slice(), &primary_keys) {
+                Err(err) => {
+                    debug!("post_index_contains: {err}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+                Ok(primary_keys) => (
+                    StatusCode::OK,
+                    response::Json(httpapi::PostIndexContainsResponse { primary_keys }),
                 )
                     .into_response(),
             }

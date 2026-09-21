@@ -22,6 +22,7 @@ use vector_store::HttpServerExt;
 use vector_store::IndexKind;
 use vector_store::IndexMetadata;
 use vector_store::IndexOptionsFts;
+use vector_store::IndexOptionsSubstring;
 use vector_store::IndexOptionsVs;
 use vector_store::NonemptyArc;
 use vector_store::NonemptyIteratorExt;
@@ -113,6 +114,26 @@ pub(crate) fn make_fts_index_with_options(
         &[],
         version,
         IndexKind::Fts(options),
+    )
+}
+
+pub(crate) fn make_substring_index_with_options(
+    name: &str,
+    primary_key_columns: &[&str],
+    partition_key_count: usize,
+    target_column: &str,
+    version: Uuid,
+    options: IndexOptionsSubstring,
+) -> IndexMetadata {
+    make_index_with_kind(
+        name,
+        primary_key_columns,
+        partition_key_count,
+        target_column,
+        DbIndexPartitioning::Global,
+        &[],
+        version,
+        IndexKind::Substring(options),
     )
 }
 

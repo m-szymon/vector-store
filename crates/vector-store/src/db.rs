@@ -5,6 +5,7 @@
 
 use crate::Analyzer;
 use crate::AsyncInProgress;
+use crate::CaseSensitive;
 use crate::ColumnName;
 use crate::Config;
 use crate::Connectivity;
@@ -19,9 +20,12 @@ use crate::ExpansionSearch;
 use crate::IndexMetadata;
 use crate::IndexName;
 use crate::IndexOptionsFts;
+use crate::IndexOptionsSubstring;
 use crate::IndexVersion;
 use crate::KeyspaceName;
+use crate::MaxGram;
 use crate::Metrics;
+use crate::MinGram;
 use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
 use crate::Positions;
@@ -95,6 +99,7 @@ type GetVsIndexParamsR = anyhow::Result<
     )>,
 >;
 type GetFtsIndexParamsR = anyhow::Result<Option<IndexOptionsFts>>;
+type GetSubstringIndexParamsR = anyhow::Result<Option<IndexOptionsSubstring>>;
 type IsValidIndexR = bool;
 type IsValidSchemaR = bool;
 
@@ -141,6 +146,12 @@ pub enum Db {
         table: TableName,
         index: IndexName,
         tx: oneshot::Sender<GetFtsIndexParamsR>,
+    },
+    GetSubstringIndexParams {
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+        tx: oneshot::Sender<GetSubstringIndexParamsR>,
     },
 
     // The vector-store reads some schema metadata from system tables directly, because they are
@@ -196,6 +207,13 @@ pub(crate) trait DbExt {
         table: TableName,
         index: IndexName,
     ) -> GetFtsIndexParamsR;
+
+    async fn get_substring_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetSubstringIndexParamsR;
 
     async fn is_valid_index(&self, metadata: IndexMetadata) -> IsValidIndexR;
 
@@ -282,6 +300,23 @@ impl DbExt for mpsc::Sender<Db> {
     ) -> GetFtsIndexParamsR {
         let (tx, rx) = oneshot::channel();
         self.send(Db::GetFtsIndexParams {
+            keyspace,
+            table,
+            index,
+            tx,
+        })
+        .await?;
+        rx.await?
+    }
+
+    async fn get_substring_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetSubstringIndexParamsR {
+        let (tx, rx) = oneshot::channel();
+        self.send(Db::GetSubstringIndexParams {
             keyspace,
             table,
             index,
@@ -444,6 +479,9 @@ fn respond_with_error(msg: Db, error: anyhow::Error) {
         Db::GetFtsIndexParams { tx, .. } => {
             let _ = tx.send(Err(error));
         }
+        Db::GetSubstringIndexParams { tx, .. } => {
+            let _ = tx.send(Err(error));
+        }
         Db::IsValidIndex { tx, .. } => {
             let _ = tx.send(false);
         }
@@ -523,6 +561,21 @@ async fn process(
                     .await,
             )
             .unwrap_or_else(|_| trace!("process: Db::GetFtsIndexParams: unable to send response")),
+
+        Db::GetSubstringIndexParams {
+            keyspace,
+            table,
+            index,
+            tx,
+        } => tx
+            .send(
+                statements
+                    .get_substring_index_params(keyspace, table, index)
+                    .await,
+            )
+            .unwrap_or_else(|_| {
+                trace!("process: Db::GetSubstringIndexParams: unable to send response")
+            }),
 
         Db::IsValidIndex { metadata, tx } => tx
             .send(statements.is_valid_index(metadata).await)
@@ -1071,6 +1124,26 @@ impl Statements {
         }))
     }
 
+    async fn get_substring_index_params(
+        &self,
+        keyspace: KeyspaceName,
+        table: TableName,
+        index: IndexName,
+    ) -> GetSubstringIndexParamsR {
+        let options = self.get_index_options(keyspace, table, index).await?;
+        Ok(options.map(|options| {
+            let min_gram: MinGram = parse_index_option(&options, "min_gram");
+            let max_gram: MaxGram = parse_index_option(&options, "max_gram");
+            let case_sensitive: CaseSensitive = parse_index_option(&options, "case_sensitive");
+            IndexOptionsSubstring {
+                min_gram,
+                max_gram,
+                case_sensitive,
+            }
+            .validated()
+        }))
+    }
+
     async fn is_valid_index(&self, metadata: IndexMetadata) -> IsValidIndexR {
         let Some(session) = self.session_rx.borrow().clone() else {
             debug!("is_valid_index: no active session for {}", metadata.key());
@@ -1219,6 +1292,7 @@ fn db_index_kind_from_options(options: &mut BTreeMap<String, String>) -> Option<
     match options.remove("class_name").as_deref() {
         Some("vector_index") | None => Some(DbIndexKind::VectorSearch),
         Some("fulltext_index") => Some(DbIndexKind::FullTextSearch),
+        Some("substring_index") => Some(DbIndexKind::Substring),
         Some(unknown) => {
             debug!("unrecognized index class_name: {unknown:?}, skipping index");
             None
@@ -1320,7 +1394,7 @@ fn validate_column_type_for_kind(
                 );
             }
         }
-        DbIndexKind::FullTextSearch => {
+        DbIndexKind::FullTextSearch | DbIndexKind::Substring => {
             if !matches!(
                 column_type,
                 ColumnType::Native(NativeType::Text) | ColumnType::Native(NativeType::Ascii)
@@ -1393,6 +1467,14 @@ pub(crate) mod tests {
             tx: oneshot::Sender<GetFtsIndexParamsR>,
         ) -> impl Future<Output = ()> + Send + 'static;
 
+        fn get_substring_index_params(
+            &self,
+            keyspace: KeyspaceName,
+            table: TableName,
+            index: IndexName,
+            tx: oneshot::Sender<GetSubstringIndexParamsR>,
+        ) -> impl Future<Output = ()> + Send + 'static;
+
         fn is_valid_index(
             &self,
             metadata: IndexMetadata,
@@ -1456,6 +1538,16 @@ pub(crate) mod tests {
                             index,
                             tx,
                         } => sim.get_fts_index_params(keyspace, table, index, tx).await,
+
+                        Db::GetSubstringIndexParams {
+                            keyspace,
+                            table,
+                            index,
+                            tx,
+                        } => {
+                            sim.get_substring_index_params(keyspace, table, index, tx)
+                                .await
+                        }
 
                         Db::IsValidIndex { metadata, tx } => sim.is_valid_index(metadata, tx).await,
 
@@ -1612,6 +1704,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn db_index_kind_from_options_substring() {
+        let mut options =
+            BTreeMap::from([("class_name".to_string(), "substring_index".to_string())]);
+        assert_eq!(
+            db_index_kind_from_options(&mut options),
+            Some(DbIndexKind::Substring)
+        );
+        assert!(!options.contains_key("class_name"));
+    }
+
+    #[test]
     fn db_index_kind_from_options_absent() {
         let mut options = BTreeMap::new();
         assert_eq!(
@@ -1706,6 +1809,30 @@ pub(crate) mod tests {
         let col_type = ColumnType::Native(NativeType::Int);
         let result = validate_column_type_for_kind("col", &col_type, DbIndexKind::FullTextSearch);
         assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not a text column")
+        );
+    }
+
+    #[test]
+    fn validate_substring_accepts_text_and_ascii_columns() {
+        for col_type in [
+            ColumnType::Native(NativeType::Text),
+            ColumnType::Native(NativeType::Ascii),
+        ] {
+            assert!(
+                validate_column_type_for_kind("name", &col_type, DbIndexKind::Substring).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_substring_rejects_non_text_column() {
+        let col_type = ColumnType::Native(NativeType::Int);
+        let result = validate_column_type_for_kind("col", &col_type, DbIndexKind::Substring);
         assert!(
             result
                 .unwrap_err()

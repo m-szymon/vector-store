@@ -7,6 +7,7 @@ use crate::common::blocking_scan_fn;
 use crate::common::make_fts_index;
 use crate::common::make_fts_index_with_options;
 use crate::common::make_index_with_kind;
+use crate::common::make_substring_index_with_options;
 use crate::common::make_vs_index;
 use crate::common::ordered_timeuuid;
 use crate::common::setup;
@@ -19,6 +20,7 @@ use httpapi::FulltextIndexOptions;
 use httpapi::IndexOptions;
 use httpapi::IndexStatus;
 use httpapi::SimilarityFunction;
+use httpapi::SubstringIndexOptions;
 use httpapi::VectorIndexOptions;
 use rstest::rstest;
 use scylla::cluster::metadata::NativeType;
@@ -30,6 +32,7 @@ use vector_store::Analyzer;
 use vector_store::DbIndexPartitioning;
 use vector_store::IndexKind;
 use vector_store::IndexOptionsFts;
+use vector_store::IndexOptionsSubstring;
 use vector_store::IndexOptionsVs;
 use vector_store::Percentage;
 use vector_store::Progress;
@@ -245,8 +248,32 @@ async fn indexes_lists_all_indexes_with_options() {
     )
     .unwrap();
 
+    let substring_options = IndexOptionsSubstring {
+        min_gram: "2".parse().unwrap(),
+        max_gram: "4".parse().unwrap(),
+        case_sensitive: false.into(),
+    };
+    let substring_index = make_substring_index_with_options(
+        "fourth",
+        &["pk"],
+        1,
+        "nickname",
+        ordered_timeuuid(4),
+        substring_options,
+    );
+    db.add_index(
+        substring_index.clone(),
+        Some(db_basic::scan_fn_documents([(
+            [CqlValue::Int(1)].into(),
+            Some("宇将军".to_string()),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+    )
+    .unwrap();
+
     wait_for(
-        || async { client.indexes().await.len() == 3 },
+        || async { client.indexes().await.len() == 4 },
         "all indexes to be listed",
     )
     .await;
@@ -264,6 +291,14 @@ async fn indexes_lists_all_indexes_with_options() {
         (
             "third",
             IndexOptions::Fulltext(FulltextIndexOptions::from(&fts_options)),
+        ),
+        (
+            "fourth",
+            IndexOptions::Substring(SubstringIndexOptions {
+                min_gram: 2,
+                max_gram: 4,
+                case_sensitive: false,
+            }),
         ),
     ]);
     for entry in &entries {
