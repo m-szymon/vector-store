@@ -16,10 +16,12 @@
 //!
 //! So the ordered variants here are expected to be linear in the match count while the unordered
 //! one is flat. The question this benchmark answers is not whether that is true but what the
-//! constant is, because that decides whether plain ordering survives for realistic search-box
-//! keywords or whether stage 2 needs to partition the index by the sort column.
+//! constant is, and what can be done about it. The answers, at 2M names: ordering costs about
+//! 13.5 ns per match unverified and 580--7,700 ns per match verified; restricting the order to the
+//! newest hundredth of the corpus is about 100 times cheaper and tracks the window rather than the
+//! match count; and moving verification off the document store makes it worse, not better.
 //!
-//! Four things are measured, at each keyword frequency:
+//! Measured at each keyword frequency:
 //!
 //! * `walk_unordered` -- stage 1 as it ships: walk, verify, stop at the limit.
 //! * `topdocs_ordered` -- stage 2 for keywords within `max_gram`: one term, ordered top-k.
@@ -27,9 +29,16 @@
 //!   from the store and verified before the top-k is known, so this is the case that turns bounded
 //!   store reads into unbounded ones. Compared against `walk_unordered_verify`, the same query
 //!   shape without ordering.
-//! * `deep_page` -- page 50 rather than page 1, unordered (offset) and ordered, to show that a
-//!   cursor does not rescue either: for `DESC` by time the cursor excludes only the rows already
-//!   returned.
+//! * `deep_page` -- page 50 rather than page 1. A cursor on the sort value does not rescue
+//!   ordering: for `DESC` by time it excludes only the rows already returned, so every page costs
+//!   what the first one did.
+//! * `short_keyword_window` / `long_keyword_window` -- ordering only the newest slice of the
+//!   corpus, which is what partitioning the index by the sort column would amount to. A `doc_id`
+//!   bound stands in for a bucket boundary, and `DocSet::seek` skips the rest over the posting
+//!   list's skip lists.
+//! * `walk_ordered_verify_fast` -- verifying from a `FAST` text column rather than the document
+//!   store. Measured and rejected; behind `SUBSTRING_BENCH_FAST_TEXT` so it stays reproducible.
+//!   See `fast_text_enabled`.
 //!
 //! The corpus is synthetic and built so that match counts are exact rather than estimated: filler
 //! characters and keyword characters are drawn from disjoint alphabets, so a keyword occurs in
@@ -115,6 +124,18 @@ const FILLER: &str =
 /// occurs exactly as often as it was planted.
 const KEYWORD_ALPHABET: &str = "가나다라마바사아자차카타파하거너더러머버서어저처커터퍼허";
 
+/// Whether to add the `FAST` text column that `walk_ordered_verified_fast` needs.
+///
+/// Measured and rejected: the column is dictionary-encoded and every name is distinct, so each
+/// lookup is an sstable seek into a dictionary with one entry per document, at a flat ~7,700 ns per
+/// candidate. Reading the document store instead costs 580--5,600 ns and gets cheaper as matches
+/// get denser, because the walk picks up block locality the column has no equivalent of. At 400,000
+/// matches that is 233 ms against 3,088 ms. Kept behind a flag rather than deleted so the negative
+/// result can be re-checked against a later Tantivy.
+fn fast_text_enabled() -> bool {
+    std::env::var("SUBSTRING_BENCH_FAST_TEXT").is_ok_and(|v| v != "0")
+}
+
 fn corpus_size() -> usize {
     std::env::var("SUBSTRING_BENCH_NAMES")
         .ok()
@@ -142,9 +163,15 @@ fn build_schema() -> Schema {
     let indexing = TextFieldIndexing::default()
         .set_tokenizer(TOKENIZER_NAME)
         .set_index_option(IndexRecordOption::Basic);
-    let text_options = TextOptions::default()
+    // Off by default: the shipped index does not have this column, and adding it inflates the index
+    // and slows the other variants by about a fifth. It exists so the rejected alternative stays
+    // reproducible -- see `walk_ordered_verified_fast`.
+    let mut text_options = TextOptions::default()
         .set_indexing_options(indexing)
         .set_stored();
+    if fast_text_enabled() {
+        text_options = text_options.set_fast(None);
+    }
     let mut builder = Schema::builder();
     builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED);
     builder.add_text_field(TEXT_FIELD, text_options);
@@ -256,6 +283,19 @@ fn build_corpus() -> Corpus {
     writer.commit().expect("bench: failed to commit");
 
     let reader = index.reader().expect("bench: failed to open a reader");
+    let bytes: u64 = std::fs::read_dir(dir.path())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
+        .sum();
+    eprintln!(
+        "corpus: {names} names, index {:.1} MiB ({:.2} bytes/name), {} segments",
+        bytes as f64 / (1 << 20) as f64,
+        bytes as f64 / names as f64,
+        reader.searcher().segment_readers().len(),
+    );
     Corpus {
         _dir: dir,
         reader,
@@ -423,6 +463,128 @@ fn walk_ordered_verified(corpus: &Corpus, keyword: &str, limit: usize, offset: u
     scored.into_iter().skip(offset).take(limit).count()
 }
 
+/// Stage 2 past `max_gram`, verifying from the `FAST` text column instead of the document store.
+///
+/// Identical to `walk_ordered_verified` except for where the text comes from. The store read is
+/// what makes that function cost roughly 545 ns per candidate rather than the 13.5 ns the
+/// unverified path pays, so this asks whether a columnar read is cheaper. It is not obvious that it
+/// is: the str column is dictionary-encoded and every name is distinct, so the dictionary has as
+/// many entries as the corpus has documents and each lookup is an sstable seek.
+fn walk_ordered_verified_fast(
+    corpus: &Corpus,
+    keyword: &str,
+    limit: usize,
+    offset: usize,
+) -> usize {
+    let text_field = corpus.schema.get_field(TEXT_FIELD).unwrap();
+    let (query, needs_verification) = build_query(text_field, keyword);
+
+    let searcher = corpus.reader.searcher();
+    let weight = query
+        .weight(EnableScoring::disabled_from_searcher(&searcher))
+        .expect("bench: failed to build the weight");
+
+    let mut scored: Vec<(u64, u32)> = Vec::new();
+    for segment in searcher.segment_readers() {
+        let mut scorer = weight.scorer(segment, 1.0).expect("bench: failed to score");
+        let alive = segment.alive_bitset();
+        let sort_column = segment
+            .fast_fields()
+            .u64(SORT_FIELD)
+            .expect("bench: missing the sort fast field");
+        let text_column = segment
+            .fast_fields()
+            .str(TEXT_FIELD)
+            .expect("bench: failed to open the text column")
+            .expect("bench: missing the text fast field");
+        let mut buffer = String::new();
+
+        let mut doc_id = scorer.doc();
+        while doc_id != tantivy::TERMINATED {
+            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                let verified = !needs_verification || {
+                    let mut found = false;
+                    for ord in text_column.term_ords(doc_id) {
+                        buffer.clear();
+                        text_column
+                            .ord_to_str(ord, &mut buffer)
+                            .expect("bench: failed to read the text column");
+                        if buffer.contains(keyword) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                };
+                if verified {
+                    let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                    scored.push((sort_key, doc_id));
+                }
+            }
+            doc_id = scorer.advance();
+        }
+    }
+    scored.sort_unstable_by_key(|(sort_key, _)| std::cmp::Reverse(*sort_key));
+    scored.into_iter().skip(offset).take(limit).count()
+}
+
+/// What one bucket of a time-partitioned index would cost.
+///
+/// Bucketing works because a document's bucket is decided by the sort column, so the newest bucket
+/// holds the newest documents and ordering it answers page one without the rest of the corpus being
+/// looked at. This simulates that without building separate indexes: documents are written in sort
+/// order, so a `doc_id` lower bound is the same restriction a bucket boundary would be, and
+/// `DocSet::seek` jumps there over the posting list's skip lists rather than advancing through it.
+///
+/// The measurement to take from this is not the absolute number but that it tracks the matches
+/// inside the window rather than the matches in the corpus.
+fn windowed_ordered(corpus: &Corpus, keyword: &str, limit: usize, window: f64) -> usize {
+    let text_field = corpus.schema.get_field(TEXT_FIELD).unwrap();
+    let (query, needs_verification) = build_query(text_field, keyword);
+
+    let searcher = corpus.reader.searcher();
+    let weight = query
+        .weight(EnableScoring::disabled_from_searcher(&searcher))
+        .expect("bench: failed to build the weight");
+
+    let mut scored: Vec<(u64, u32)> = Vec::new();
+    for segment in searcher.segment_readers() {
+        let max_doc = segment.max_doc();
+        let first_in_window = ((max_doc as f64) * (1.0 - window)) as u32;
+        let mut scorer = weight.scorer(segment, 1.0).expect("bench: failed to score");
+        let alive = segment.alive_bitset();
+        let sort_column = segment
+            .fast_fields()
+            .u64(SORT_FIELD)
+            .expect("bench: missing the sort fast field");
+
+        let store = segment
+            .get_store_reader(STORE_CACHE_BLOCKS)
+            .expect("bench: failed to open the store");
+
+        // The whole point: skip the older part of the posting list rather than walk it.
+        let mut doc_id = scorer.seek(first_in_window);
+        while doc_id != tantivy::TERMINATED {
+            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                let verified = !needs_verification || {
+                    let doc: TantivyDocument =
+                        store.get(doc_id).expect("bench: failed to read a doc");
+                    doc.get_first(text_field)
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|text| text.contains(keyword))
+                };
+                if verified {
+                    let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                    scored.push((sort_key, doc_id));
+                }
+            }
+            doc_id = scorer.advance();
+        }
+    }
+    scored.sort_unstable_by_key(|(sort_key, _)| std::cmp::Reverse(*sort_key));
+    scored.into_iter().take(limit).count()
+}
+
 /// Two-character keywords: the typical search-box query, and the comparison that matters. The
 /// unordered walk should be flat across frequencies and the ordered top-k linear in them.
 fn bench_short_keywords(c: &mut Criterion) {
@@ -466,6 +628,15 @@ fn bench_long_keywords(c: &mut Criterion) {
             &planted.keyword,
             |b, keyword| b.iter(|| black_box(walk_ordered_verified(corpus, keyword, LIMIT, 0))),
         );
+        if fast_text_enabled() {
+            group.bench_with_input(
+                BenchmarkId::new("walk_ordered_verify_fast", &label),
+                &planted.keyword,
+                |b, keyword| {
+                    b.iter(|| black_box(walk_ordered_verified_fast(corpus, keyword, LIMIT, 0)))
+                },
+            );
+        }
     }
     group.finish();
 }
@@ -528,8 +699,23 @@ fn verify_corpus(corpus: &Corpus) {
         );
     }
 
+    if fast_text_enabled() {
+        for planted in &corpus.long {
+            assert_eq!(
+                walk_ordered_verified_fast(corpus, &planted.keyword, usize::MAX, 0),
+                planted.matches,
+                "bench: verifying from the fast text column disagrees with the document store"
+            );
+        }
+    }
+
     for planted in &corpus.short {
         let expected = planted.matches.min(LIMIT);
+        assert_eq!(
+            windowed_ordered(corpus, &planted.keyword, LIMIT, 1.0),
+            expected,
+            "bench: a full-corpus window must return the same page as no window at all"
+        );
         assert_eq!(
             walk_unordered(corpus, &planted.keyword, LIMIT, 0).len(),
             expected,
@@ -566,10 +752,68 @@ fn verify_corpus(corpus: &Corpus) {
     );
 }
 
+/// Ordering the newest slice of the corpus rather than all of it: what bucketing would buy.
+///
+/// The 1% window is the shape worth designing against -- a bucket holding a hundredth of the corpus
+/// turns the hot keyword from "every match" into "every match registered recently", which is the
+/// difference between tens of milliseconds and a fraction of one.
+fn bench_windowed(c: &mut Criterion) {
+    let corpus = &*CORPUS;
+    let names = corpus_size();
+    let mut group = c.benchmark_group("short_keyword_window");
+    for planted in &corpus.short {
+        let label = format!("{}of{}", planted.matches, names);
+        group.throughput(Throughput::Elements(planted.matches as u64));
+        for (name, window) in [
+            ("whole_corpus", 1.0),
+            ("newest_10pct", 0.1),
+            ("newest_1pct", 0.01),
+        ] {
+            group.bench_with_input(
+                BenchmarkId::new(name, &label),
+                &planted.keyword,
+                |b, keyword| b.iter(|| black_box(windowed_ordered(corpus, keyword, LIMIT, window))),
+            );
+        }
+    }
+    group.finish();
+}
+
+/// The one case bucketing might not rescue: a keyword past `max_gram` inside a window.
+///
+/// Windowing cuts how many candidates there are, but each surviving candidate still costs a
+/// document store read, and a narrow window makes those reads sparser and so individually dearer --
+/// the store-read cost per candidate runs from about 580 ns when matches are dense to 5,600 ns when
+/// they are not. Whether the smaller count or the worse locality wins is not something to reason
+/// about from the other numbers.
+fn bench_windowed_verified(c: &mut Criterion) {
+    let corpus = &*CORPUS;
+    let names = corpus_size();
+    let mut group = c.benchmark_group("long_keyword_window");
+    for planted in &corpus.long {
+        let label = format!("{}of{}", planted.matches, names);
+        group.throughput(Throughput::Elements(planted.matches as u64));
+        for (name, window) in [
+            ("whole_corpus", 1.0),
+            ("newest_10pct", 0.1),
+            ("newest_1pct", 0.01),
+        ] {
+            group.bench_with_input(
+                BenchmarkId::new(name, &label),
+                &planted.keyword,
+                |b, keyword| b.iter(|| black_box(windowed_ordered(corpus, keyword, LIMIT, window))),
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_short_keywords,
     bench_long_keywords,
-    bench_deep_page
+    bench_deep_page,
+    bench_windowed,
+    bench_windowed_verified
 );
 criterion_main!(benches);
