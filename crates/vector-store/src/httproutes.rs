@@ -262,6 +262,11 @@ impl From<&IndexOptionsFts> for FulltextIndexOptions {
 impl From<&IndexOptionsSubstring> for SubstringIndexOptions {
     fn from(options: &IndexOptionsSubstring) -> Self {
         SubstringIndexOptions {
+            order_by: options
+                .order_by
+                .as_ref()
+                .as_ref()
+                .map(|column| column.as_ref().to_string()),
             min_gram: options.min_gram.as_ref().get(),
             max_gram: options.max_gram.as_ref().get(),
             case_sensitive: *options.case_sensitive.as_ref(),
@@ -1301,6 +1306,7 @@ async fn post_index_contains(
             request.query,
             request.limit.into(),
             request.offset,
+            request.cursor,
         )
         .await;
 
@@ -1317,15 +1323,18 @@ async fn post_index_contains(
             };
             (status, msg).into_response()
         }
-        Ok(primary_keys) => {
-            match try_collect_primary_keys(primary_key_columns.as_slice(), &primary_keys) {
+        Ok(page) => {
+            match try_collect_primary_keys(primary_key_columns.as_slice(), &page.primary_keys) {
                 Err(err) => {
                     debug!("post_index_contains: {err}");
                     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
                 }
                 Ok(primary_keys) => (
                     StatusCode::OK,
-                    response::Json(httpapi::PostIndexContainsResponse { primary_keys }),
+                    response::Json(httpapi::PostIndexContainsResponse {
+                        primary_keys,
+                        next_cursor: page.next_cursor,
+                    }),
                 )
                     .into_response(),
             }

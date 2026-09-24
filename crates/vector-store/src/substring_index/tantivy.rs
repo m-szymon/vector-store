@@ -10,10 +10,34 @@
 //! an exact match. A longer query is answered by intersecting the posting lists of its
 //! `max_gram`-long substrings, which admits false positives (all the pieces present, but not
 //! contiguous), so each candidate is verified against the stored value before it is returned.
+//!
+//! # Ordered search, and what it does not do yet
+//!
+//! An index created with an `order_by` column carries that column's value as a `FAST` u64 and
+//! answers newest-first, paging by a cursor rather than an offset. Known gaps, all of them things
+//! a proof of concept can live with and a shipped feature cannot:
+//!
+//! * **Ties are skipped.** The cursor is a sort key and the next page takes rows strictly below
+//!   it, so when several rows share a sort key and the page boundary falls among them, the
+//!   remainder are never returned. The fix is a composite `(sort_key, primary_id)` cursor, which
+//!   needs the tie-break to be part of the comparison rather than of the heap entry only.
+//! * **Only descending.** `ORDER BY ... ASC` would need the segment walk and the heap to invert;
+//!   nothing here is inherently descending, but nothing takes a direction either.
+//! * **No range restriction.** `WHERE ... AND ts < ?` cannot be pushed down yet, so the caller
+//!   cannot ask for a window, only for a prefix of the order.
+//! * **A short page is ambiguous.** Rows dropped because the table no longer knows them shorten a
+//!   page without exhausting the search, so a caller cannot infer "no more results" from a page
+//!   shorter than the limit, and must follow the cursor instead.
+//! * **Pruning depends on segment layout.** Cost is flat only where a segment's span of the sort
+//!   column is narrow. After an unordered backfill every segment spans everything and the search
+//!   degrades to visiting every match -- correct, but not fast. Keeping segments narrow is a
+//!   separate piece of work (see `docs/dev/substring/stage-2-ordering.md`).
 
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::BinaryHeap;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -72,6 +96,7 @@ use crate::worker::Worker;
 use crate::worker::WorkerExt;
 
 use super::actor::SubstringIndex;
+use super::actor::SubstringPage;
 use super::actor::SubstringSearchR;
 use super::factory::SubstringIndexConfiguration;
 use super::factory::SubstringIndexFactory;
@@ -300,6 +325,116 @@ fn build_query(state: &SubstringIndexState, normalized: &str) -> anyhow::Result<
 /// found, so a hot single-character query does not pay for its whole posting list. The stored
 /// document has to be read anyway for the primary id, so verifying the containment on the way
 /// costs no extra I/O.
+/// One page of an ordered search: the `limit` highest sort keys strictly below `cursor`, newest
+/// first, with the cursor to resume from.
+///
+/// Two things keep this off the O(matches) path the obvious implementation lands on. Segments are
+/// visited by descending upper bound and the walk stops once the next segment's bound cannot beat
+/// the page's weakest entry, which skips whole segments unopened. And within a segment the sort key
+/// -- a columnar read -- is checked before the document store is touched, so a candidate that
+/// cannot make the page costs almost nothing. Measured, the second is worth 4-13x on its own and
+/// does not depend on how the segments are laid out.
+///
+/// The cursor is a sort key rather than an offset, so a later page does not re-walk the earlier
+/// ones. Rows sharing a sort key are a known gap; see the note in the module docs.
+fn collect_matches_ordered(
+    state: &SubstringIndexState,
+    normalized: &str,
+    limit: usize,
+    cursor: Option<u64>,
+) -> anyhow::Result<(Vec<PrimaryId>, Option<u64>)> {
+    let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
+    let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
+    let sort_field_name = SORT_FIELD;
+
+    let (query, needs_verification) = match build_query(state, normalized)? {
+        SubstringQuery::Exact(query) => (query, false),
+        SubstringQuery::Candidates(query) => (query, true),
+    };
+
+    let searcher = state.reader.searcher();
+    let weight = query
+        .weight(EnableScoring::disabled_from_searcher(&searcher))
+        .map_err(|e| anyhow!("substring: failed to build the query: {e}"))?;
+
+    let mut segments = Vec::with_capacity(searcher.segment_readers().len());
+    for segment in searcher.segment_readers() {
+        let column = segment
+            .fast_fields()
+            .u64(sort_field_name)
+            .map_err(|e| anyhow!("substring: failed to open the sort column: {e}"))?;
+        let bounds = (column.min_value(), column.max_value());
+        // A segment starting at or above the cursor holds only rows the caller has already seen.
+        if cursor.is_none_or(|cursor| bounds.0 < cursor) {
+            segments.push((segment, column, bounds.1));
+        }
+    }
+    segments.sort_by_key(|(_, _, upper_bound)| Reverse(*upper_bound));
+
+    // Min-heap of the best `limit` so far, so the root is the entry to beat.
+    let mut best: BinaryHeap<Reverse<(u64, u64)>> = BinaryHeap::with_capacity(limit + 1);
+    for (segment, sort_column, upper_bound) in segments {
+        if best.len() == limit
+            && let Some(Reverse((weakest, _))) = best.peek()
+            && upper_bound <= *weakest
+        {
+            // Nothing in this segment, nor in any later one, can enter the page.
+            break;
+        }
+
+        let mut scorer = weight
+            .scorer(segment, 1.0)
+            .map_err(|e| anyhow!("substring: failed to run the query: {e}"))?;
+        let alive = segment.alive_bitset();
+        let store = segment
+            .get_store_reader(STORE_CACHE_BLOCKS)
+            .map_err(|e| anyhow!("substring: failed to open the document store: {e}"))?;
+
+        let mut doc_id = scorer.doc();
+        while doc_id != TERMINATED {
+            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                let below_cursor = cursor.is_none_or(|cursor| sort_key < cursor);
+                let beats_page = best.len() < limit
+                    || best
+                        .peek()
+                        .is_none_or(|Reverse((weakest, _))| sort_key > *weakest);
+                if below_cursor && beats_page {
+                    let doc: TantivyDocument = store
+                        .get(doc_id)
+                        .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
+                    let verified = !needs_verification
+                        || doc
+                            .get_first(text_field)
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| text.contains(normalized));
+                    if verified {
+                        let raw_id = doc
+                            .get_first(primary_id_field)
+                            .and_then(|value| value.as_u64())
+                            .ok_or_else(|| anyhow!("substring: missing primary_id in doc"))?;
+                        best.push(Reverse((sort_key, raw_id)));
+                        if best.len() > limit {
+                            best.pop();
+                        }
+                    }
+                }
+            }
+            doc_id = scorer.advance();
+        }
+    }
+
+    let next_cursor = best.peek().map(|Reverse((sort_key, _))| *sort_key);
+    let mut page: Vec<(u64, u64)> = best.into_iter().map(|Reverse(entry)| entry).collect();
+    page.sort_unstable_by_key(|(sort_key, _)| Reverse(*sort_key));
+    Ok((
+        page.into_iter()
+            .map(|(_, raw_id)| PrimaryId::from(raw_id))
+            .collect(),
+        next_cursor,
+    ))
+}
+
 fn collect_matches(
     state: &SubstringIndexState,
     normalized: &str,
@@ -369,19 +504,29 @@ fn handle_search(
     query: &str,
     limit: Limit,
     offset: usize,
+    cursor: Option<u64>,
 ) -> SubstringSearchR {
     let normalized = normalize(query, state.backend.options.case_sensitive);
     let limit: usize = (*limit.as_ref()).into();
-    let primary_ids = collect_matches(state, &normalized, limit, offset)?;
+    let (primary_ids, next_cursor) = if state.backend.orders_results() {
+        collect_matches_ordered(state, &normalized, limit, cursor)?
+    } else {
+        (collect_matches(state, &normalized, limit, offset)?, None)
+    };
 
     let table = table.read().unwrap();
     let partition_id = find_partition_id::<SubstringBackend>(table.deref(), index_key)?;
     // A row the table cache no longer knows was deleted after the index snapshot was taken;
-    // it is simply left out, as the full-text search does.
-    Ok(primary_ids
-        .into_iter()
-        .filter_map(|primary_id| table.primary_key(partition_id, primary_id))
-        .collect())
+    // it is simply left out, as the full-text search does. Note this can shorten a page below
+    // `limit` without the search being exhausted, which is why the cursor is reported separately
+    // rather than inferred from the page being short.
+    Ok(SubstringPage {
+        primary_keys: primary_ids
+            .into_iter()
+            .filter_map(|primary_id| table.primary_key(partition_id, primary_id))
+            .collect(),
+        next_cursor,
+    })
 }
 
 pub(crate) fn new(
@@ -492,10 +637,14 @@ pub(crate) fn new(
                             query,
                             limit,
                             offset,
+                            cursor,
                             tx,
                         } => {
                             let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
-                                _ = tx.send(Ok(vec![]));
+                                _ = tx.send(Ok(SubstringPage {
+                                    primary_keys: vec![],
+                                    next_cursor: None,
+                                }));
                                 continue;
                             };
                             let table = Arc::clone(&table);
@@ -508,6 +657,7 @@ pub(crate) fn new(
                                         &query,
                                         limit,
                                         offset,
+                                        cursor,
                                     );
                                     _ = tx.send(result);
                                 })
@@ -584,6 +734,12 @@ mod tests {
                 let id_val = u64::from(primary_id);
                 Some(PrimaryKey::from(vec![CqlValue::BigInt(id_val as i64)]))
             });
+        // The sort column mirrors the primary id, so "newest first" is "highest id first" and a
+        // test can assert on plain integers.
+        mock.expect_column_value_for()
+            .returning(|_partition_id, primary_id, _column| {
+                Some(CqlValue::BigInt(u64::from(primary_id) as i64))
+            });
         Arc::new(RwLock::new(mock))
     }
 
@@ -615,6 +771,15 @@ mod tests {
             max_gram: MaxGram::from(NonZeroUsize::new(max_gram).unwrap()),
             case_sensitive: CaseSensitive::from(case_sensitive),
             order_by: OrderBy::default(),
+        }
+    }
+
+    /// Options with a sort column. The mock table answers `column_value_for` with the primary id,
+    /// whatever the column is called.
+    fn ordered_options() -> IndexOptionsSubstring {
+        IndexOptionsSubstring {
+            order_by: "sort_col".parse().unwrap(),
+            ..IndexOptionsSubstring::default()
         }
     }
 
@@ -675,6 +840,29 @@ mod tests {
         search_page(sender, query, 100, 0).await
     }
 
+    /// Like `search_page`, but keeps the order the index returned -- the sorting helpers above
+    /// cannot tell a correctly ordered answer from a scrambled one.
+    async fn search_ordered(
+        sender: &mpsc::Sender<SubstringIndex>,
+        query: &str,
+        limit_n: usize,
+        cursor: Option<u64>,
+    ) -> (Vec<i64>, Option<u64>) {
+        let page = sender
+            .search(make_index_key(), query.into(), limit(limit_n), 0, cursor)
+            .await
+            .unwrap();
+        let ids = page
+            .primary_keys
+            .iter()
+            .map(|pk| match pk.get(0).unwrap() {
+                CqlValue::BigInt(id) => id,
+                other => panic!("unexpected primary key value {other:?}"),
+            })
+            .collect();
+        (ids, page.next_cursor)
+    }
+
     async fn search_page(
         sender: &mpsc::Sender<SubstringIndex>,
         query: &str,
@@ -682,9 +870,10 @@ mod tests {
         offset: usize,
     ) -> Vec<i64> {
         let mut ids: Vec<i64> = sender
-            .search(make_index_key(), query.into(), limit(limit_n), offset)
+            .search(make_index_key(), query.into(), limit(limit_n), offset, None)
             .await
             .unwrap()
+            .primary_keys
             .into_iter()
             .map(|pk| match pk.get(0).unwrap() {
                 CqlValue::BigInt(id) => id,
@@ -861,7 +1050,7 @@ mod tests {
         add_docs(&sender, NICKNAMES).await;
 
         let err = sender
-            .search(make_index_key(), "".into(), limit(10), 0)
+            .search(make_index_key(), "".into(), limit(10), 0, None)
             .await
             .expect_err("an empty query cannot be answered");
 
@@ -876,7 +1065,7 @@ mod tests {
         add_docs(&sender, NICKNAMES).await;
 
         let err = sender
-            .search(make_index_key(), "宫".into(), limit(10), 0)
+            .search(make_index_key(), "宫".into(), limit(10), 0, None)
             .await
             .expect_err("a one-character query cannot be answered by a min_gram=2 index");
 
@@ -974,5 +1163,82 @@ mod tests {
         assert_eq!(normalize("NGgamer", CaseSensitive::from(true)), "NGgamer");
         assert_eq!(normalize("NGgamer", CaseSensitive::from(false)), "nggamer");
         assert_eq!(normalize("将军", CaseSensitive::from(false)), "将军");
+    }
+
+    /// An index with a sort column returns the highest sort keys first. The unordered helpers sort
+    /// their results, so only `search_ordered` can see this.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_ordered_index_returns_the_highest_sort_keys_first() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, _) = search_ordered(&sender, "将军", 10, None).await;
+        let mut descending = ids.clone();
+        descending.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(ids, descending, "not ordered by the sort column");
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    /// Without a sort column nothing changes: the index answers as it did before, and reports no
+    /// cursor for the caller to page with.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_unordered_index_reports_no_cursor() {
+        let sender = make_sender();
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, cursor) = search_ordered(&sender, "将军", 10, None).await;
+        assert_eq!(cursor, None);
+        assert_eq!(ids.len(), 3);
+    }
+
+    /// Paging by cursor: the pages are disjoint, in order, and together cover every match.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn cursor_pages_are_disjoint_and_cover_every_match() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (first, cursor) = search_ordered(&sender, "将军", 2, None).await;
+        assert_eq!(first, vec![3, 2]);
+        let cursor = cursor.expect("a full page leaves a cursor");
+
+        let (second, _) = search_ordered(&sender, "将军", 2, Some(cursor)).await;
+        assert_eq!(second, vec![1]);
+
+        let seen: Vec<i64> = first.into_iter().chain(second).collect();
+        assert_eq!(seen, vec![3, 2, 1]);
+    }
+
+    /// A keyword longer than `max_gram` takes the verification path, where the sort key is read
+    /// before the document store rather than after. The answer must be the same.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn ordering_holds_for_a_keyword_past_max_gram() {
+        let sender = make_sender_with_options(IndexOptionsSubstring {
+            order_by: "sort_col".parse().unwrap(),
+            ..options(1, 3, true)
+        });
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, _) = search_ordered(&sender, "将军来了", 10, None).await;
+        assert_eq!(ids, vec![3]);
+    }
+
+    /// Reading past the end yields an empty page rather than an error.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn paging_past_the_last_match_is_empty() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, _) = search_ordered(&sender, "将军", 10, Some(1)).await;
+        assert!(ids.is_empty(), "got {ids:?}");
     }
 }

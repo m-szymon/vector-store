@@ -220,6 +220,7 @@ async fn substring_index_lifecycle(actors: Arc<TestActors>) {
         assert_eq!(
             serving.options,
             IndexOptions::Substring(SubstringIndexOptions {
+                order_by: None,
                 min_gram: 2,
                 max_gram: 4,
                 case_sensitive: false,

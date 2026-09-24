@@ -298,6 +298,7 @@ async fn substring_contains_not_found_returns_404() {
             "将军".into(),
             NonZeroUsize::new(10).unwrap().into(),
             0,
+            None,
         )
         .await;
 
@@ -318,6 +319,7 @@ async fn substring_contains_empty_query_returns_400() {
             "".into(),
             NonZeroUsize::new(10).unwrap().into(),
             0,
+            None,
         )
         .await;
 
@@ -358,6 +360,7 @@ async fn substring_contains_returns_503_and_node_bootstrapping_reason_while_the_
             "将军".into(),
             NonZeroUsize::new(10).unwrap().into(),
             0,
+            None,
         )
         .await;
 
@@ -404,6 +407,7 @@ async fn substring_contains_returns_503_and_index_building_reason_while_a_later_
             "将军".into(),
             NonZeroUsize::new(10).unwrap().into(),
             0,
+            None,
         )
         .await;
 
@@ -439,6 +443,7 @@ async fn substring_index_appears_in_indexes_list_with_its_options() {
     assert_eq!(
         listed.options,
         httpapi::IndexOptions::Substring(httpapi::SubstringIndexOptions {
+            order_by: None,
             min_gram: 2,
             max_gram: 4,
             case_sensitive: false,

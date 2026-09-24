@@ -296,6 +296,7 @@ async fn indexes_lists_all_indexes_with_options() {
         (
             "fourth",
             IndexOptions::Substring(SubstringIndexOptions {
+                order_by: None,
                 min_gram: 2,
                 max_gram: 4,
                 case_sensitive: false,

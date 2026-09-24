@@ -195,6 +195,9 @@ pub struct FulltextIndexOptions {
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Options a substring index was created with.
 pub struct SubstringIndexOptions {
+    /// The column results are ordered by, or absent for unspecified order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<String>,
     /// Length in characters of the shortest indexed substring; queries shorter than this are rejected.
     pub min_gram: usize,
     /// Length in characters of the longest indexed substring; longer queries are answered by intersecting their substrings and verifying candidates.
@@ -519,16 +522,22 @@ pub struct PostIndexContainsRequest {
     /// The maximum number of primary keys to return.
     #[serde(default)]
     pub limit: Limit,
-    /// The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes.
+    /// The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.
     #[serde(default)]
     pub offset: usize,
+    /// Resume an ordered search below this sort key, as returned by the previous page's `next_cursor`. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub cursor: Option<u64>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Response for substring (infix containment) search.
 pub struct PostIndexContainsResponse {
-    /// Primary keys of the matching rows, one array of values per primary key column.
+    /// Primary keys of the matching rows, one array of values per primary key column. Ordered by the index's sort column when it has one.
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
+    /// Pass as the next request's `cursor` to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]

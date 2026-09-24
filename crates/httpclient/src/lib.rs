@@ -160,12 +160,26 @@ impl HttpClient {
         limit: Limit,
         offset: usize,
     ) -> HashMap<ColumnName, Vec<Value>> {
-        self.post_contains(keyspace_name, index_name, query, limit, offset)
+        self.contains_page(keyspace_name, index_name, query, limit, offset, None)
+            .await
+            .primary_keys
+    }
+
+    /// One page of an ordered substring search, with the cursor to read the next one.
+    pub async fn contains_page(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        query: String,
+        limit: Limit,
+        offset: usize,
+        cursor: Option<u64>,
+    ) -> PostIndexContainsResponse {
+        self.post_contains(keyspace_name, index_name, query, limit, offset, cursor)
             .await
             .json::<PostIndexContainsResponse>()
             .await
             .unwrap()
-            .primary_keys
     }
 
     pub async fn post_contains(
@@ -175,11 +189,13 @@ impl HttpClient {
         query: String,
         limit: Limit,
         offset: usize,
+        cursor: Option<u64>,
     ) -> reqwest::Response {
         let request = PostIndexContainsRequest {
             query,
             limit,
             offset,
+            cursor,
         };
         self.client
             .post(format!(

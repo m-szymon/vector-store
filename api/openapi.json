@@ -1330,13 +1330,22 @@
           "query"
         ],
         "properties": {
+          "cursor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Resume an ordered search below this sort key, as returned by the previous page's `next_cursor`. Only meaningful for an index created with an `order_by` column; ignored otherwise.",
+            "minimum": 0
+          },
           "limit": {
             "$ref": "#/components/schemas/Limit",
             "description": "The maximum number of primary keys to return."
           },
           "offset": {
             "type": "integer",
-            "description": "The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes.",
+            "description": "The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.",
             "minimum": 0
           },
           "query": {
@@ -1352,9 +1361,18 @@
           "primary_keys"
         ],
         "properties": {
+          "next_cursor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Pass as the next request's `cursor` to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.",
+            "minimum": 0
+          },
           "primary_keys": {
             "type": "object",
-            "description": "Primary keys of the matching rows, one array of values per primary key column.",
+            "description": "Primary keys of the matching rows, one array of values per primary key column. Ordered by the index's sort column when it has one.",
             "additionalProperties": {
               "type": "array",
               "items": {}
@@ -1443,6 +1461,13 @@
             "type": "integer",
             "description": "Length in characters of the shortest indexed substring; queries shorter than this are rejected.",
             "minimum": 0
+          },
+          "order_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The column results are ordered by, or absent for unspecified order."
           }
         }
       },

@@ -14,8 +14,18 @@ use crate::vs_index::CountR;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-/// Primary keys of the rows whose indexed value contains the query, in index order.
-pub(crate) type SubstringSearchR = anyhow::Result<Vec<PrimaryKey>>;
+/// One page of a substring search.
+#[derive(Debug)]
+pub(crate) struct SubstringPage {
+    /// Primary keys of the rows whose indexed value contains the query. Ordered by the index's
+    /// sort column when it has one, otherwise in whatever order the walk found them.
+    pub(crate) primary_keys: Vec<PrimaryKey>,
+    /// Where the next page starts, for an ordered search that filled this one. `None` means there
+    /// is nothing more to read, or the index is unordered and does not page this way.
+    pub(crate) next_cursor: Option<u64>,
+}
+
+pub(crate) type SubstringSearchR = anyhow::Result<SubstringPage>;
 
 pub(crate) enum SubstringIndex {
     AddDocument {
@@ -38,8 +48,11 @@ pub(crate) enum SubstringIndex {
         index_key: IndexKey,
         query: String,
         limit: Limit,
-        /// Number of matching rows to skip before collecting `limit` of them.
+        /// Number of matching rows to skip before collecting `limit` of them. Ignored by an
+        /// ordered search, which pages by cursor instead.
         offset: usize,
+        /// Resume an ordered search below this sort key. Ignored by an unordered index.
+        cursor: Option<u64>,
         tx: oneshot::Sender<SubstringSearchR>,
     },
     Stats {
@@ -68,6 +81,7 @@ pub(crate) trait SubstringIndexExt {
         query: String,
         limit: Limit,
         offset: usize,
+        cursor: Option<u64>,
     ) -> SubstringSearchR;
     async fn stats(&self, index_key: IndexKey) -> TantivyStatsR;
 }
@@ -115,6 +129,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         query: String,
         limit: Limit,
         offset: usize,
+        cursor: Option<u64>,
     ) -> SubstringSearchR {
         let (tx, rx) = oneshot::channel();
         self.send(SubstringIndex::Search {
@@ -122,6 +137,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
             query,
             limit,
             offset,
+            cursor,
             tx,
         })
         .await?;
