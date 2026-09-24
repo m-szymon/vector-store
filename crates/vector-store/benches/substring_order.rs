@@ -64,7 +64,9 @@ use criterion::criterion_main;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::collections::BinaryHeap;
 use std::hint::black_box;
 use std::sync::LazyLock;
 use tantivy::DocAddress;
@@ -134,6 +136,27 @@ const KEYWORD_ALPHABET: &str = "가나다라마바사아자차카타파하거너
 /// result can be re-checked against a later Tantivy.
 fn fast_text_enabled() -> bool {
     std::env::var("SUBSTRING_BENCH_FAST_TEXT").is_ok_and(|v| v != "0")
+}
+
+/// Documents per commit, which is what decides how many segments the index has and therefore how
+/// finely a query can prune. 0 keeps Tantivy's own behaviour, where a segment is cut whenever the
+/// writer's per-thread budget fills. Anything else also switches the merge policy off, so the
+/// segment count is exactly what was asked for rather than whatever merging leaves behind.
+fn segment_docs() -> usize {
+    std::env::var("SUBSTRING_BENCH_SEGMENT_DOCS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether the sort column disagrees with insertion order.
+///
+/// Live traffic arrives in registration order, so each segment covers a narrow span and a query can
+/// skip most of them. The initial CDC backfill does not: it reads per stream per token range, which
+/// is uncorrelated with registration time, so every segment spans nearly the whole range and
+/// nothing can be skipped. This models the second case.
+fn shuffled_sort_keys() -> bool {
+    std::env::var("SUBSTRING_BENCH_SHUFFLE").is_ok_and(|v| v != "0")
 }
 
 fn corpus_size() -> usize {
@@ -233,7 +256,25 @@ fn build_corpus() -> Corpus {
         .expect("bench: failed to create the writer");
     let mut rng = StdRng::seed_from_u64(0x5eed);
 
-    for doc_id in 0..names {
+    let per_segment = segment_docs();
+    if per_segment > 0 {
+        // Otherwise the log policy merges by size tier and the segment count stops being the thing
+        // the benchmark is varying.
+        writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+    }
+
+    // The sort column. In order it is the document's own position, so segments come out disjoint
+    // and narrow; shuffled, every segment spans nearly the whole range and pruning has nothing to
+    // work with.
+    let mut sort_keys: Vec<u64> = (0..names as u64).collect();
+    if shuffled_sort_keys() {
+        for i in (1..names).rev() {
+            let j = rng.random_range(0..=i);
+            sort_keys.swap(i, j);
+        }
+    }
+
+    for (doc_id, &sort_key) in sort_keys.iter().enumerate().take(names) {
         // Whichever keywords claim this document. A document can carry more than one, which is what
         // a real corpus does too -- a name holding one common character often holds another.
         let to_plant: Vec<&str> = short
@@ -275,10 +316,13 @@ fn build_corpus() -> Corpus {
         doc.add_text(text_field, &name);
         // Stand-in for register_time: monotonically increasing, so "newest first" is a meaningful
         // ordering and the top-k is spread across the whole corpus rather than sitting in one spot.
-        doc.add_u64(sort_field, doc_id as u64);
+        doc.add_u64(sort_field, sort_key);
         writer
             .add_document(doc)
             .expect("bench: failed to add a doc");
+        if per_segment > 0 && (doc_id + 1) % per_segment == 0 {
+            writer.commit().expect("bench: failed to commit");
+        }
     }
     writer.commit().expect("bench: failed to commit");
 
@@ -585,6 +629,114 @@ fn windowed_ordered(corpus: &Corpus, keyword: &str, limit: usize, window: f64) -
     scored.into_iter().take(limit).count()
 }
 
+/// Ordering with segment-level pruning: the design that uses Tantivy's own structure instead of
+/// partitioning the index.
+///
+/// A segment is already an immutable bucket with its own postings and columns, and `Column` carries
+/// conservative `min_value`/`max_value` bounds for a `FAST` field that can be read without touching
+/// the data. So a query can visit segments newest-first, keep a running top-k, and stop as soon as
+/// the next segment's upper bound cannot beat the k-th best it already holds.
+///
+/// This is correct whatever order documents arrived in -- the bounds are always valid, so a stale
+/// or shuffled ingestion order costs time and never answers. What insertion order decides is how
+/// tight the bounds are, which is what `SUBSTRING_BENCH_SHUFFLE` exists to measure.
+fn segment_pruned_ordered(corpus: &Corpus, keyword: &str, limit: usize) -> usize {
+    let text_field = corpus.schema.get_field(TEXT_FIELD).unwrap();
+    let (query, needs_verification) = build_query(text_field, keyword);
+
+    let searcher = corpus.reader.searcher();
+    let weight = query
+        .weight(EnableScoring::disabled_from_searcher(&searcher))
+        .expect("bench: failed to build the weight");
+
+    let mut segments: Vec<_> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let column = segment
+                .fast_fields()
+                .u64(SORT_FIELD)
+                .expect("bench: missing the sort fast field");
+            let upper_bound = column.max_value();
+            (segment, column, upper_bound)
+        })
+        .collect();
+    segments.sort_by_key(|(_, _, upper_bound)| std::cmp::Reverse(*upper_bound));
+
+    // Min-heap of the best `limit` seen so far, so the root is the one to beat.
+    let mut best: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+    for (segment, sort_column, upper_bound) in segments {
+        if best.len() == limit
+            && let Some(Reverse((kth, _))) = best.peek()
+            && upper_bound <= *kth
+        {
+            // Nothing in this segment, or any later one, can enter the page.
+            break;
+        }
+
+        let mut scorer = weight.scorer(segment, 1.0).expect("bench: failed to score");
+        let alive = segment.alive_bitset();
+        let store = segment
+            .get_store_reader(STORE_CACHE_BLOCKS)
+            .expect("bench: failed to open the store");
+
+        let mut doc_id = scorer.doc();
+        while doc_id != tantivy::TERMINATED {
+            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                // Check the cheap thing first: a candidate that cannot make the page need not be
+                // read from the store, which is what makes pruning pay on the verified path too.
+                let worth_it = best.len() < limit
+                    || best.peek().is_none_or(|Reverse((kth, _))| sort_key > *kth);
+                if worth_it {
+                    let verified = !needs_verification || {
+                        let doc: TantivyDocument =
+                            store.get(doc_id).expect("bench: failed to read a doc");
+                        doc.get_first(text_field)
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| text.contains(keyword))
+                    };
+                    if verified {
+                        best.push(Reverse((sort_key, doc_id)));
+                        if best.len() > limit {
+                            best.pop();
+                        }
+                    }
+                }
+            }
+            doc_id = scorer.advance();
+        }
+    }
+    best.len()
+}
+
+/// How tight the segments are: the mean segment's span of the sort column, as a fraction of the
+/// whole corpus's span. Near `1 / segments` when ingestion follows the sort column, near 1 when it
+/// does not -- and it is the direct predictor of how much `segment_pruned_ordered` can skip.
+fn segment_tightness(corpus: &Corpus) -> (usize, f64) {
+    let searcher = corpus.reader.searcher();
+    let spans: Vec<(u64, u64)> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let column = segment
+                .fast_fields()
+                .u64(SORT_FIELD)
+                .expect("bench: missing the sort fast field");
+            (column.min_value(), column.max_value())
+        })
+        .collect();
+    let lowest = spans.iter().map(|(min, _)| *min).min().unwrap_or(0);
+    let highest = spans.iter().map(|(_, max)| *max).max().unwrap_or(0);
+    let whole = (highest - lowest).max(1) as f64;
+    let mean = spans
+        .iter()
+        .map(|(min, max)| (max - min) as f64 / whole)
+        .sum::<f64>()
+        / spans.len().max(1) as f64;
+    (spans.len(), mean)
+}
+
 /// Two-character keywords: the typical search-box query, and the comparison that matters. The
 /// unordered walk should be flat across frequencies and the ordered top-k linear in them.
 fn bench_short_keywords(c: &mut Criterion) {
@@ -717,6 +869,11 @@ fn verify_corpus(corpus: &Corpus) {
             "bench: a full-corpus window must return the same page as no window at all"
         );
         assert_eq!(
+            segment_pruned_ordered(corpus, &planted.keyword, LIMIT),
+            expected,
+            "bench: segment pruning must not drop rows from the page"
+        );
+        assert_eq!(
             walk_unordered(corpus, &planted.keyword, LIMIT, 0).len(),
             expected,
             "bench: the unordered walk returned the wrong page size"
@@ -808,12 +965,68 @@ fn bench_windowed_verified(c: &mut Criterion) {
     group.finish();
 }
 
+/// Segment pruning against no pruning, which is the measurement that decides the design.
+fn bench_segment_pruning(c: &mut Criterion) {
+    let corpus = &*CORPUS;
+    let names = corpus_size();
+    let (segments, tightness) = segment_tightness(corpus);
+    eprintln!(
+        "segments: {segments}, mean span {:.1}% of the corpus ({})",
+        tightness * 100.0,
+        if shuffled_sort_keys() {
+            "shuffled ingestion"
+        } else {
+            "ingestion follows the sort column"
+        },
+    );
+    let mut group = c.benchmark_group("short_keyword_segment_pruning");
+    for planted in &corpus.short {
+        let label = format!("{}of{}", planted.matches, names);
+        group.throughput(Throughput::Elements(planted.matches as u64));
+        group.bench_with_input(
+            BenchmarkId::new("no_pruning", &label),
+            &planted.keyword,
+            |b, keyword| b.iter(|| black_box(topdocs_ordered(corpus, keyword, LIMIT, 0))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("segment_pruned", &label),
+            &planted.keyword,
+            |b, keyword| b.iter(|| black_box(segment_pruned_ordered(corpus, keyword, LIMIT))),
+        );
+    }
+    group.finish();
+}
+
+/// The same, for keywords past `max_gram`, where a skipped candidate also skips a store read.
+fn bench_segment_pruning_verified(c: &mut Criterion) {
+    let corpus = &*CORPUS;
+    let names = corpus_size();
+    let mut group = c.benchmark_group("long_keyword_segment_pruning");
+    for planted in &corpus.long {
+        let label = format!("{}of{}", planted.matches, names);
+        group.throughput(Throughput::Elements(planted.matches as u64));
+        group.bench_with_input(
+            BenchmarkId::new("no_pruning", &label),
+            &planted.keyword,
+            |b, keyword| b.iter(|| black_box(walk_ordered_verified(corpus, keyword, LIMIT, 0))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("segment_pruned", &label),
+            &planted.keyword,
+            |b, keyword| b.iter(|| black_box(segment_pruned_ordered(corpus, keyword, LIMIT))),
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_short_keywords,
     bench_long_keywords,
     bench_deep_page,
     bench_windowed,
-    bench_windowed_verified
+    bench_windowed_verified,
+    bench_segment_pruning,
+    bench_segment_pruning_verified
 );
 criterion_main!(benches);
