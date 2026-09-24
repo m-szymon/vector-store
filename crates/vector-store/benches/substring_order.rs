@@ -111,6 +111,9 @@ const DEEP_PAGE: usize = 50;
 const DEFAULT_NAMES: usize = 500_000;
 const NAME_LEN: usize = 12;
 const WRITER_HEAP_BYTES: usize = 256 << 20;
+/// Seeds the per-document name generator, so a name depends only on its document id and documents
+/// can be written in any order.
+const NAME_SEED: u64 = 0x5eed_0fed_bead_c0de;
 
 /// Share of the corpus each planted keyword matches. The top of the range is what a one- or
 /// two-character CJK keyword really does to a display-name corpus; the bottom is a rare keyword,
@@ -157,6 +160,19 @@ fn segment_docs() -> usize {
 /// nothing can be skipped. This models the second case.
 fn shuffled_sort_keys() -> bool {
     std::env::var("SUBSTRING_BENCH_SHUFFLE").is_ok_and(|v| v != "0")
+}
+
+/// The share of documents left in wide, unsorted segments -- an L0 that compaction has not yet
+/// rewritten into value-aligned segments.
+///
+/// This is the compaction SLA in one number. Queries must scan all of L0, because nothing in it can
+/// be pruned, so it says how far behind compaction may fall before ordered queries stop meeting
+/// their budget. 0 is a fully compacted index, 1 is a raw backfill.
+fn l0_fraction() -> f64 {
+    std::env::var("SUBSTRING_BENCH_L0")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
 }
 
 fn corpus_size() -> usize {
@@ -274,7 +290,47 @@ fn build_corpus() -> Corpus {
         }
     }
 
-    for (doc_id, &sort_key) in sort_keys.iter().enumerate().take(names) {
+    // The order documents are written in, which is what decides how wide each segment's span of the
+    // sort column ends up. The compacted part is written in sort order, so its segments are narrow;
+    // the L0 part is written as it arrived, so its segments span nearly everything.
+    let mut written = 0usize;
+    let l0 = ((names as f64) * l0_fraction()).round() as usize;
+    let mut sorted: Vec<usize> = (0..names).collect();
+    sorted.sort_by_key(|doc_id| sort_keys[*doc_id]);
+
+    // Which documents are still in L0. The two cases behave very differently and the design has to
+    // survive both: 'recent' is live traffic not yet compacted, which sits at the top of the range
+    // and so lands in segments a newest-first query was going to read anyway; 'scattered' is a
+    // rewrite of historic rows, spread across the whole range, which leaves every L0 segment
+    // spanning everything and unprunable no matter which page is asked for.
+    let scattered = std::env::var("SUBSTRING_BENCH_L0_SPREAD")
+        .map(|v| v != "recent")
+        .unwrap_or(true);
+    let mut compacted = Vec::with_capacity(names - l0);
+    let mut pending = Vec::with_capacity(l0);
+    if scattered {
+        let stride = names.checked_div(l0).unwrap_or(0);
+        for (i, doc_id) in sorted.iter().enumerate() {
+            if stride > 0 && i.is_multiple_of(stride) && pending.len() < l0 {
+                pending.push(*doc_id);
+            } else {
+                compacted.push(*doc_id);
+            }
+        }
+    } else {
+        compacted.extend_from_slice(&sorted[..names - l0]);
+        pending.extend_from_slice(&sorted[names - l0..]);
+    }
+    // L0 is written in arrival order, which is what makes its segments wide.
+    pending.sort_unstable();
+    compacted.extend(pending);
+    let write_order = compacted;
+
+    for doc_id in write_order {
+        let sort_key = sort_keys[doc_id];
+        // Name generation is a pure function of the document id, so documents can be written in any
+        // order without the whole corpus being held in memory first.
+        let mut rng = StdRng::seed_from_u64(NAME_SEED ^ doc_id as u64);
         // Whichever keywords claim this document. A document can carry more than one, which is what
         // a real corpus does too -- a name holding one common character often holds another.
         let to_plant: Vec<&str> = short
@@ -320,7 +376,8 @@ fn build_corpus() -> Corpus {
         writer
             .add_document(doc)
             .expect("bench: failed to add a doc");
-        if per_segment > 0 && (doc_id + 1) % per_segment == 0 {
+        written += 1;
+        if per_segment > 0 && written.is_multiple_of(per_segment) {
             writer.commit().expect("bench: failed to commit");
         }
     }
@@ -710,6 +767,101 @@ fn segment_pruned_ordered(corpus: &Corpus, keyword: &str, limit: usize) -> usize
     best.len()
 }
 
+/// One page of an ordered search, resumed from a keyset cursor.
+///
+/// The cursor is the sort key of the last row of the previous page, so a page is "the best `limit`
+/// strictly below it". That makes paging a range query, which is what lets it prune: a segment
+/// whose lower bound is at or above the cursor holds nothing but rows already returned, and one
+/// whose upper bound cannot beat the k-th best found so far holds nothing that can enter the page.
+/// Offset paging has neither property, which is why it re-walks everything on every page.
+fn segment_pruned_page(
+    corpus: &Corpus,
+    keyword: &str,
+    limit: usize,
+    cursor: Option<u64>,
+) -> (usize, Option<u64>) {
+    let text_field = corpus.schema.get_field(TEXT_FIELD).unwrap();
+    let (query, needs_verification) = build_query(text_field, keyword);
+
+    let searcher = corpus.reader.searcher();
+    let weight = query
+        .weight(EnableScoring::disabled_from_searcher(&searcher))
+        .expect("bench: failed to build the weight");
+
+    let mut segments: Vec<_> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let column = segment
+                .fast_fields()
+                .u64(SORT_FIELD)
+                .expect("bench: missing the sort fast field");
+            let bounds = (column.min_value(), column.max_value());
+            (segment, column, bounds)
+        })
+        .filter(|(_, _, (min, _))| cursor.is_none_or(|cursor| *min < cursor))
+        .collect();
+    segments.sort_by_key(|(_, _, (_, max))| std::cmp::Reverse(*max));
+
+    let mut best: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+    for (segment, sort_column, (_, upper_bound)) in segments {
+        if best.len() == limit
+            && let Some(Reverse((kth, _))) = best.peek()
+            && upper_bound <= *kth
+        {
+            break;
+        }
+
+        let mut scorer = weight.scorer(segment, 1.0).expect("bench: failed to score");
+        let alive = segment.alive_bitset();
+        let store = segment
+            .get_store_reader(STORE_CACHE_BLOCKS)
+            .expect("bench: failed to open the store");
+
+        let mut doc_id = scorer.doc();
+        while doc_id != tantivy::TERMINATED {
+            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                let below_cursor = cursor.is_none_or(|cursor| sort_key < cursor);
+                let worth_it = below_cursor
+                    && (best.len() < limit
+                        || best.peek().is_none_or(|Reverse((kth, _))| sort_key > *kth));
+                if worth_it {
+                    let verified = !needs_verification || {
+                        let doc: TantivyDocument =
+                            store.get(doc_id).expect("bench: failed to read a doc");
+                        doc.get_first(text_field)
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| text.contains(keyword))
+                    };
+                    if verified {
+                        best.push(Reverse((sort_key, doc_id)));
+                        if best.len() > limit {
+                            best.pop();
+                        }
+                    }
+                }
+            }
+            doc_id = scorer.advance();
+        }
+    }
+    let next = best.peek().map(|Reverse((sort_key, _))| *sort_key);
+    (best.len(), next)
+}
+
+/// The cursor that reaching page `page` would leave behind, walked once outside the timed loop.
+fn cursor_for_page(corpus: &Corpus, keyword: &str, page: usize) -> Option<u64> {
+    let mut cursor = None;
+    for _ in 0..page {
+        let (found, next) = segment_pruned_page(corpus, keyword, LIMIT, cursor);
+        if found < LIMIT {
+            break;
+        }
+        cursor = next;
+    }
+    cursor
+}
+
 /// How tight the segments are: the mean segment's span of the sort column, as a fraction of the
 /// whole corpus's span. Near `1 / segments` when ingestion follows the sort column, near 1 when it
 /// does not -- and it is the direct predictor of how much `segment_pruned_ordered` can skip.
@@ -874,6 +1026,11 @@ fn verify_corpus(corpus: &Corpus) {
             "bench: segment pruning must not drop rows from the page"
         );
         assert_eq!(
+            segment_pruned_page(corpus, &planted.keyword, LIMIT, None).0,
+            expected,
+            "bench: a page with no cursor must be the first page"
+        );
+        assert_eq!(
             walk_unordered(corpus, &planted.keyword, LIMIT, 0).len(),
             expected,
             "bench: the unordered walk returned the wrong page size"
@@ -1019,6 +1176,33 @@ fn bench_segment_pruning_verified(c: &mut Criterion) {
     group.finish();
 }
 
+/// A deep page against the first page. With value-aligned segments a cursor should make page fifty
+/// cost about what page one costs, since both touch only the segments straddling the cursor.
+fn bench_paged(c: &mut Criterion) {
+    let corpus = &*CORPUS;
+    let names = corpus_size();
+    let mut group = c.benchmark_group("short_keyword_cursor_paging");
+    for planted in &corpus.short {
+        if planted.matches < DEEP_PAGE * LIMIT {
+            continue;
+        }
+        let label = format!("{}of{}", planted.matches, names);
+        let deep = cursor_for_page(corpus, &planted.keyword, DEEP_PAGE);
+        group.throughput(Throughput::Elements(planted.matches as u64));
+        group.bench_with_input(
+            BenchmarkId::new("page_1", &label),
+            &planted.keyword,
+            |b, keyword| b.iter(|| black_box(segment_pruned_page(corpus, keyword, LIMIT, None))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("page_50", &label),
+            &planted.keyword,
+            |b, keyword| b.iter(|| black_box(segment_pruned_page(corpus, keyword, LIMIT, deep))),
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_short_keywords,
@@ -1027,6 +1211,7 @@ criterion_group!(
     bench_windowed,
     bench_windowed_verified,
     bench_segment_pruning,
-    bench_segment_pruning_verified
+    bench_segment_pruning_verified,
+    bench_paged
 );
 criterion_main!(benches);
