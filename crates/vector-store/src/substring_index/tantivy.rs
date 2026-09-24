@@ -23,11 +23,10 @@
 //!   needs the tie-break to be part of the comparison rather than of the heap entry only.
 //! * **Only descending.** `ORDER BY ... ASC` would need the segment walk and the heap to invert;
 //!   nothing here is inherently descending, but nothing takes a direction either.
-//! * **No range restriction.** `WHERE ... AND ts < ?` cannot be pushed down yet, so the caller
-//!   cannot ask for a window, only for a prefix of the order.
 //! * **A short page is ambiguous.** Rows dropped because the table no longer knows them shorten a
-//!   page without exhausting the search, so a caller cannot infer "no more results" from a page
-//!   shorter than the limit, and must follow the cursor instead.
+//!   page after the walk has filled it, so a caller cannot infer "no more results" from a page
+//!   shorter than the limit, and must follow the cursor instead. The converse is exact: the walk
+//!   reports a cursor only when it filled the page, so no cursor does mean no more results.
 //! * **Pruning depends on segment layout.** Cost is flat only where a segment's span of the sort
 //!   column is narrow. After an unordered backfill every segment spans everything and the search
 //!   degrades to visiting every match -- correct, but not fast. Keeping segments narrow is a
@@ -480,7 +479,14 @@ fn collect_matches_ordered(
         }
     }
 
-    let next_cursor = best.peek().map(|Reverse((sort_key, _))| *sort_key);
+    // A cursor says there may be more below this point. That is only true if the page filled: a
+    // walk that ended with fewer than `limit` matches visited every segment overlapping the window,
+    // so there is nothing left to resume from and a cursor would only cost the caller an empty
+    // round trip. (Rows dropped later, in `handle_search`, shorten the page after this point and
+    // must not suppress the cursor -- which is why this asks the heap, not the returned page.)
+    let next_cursor = (best.len() == limit)
+        .then(|| best.peek().map(|Reverse((sort_key, _))| *sort_key))
+        .flatten();
     let mut page: Vec<(u64, u64)> = best.into_iter().map(|Reverse(entry)| entry).collect();
     page.sort_unstable_by_key(|(sort_key, _)| Reverse(*sort_key));
     Ok((
@@ -1290,7 +1296,7 @@ mod tests {
         assert_eq!(first, vec![3, 2]);
         let cursor = cursor.expect("a full page leaves a cursor");
 
-        let (second, _) = search_ordered(
+        let (second, cursor) = search_ordered(
             &sender,
             "将军",
             2,
@@ -1298,9 +1304,51 @@ mod tests {
         )
         .await;
         assert_eq!(second, vec![1]);
+        assert_eq!(
+            cursor, None,
+            "a page the walk could not fill is the last one"
+        );
 
         let seen: Vec<i64> = first.into_iter().chain(second).collect();
         assert_eq!(seen, vec![3, 2, 1]);
+    }
+
+    /// A cursor is an invitation to ask again, so it is only offered when the walk filled the page.
+    /// Offering one after an exhausted walk costs the caller a round trip that returns nothing, and
+    /// tells a client there are more pages when there are not.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_unfilled_page_offers_no_cursor() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        // Three matches, asked for ten.
+        let (ids, cursor) = search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        assert_eq!(ids, vec![3, 2, 1]);
+        assert_eq!(
+            cursor, None,
+            "the walk ran out, so there is nothing to resume from"
+        );
+
+        // Exactly as many as there are: the walk stopped because the page was full, not because it
+        // ran out, so it cannot tell that the next page would be empty and says so with a cursor.
+        let (ids, cursor) = search_ordered(&sender, "将军", 3, SortWindow::default()).await;
+        assert_eq!(ids, vec![3, 2, 1]);
+        assert!(cursor.is_some(), "a filled page leaves a cursor");
+    }
+
+    /// No match at all is not a page to resume either.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_empty_page_offers_no_cursor() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, cursor) = search_ordered(&sender, "没有人", 10, SortWindow::default()).await;
+        assert!(ids.is_empty(), "got {ids:?}");
+        assert_eq!(cursor, None);
     }
 
     /// A keyword longer than `max_gram` takes the verification path, where the sort key is read
