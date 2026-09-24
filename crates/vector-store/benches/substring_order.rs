@@ -1176,6 +1176,127 @@ fn bench_segment_pruning_verified(c: &mut Criterion) {
     group.finish();
 }
 
+/// Rewrites a corpus into value-aligned segments, and says what that cost.
+///
+/// This is the compaction step the `rewrite` policy would run, and the only way to reach tight
+/// segments when arrivals do not follow the sort column -- merging cannot do it, because a merge
+/// unions two ranges and there is no split to narrow one again.
+///
+/// It deliberately avoids buffering documents by range, which would need memory proportional to the
+/// whole dataset for a randomly ordered input. Instead each output range is a pass that reads the
+/// `sort_key` column -- about 13 ns a document -- and re-adds only the documents that fall in it, so
+/// memory is constant and each document is re-indexed exactly once across all passes. The column
+/// scans are the price of not buffering: `ranges` times the corpus, but of the cheapest read there
+/// is.
+fn run_distribution_pass(corpus: &Corpus, ranges: usize) -> (std::time::Duration, usize, f64) {
+    let text_field = corpus.schema.get_field(TEXT_FIELD).unwrap();
+    let primary_id_field = corpus.schema.get_field(PRIMARY_ID_FIELD).unwrap();
+    let sort_field = corpus.schema.get_field(SORT_FIELD).unwrap();
+
+    let searcher = corpus.reader.searcher();
+    let bounds: Vec<(u64, u64)> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let column = segment
+                .fast_fields()
+                .u64(SORT_FIELD)
+                .expect("bench: missing the sort fast field");
+            (column.min_value(), column.max_value())
+        })
+        .collect();
+    let lowest = bounds.iter().map(|(min, _)| *min).min().unwrap_or(0);
+    let highest = bounds.iter().map(|(_, max)| *max).max().unwrap_or(0);
+    let width = ((highest - lowest) / ranges.max(1) as u64).max(1);
+
+    let dir = tempfile::tempdir().expect("bench: failed to create the output directory");
+    let index = Index::create_in_dir(dir.path(), corpus.schema.clone())
+        .expect("bench: failed to create the output index");
+    let tokenizer =
+        NgramTokenizer::new(MIN_GRAM, MAX_GRAM, false).expect("bench: bad n-gram range");
+    index
+        .tokenizers()
+        .register(TOKENIZER_NAME, TextAnalyzer::builder(tokenizer).build());
+    let mut writer = index
+        .writer::<TantivyDocument>(WRITER_HEAP_BYTES)
+        .expect("bench: failed to create the output writer");
+    writer.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+
+    let started = std::time::Instant::now();
+    for range in 0..ranges {
+        let lo = lowest + width * range as u64;
+        let hi = if range + 1 == ranges {
+            u64::MAX
+        } else {
+            lo + width
+        };
+        for segment in searcher.segment_readers() {
+            let column = segment
+                .fast_fields()
+                .u64(SORT_FIELD)
+                .expect("bench: missing the sort fast field");
+            // Skip a segment that cannot hold anything for this range: the bounds make most passes
+            // cheap once the input is even partly ordered.
+            if column.max_value() < lo || column.min_value() >= hi {
+                continue;
+            }
+            let store = segment
+                .get_store_reader(STORE_CACHE_BLOCKS)
+                .expect("bench: failed to open the store");
+            let alive = segment.alive_bitset();
+            for doc_id in 0..segment.max_doc() {
+                if alive.is_some_and(|alive| alive.is_deleted(doc_id)) {
+                    continue;
+                }
+                let sort_key = column.first(doc_id).unwrap_or(0);
+                if sort_key < lo || sort_key >= hi {
+                    continue;
+                }
+                let doc: TantivyDocument = store.get(doc_id).expect("bench: failed to read a doc");
+                let text = doc
+                    .get_first(text_field)
+                    .and_then(|value| value.as_str())
+                    .expect("bench: missing text");
+                let primary_id = doc
+                    .get_first(primary_id_field)
+                    .and_then(|value| value.as_u64())
+                    .expect("bench: missing primary id");
+                let mut out = TantivyDocument::new();
+                out.add_u64(primary_id_field, primary_id);
+                out.add_text(text_field, text);
+                out.add_u64(sort_field, sort_key);
+                writer.add_document(out).expect("bench: failed to add");
+            }
+        }
+        // One commit per range, so the segments it produces hold only that range's values.
+        writer.commit().expect("bench: failed to commit");
+    }
+    let elapsed = started.elapsed();
+
+    let reader = index
+        .reader()
+        .expect("bench: failed to open the output reader");
+    let searcher = reader.searcher();
+    let spans: Vec<(u64, u64)> = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let column = segment
+                .fast_fields()
+                .u64(SORT_FIELD)
+                .expect("bench: missing the sort fast field");
+            (column.min_value(), column.max_value())
+        })
+        .collect();
+    let whole = (highest - lowest).max(1) as f64;
+    let mean = spans
+        .iter()
+        .map(|(min, max)| (max - min) as f64 / whole)
+        .sum::<f64>()
+        / spans.len().max(1) as f64;
+    (elapsed, spans.len(), mean)
+}
+
 /// A deep page against the first page. With value-aligned segments a cursor should make page fifty
 /// cost about what page one costs, since both touch only the segments straddling the cursor.
 fn bench_paged(c: &mut Criterion) {
@@ -1203,6 +1324,35 @@ fn bench_paged(c: &mut Criterion) {
     group.finish();
 }
 
+/// Reports the cost of a distribution pass, once, rather than benchmarking it.
+///
+/// Criterion is the wrong tool here: the pass builds a whole index, so it cannot be repeated
+/// cheaply, and what matters is throughput in documents per second rather than a distribution of
+/// timings. Off unless `SUBSTRING_BENCH_COMPACT` is set, since it roughly doubles the run.
+fn bench_distribution(_c: &mut Criterion) {
+    if !std::env::var("SUBSTRING_BENCH_COMPACT").is_ok_and(|v| v != "0") {
+        return;
+    }
+    let corpus = &*CORPUS;
+    let names = corpus_size();
+    let per_segment = if segment_docs() > 0 {
+        segment_docs()
+    } else {
+        25_000
+    };
+    let ranges = names.div_ceil(per_segment).max(1);
+    let (_, before) = segment_tightness(corpus);
+    let (elapsed, segments, after) = run_distribution_pass(corpus, ranges);
+    eprintln!(
+        "distribution pass: {names} docs into {ranges} ranges in {:.1}s \
+         ({:.0} docs/s), mean span {:.1}% -> {:.1}%, {segments} segments",
+        elapsed.as_secs_f64(),
+        names as f64 / elapsed.as_secs_f64(),
+        before * 100.0,
+        after * 100.0,
+    );
+}
+
 criterion_group!(
     benches,
     bench_short_keywords,
@@ -1212,6 +1362,7 @@ criterion_group!(
     bench_windowed_verified,
     bench_segment_pruning,
     bench_segment_pruning_verified,
-    bench_paged
+    bench_paged,
+    bench_distribution
 );
 criterion_main!(benches);
