@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use super::tantivy::SortWindow;
 use crate::AsyncInProgress;
 use crate::IndexKey;
 use crate::Limit;
@@ -51,8 +52,9 @@ pub(crate) enum SubstringIndex {
         /// Number of matching rows to skip before collecting `limit` of them. Ignored by an
         /// ordered search, which pages by cursor instead.
         offset: usize,
-        /// Resume an ordered search below this sort key. Ignored by an unordered index.
-        cursor: Option<u64>,
+        /// Which sort keys the answer may come from: a range restriction, a paging cursor, or
+        /// both. Ignored by an unordered index.
+        window: SortWindow,
         tx: oneshot::Sender<SubstringSearchR>,
     },
     Stats {
@@ -81,7 +83,7 @@ pub(crate) trait SubstringIndexExt {
         query: String,
         limit: Limit,
         offset: usize,
-        cursor: Option<u64>,
+        window: SortWindow,
     ) -> SubstringSearchR;
     async fn stats(&self, index_key: IndexKey) -> TantivyStatsR;
 }
@@ -129,7 +131,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         query: String,
         limit: Limit,
         offset: usize,
-        cursor: Option<u64>,
+        window: SortWindow,
     ) -> SubstringSearchR {
         let (tx, rx) = oneshot::channel();
         self.send(SubstringIndex::Search {
@@ -137,7 +139,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
             query,
             limit,
             offset,
-            cursor,
+            window,
             tx,
         })
         .await?;

@@ -31,6 +31,7 @@ use crate::metrics::Metrics;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
 use crate::perf;
+use crate::substring_index::SortWindow;
 use crate::substring_index::SubstringIndex;
 use crate::substring_index::SubstringIndexExt;
 use crate::vector;
@@ -1306,7 +1307,7 @@ async fn post_index_contains(
             request.query,
             request.limit.into(),
             request.offset,
-            request.cursor,
+            SortWindow::new(request.cursor, request.min_sort_key, request.max_sort_key),
         )
         .await;
 

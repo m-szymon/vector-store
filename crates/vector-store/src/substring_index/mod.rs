@@ -15,6 +15,7 @@ pub(crate) use actor::SubstringIndex;
 pub(crate) use actor::SubstringIndexExt;
 pub(crate) use factory::SubstringIndexConfiguration;
 pub(crate) use factory::SubstringIndexFactory;
+pub(crate) use tantivy::SortWindow;
 use tantivy::TantivySubstringIndexFactory;
 use tokio::sync::mpsc;
 

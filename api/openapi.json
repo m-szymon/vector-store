@@ -1325,7 +1325,7 @@
       },
       "PostIndexContainsRequest": {
         "type": "object",
-        "description": "Request body for substring (infix containment) search.",
+        "description": "Request body for substring (infix containment) search.\n\n`cursor`, `min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in\nthe sort column's own values: signed types are biased so that negative values sort below\npositive ones, and dates and timestamps are their integer representations. A caller turning a\nCQL value into a bound has to apply the same mapping, which means the two sides have to agree\nabout it -- a coupling worth removing by sending typed values instead.",
         "required": [
           "query"
         ],
@@ -1342,6 +1342,24 @@
           "limit": {
             "$ref": "#/components/schemas/Limit",
             "description": "The maximum number of primary keys to return."
+          },
+          "max_sort_key": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Restrict the search to rows whose sort key is at most this. Only meaningful for an index created with an `order_by` column; ignored otherwise.",
+            "minimum": 0
+          },
+          "min_sort_key": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Restrict the search to rows whose sort key is at least this. Only meaningful for an index created with an `order_by` column; ignored otherwise.",
+            "minimum": 0
           },
           "offset": {
             "type": "integer",

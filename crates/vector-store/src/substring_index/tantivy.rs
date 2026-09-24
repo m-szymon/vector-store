@@ -38,6 +38,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
+use std::ops::Bound;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -337,11 +338,67 @@ fn build_query(state: &SubstringIndexState, normalized: &str) -> anyhow::Result<
 ///
 /// The cursor is a sort key rather than an offset, so a later page does not re-walk the earlier
 /// ones. Rows sharing a sort key are a known gap; see the note in the module docs.
+/// The window of sort keys a search may return: a range restriction, a paging cursor, or both.
+///
+/// The two arrive separately -- the range from the query's `WHERE`, the cursor from the previous
+/// page -- but they constrain the same value, so they are resolved into one pair of bounds once
+/// rather than checked separately on every candidate.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SortWindow {
+    lower: Option<u64>,
+    upper: Option<Bound<u64>>,
+}
+
+impl SortWindow {
+    pub(crate) fn new(
+        cursor: Option<u64>,
+        min_sort_key: Option<u64>,
+        max_sort_key: Option<u64>,
+    ) -> Self {
+        // The cursor excludes the key it names (the previous page ended there); a range bound
+        // includes it. Where both apply, the tighter one wins.
+        let upper = match (cursor, max_sort_key) {
+            (Some(cursor), Some(max)) if max < cursor => Some(Bound::Included(max)),
+            (Some(cursor), _) => Some(Bound::Excluded(cursor)),
+            (None, Some(max)) => Some(Bound::Included(max)),
+            (None, None) => None,
+        };
+        Self {
+            lower: min_sort_key,
+            upper,
+        }
+    }
+
+    fn contains(&self, sort_key: u64) -> bool {
+        let above_lower = self.lower.is_none_or(|lower| sort_key >= lower);
+        let below_upper = match self.upper {
+            None => true,
+            Some(Bound::Included(upper)) => sort_key <= upper,
+            Some(Bound::Excluded(upper)) => sort_key < upper,
+            Some(Bound::Unbounded) => true,
+        };
+        above_lower && below_upper
+    }
+
+    /// Whether a segment spanning `[min, max]` can hold anything in the window. Answered from the
+    /// segment's bounds alone, so a segment ruled out here is never opened.
+    fn overlaps(&self, min: u64, max: u64) -> bool {
+        let above = self.lower.is_none_or(|lower| max >= lower);
+        let below = match self.upper {
+            None => true,
+            Some(Bound::Included(upper)) => min <= upper,
+            Some(Bound::Excluded(upper)) => min < upper,
+            Some(Bound::Unbounded) => true,
+        };
+        above && below
+    }
+}
+
 fn collect_matches_ordered(
     state: &SubstringIndexState,
     normalized: &str,
     limit: usize,
-    cursor: Option<u64>,
+    window: SortWindow,
 ) -> anyhow::Result<(Vec<PrimaryId>, Option<u64>)> {
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
@@ -363,10 +420,10 @@ fn collect_matches_ordered(
             .fast_fields()
             .u64(sort_field_name)
             .map_err(|e| anyhow!("substring: failed to open the sort column: {e}"))?;
-        let bounds = (column.min_value(), column.max_value());
-        // A segment starting at or above the cursor holds only rows the caller has already seen.
-        if cursor.is_none_or(|cursor| bounds.0 < cursor) {
-            segments.push((segment, column, bounds.1));
+        let (min, max) = (column.min_value(), column.max_value());
+        // Ruled out from the bounds alone, so the segment is never opened.
+        if window.overlaps(min, max) {
+            segments.push((segment, column, max));
         }
     }
     segments.sort_by_key(|(_, _, upper_bound)| Reverse(*upper_bound));
@@ -394,12 +451,11 @@ fn collect_matches_ordered(
         while doc_id != TERMINATED {
             if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
                 let sort_key = sort_column.first(doc_id).unwrap_or(0);
-                let below_cursor = cursor.is_none_or(|cursor| sort_key < cursor);
                 let beats_page = best.len() < limit
                     || best
                         .peek()
                         .is_none_or(|Reverse((weakest, _))| sort_key > *weakest);
-                if below_cursor && beats_page {
+                if window.contains(sort_key) && beats_page {
                     let doc: TantivyDocument = store
                         .get(doc_id)
                         .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
@@ -504,12 +560,12 @@ fn handle_search(
     query: &str,
     limit: Limit,
     offset: usize,
-    cursor: Option<u64>,
+    window: SortWindow,
 ) -> SubstringSearchR {
     let normalized = normalize(query, state.backend.options.case_sensitive);
     let limit: usize = (*limit.as_ref()).into();
     let (primary_ids, next_cursor) = if state.backend.orders_results() {
-        collect_matches_ordered(state, &normalized, limit, cursor)?
+        collect_matches_ordered(state, &normalized, limit, window)?
     } else {
         (collect_matches(state, &normalized, limit, offset)?, None)
     };
@@ -637,7 +693,7 @@ pub(crate) fn new(
                             query,
                             limit,
                             offset,
-                            cursor,
+                            window,
                             tx,
                         } => {
                             let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
@@ -657,7 +713,7 @@ pub(crate) fn new(
                                         &query,
                                         limit,
                                         offset,
-                                        cursor,
+                                        window,
                                     );
                                     _ = tx.send(result);
                                 })
@@ -776,6 +832,15 @@ mod tests {
 
     /// Options with a sort column. The mock table answers `column_value_for` with the primary id,
     /// whatever the column is called.
+    /// The sort key the index stores for a row whose sort column holds `value`.
+    ///
+    /// Not the value itself: signed types are biased so that negatives sort below positives, and
+    /// the window bounds are in that space. A caller building a window from a CQL value has to
+    /// apply the same conversion -- see the note on `PostIndexContainsRequest`.
+    fn sort_key(value: i64) -> u64 {
+        crate::cql_types::to_sort_key(&CqlValue::BigInt(value)).unwrap()
+    }
+
     fn ordered_options() -> IndexOptionsSubstring {
         IndexOptionsSubstring {
             order_by: "sort_col".parse().unwrap(),
@@ -846,10 +911,10 @@ mod tests {
         sender: &mpsc::Sender<SubstringIndex>,
         query: &str,
         limit_n: usize,
-        cursor: Option<u64>,
+        window: SortWindow,
     ) -> (Vec<i64>, Option<u64>) {
         let page = sender
-            .search(make_index_key(), query.into(), limit(limit_n), 0, cursor)
+            .search(make_index_key(), query.into(), limit(limit_n), 0, window)
             .await
             .unwrap();
         let ids = page
@@ -870,7 +935,13 @@ mod tests {
         offset: usize,
     ) -> Vec<i64> {
         let mut ids: Vec<i64> = sender
-            .search(make_index_key(), query.into(), limit(limit_n), offset, None)
+            .search(
+                make_index_key(),
+                query.into(),
+                limit(limit_n),
+                offset,
+                SortWindow::default(),
+            )
             .await
             .unwrap()
             .primary_keys
@@ -1050,7 +1121,13 @@ mod tests {
         add_docs(&sender, NICKNAMES).await;
 
         let err = sender
-            .search(make_index_key(), "".into(), limit(10), 0, None)
+            .search(
+                make_index_key(),
+                "".into(),
+                limit(10),
+                0,
+                SortWindow::default(),
+            )
             .await
             .expect_err("an empty query cannot be answered");
 
@@ -1065,7 +1142,13 @@ mod tests {
         add_docs(&sender, NICKNAMES).await;
 
         let err = sender
-            .search(make_index_key(), "宫".into(), limit(10), 0, None)
+            .search(
+                make_index_key(),
+                "宫".into(),
+                limit(10),
+                0,
+                SortWindow::default(),
+            )
             .await
             .expect_err("a one-character query cannot be answered by a min_gram=2 index");
 
@@ -1174,7 +1257,7 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, _) = search_ordered(&sender, "将军", 10, None).await;
+        let (ids, _) = search_ordered(&sender, "将军", 10, SortWindow::default()).await;
         let mut descending = ids.clone();
         descending.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(ids, descending, "not ordered by the sort column");
@@ -1190,7 +1273,7 @@ mod tests {
         let sender = make_sender();
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, cursor) = search_ordered(&sender, "将军", 10, None).await;
+        let (ids, cursor) = search_ordered(&sender, "将军", 10, SortWindow::default()).await;
         assert_eq!(cursor, None);
         assert_eq!(ids.len(), 3);
     }
@@ -1203,11 +1286,17 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (first, cursor) = search_ordered(&sender, "将军", 2, None).await;
+        let (first, cursor) = search_ordered(&sender, "将军", 2, SortWindow::default()).await;
         assert_eq!(first, vec![3, 2]);
         let cursor = cursor.expect("a full page leaves a cursor");
 
-        let (second, _) = search_ordered(&sender, "将军", 2, Some(cursor)).await;
+        let (second, _) = search_ordered(
+            &sender,
+            "将军",
+            2,
+            SortWindow::new(Some(cursor), None, None),
+        )
+        .await;
         assert_eq!(second, vec![1]);
 
         let seen: Vec<i64> = first.into_iter().chain(second).collect();
@@ -1226,7 +1315,7 @@ mod tests {
         });
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, _) = search_ordered(&sender, "将军来了", 10, None).await;
+        let (ids, _) = search_ordered(&sender, "将军来了", 10, SortWindow::default()).await;
         assert_eq!(ids, vec![3]);
     }
 
@@ -1238,7 +1327,88 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, _) = search_ordered(&sender, "将军", 10, Some(1)).await;
+        let (ids, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            SortWindow::new(Some(sort_key(1)), None, None),
+        )
+        .await;
         assert!(ids.is_empty(), "got {ids:?}");
+    }
+
+    /// A range restriction narrows the answer without changing its order.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_range_restricts_which_rows_are_returned() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        // The mock table answers with the primary id as the sort key, so this is ids 2..=3.
+        let window = SortWindow::new(None, Some(sort_key(2)), Some(sort_key(3)));
+        let (ids, _) = search_ordered(&sender, "将军", 10, window).await;
+        assert_eq!(ids, vec![3, 2]);
+    }
+
+    /// The bounds are inclusive, unlike the cursor, which excludes the key it names.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn range_bounds_are_inclusive_and_the_cursor_is_not() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (inclusive, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            SortWindow::new(None, Some(sort_key(3)), Some(sort_key(3))),
+        )
+        .await;
+        assert_eq!(inclusive, vec![3]);
+
+        let (exclusive, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            SortWindow::new(Some(sort_key(3)), Some(sort_key(3)), None),
+        )
+        .await;
+        assert!(exclusive.is_empty(), "got {exclusive:?}");
+    }
+
+    /// A range and a cursor constrain the same value, so the tighter upper bound wins rather than
+    /// one quietly overriding the other.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_cursor_and_a_range_both_apply() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        // The range allows 1..=3, the cursor excludes 3 and above: 2 and 1 remain.
+        let window = SortWindow::new(Some(sort_key(3)), Some(sort_key(1)), Some(sort_key(3)));
+        let (ids, _) = search_ordered(&sender, "将军", 10, window).await;
+        assert_eq!(ids, vec![2, 1]);
+    }
+
+    /// An empty window is not an error, just an empty answer.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_window_matching_nothing_returns_nothing() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, cursor) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            SortWindow::new(None, Some(sort_key(900)), Some(sort_key(999))),
+        )
+        .await;
+        assert!(ids.is_empty(), "got {ids:?}");
+        assert_eq!(cursor, None);
     }
 }

@@ -516,6 +516,12 @@ pub struct PostIndexBm25Response {
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Request body for substring (infix containment) search.
+///
+/// `cursor`, `min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in
+/// the sort column's own values: signed types are biased so that negative values sort below
+/// positive ones, and dates and timestamps are their integer representations. A caller turning a
+/// CQL value into a bound has to apply the same mapping, which means the two sides have to agree
+/// about it -- a coupling worth removing by sending typed values instead.
 pub struct PostIndexContainsRequest {
     /// The text every returned row's indexed value must contain.
     pub query: String,
@@ -528,6 +534,12 @@ pub struct PostIndexContainsRequest {
     /// Resume an ordered search below this sort key, as returned by the previous page's `next_cursor`. Only meaningful for an index created with an `order_by` column; ignored otherwise.
     #[serde(default)]
     pub cursor: Option<u64>,
+    /// Restrict the search to rows whose sort key is at least this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub min_sort_key: Option<u64>,
+    /// Restrict the search to rows whose sort key is at most this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub max_sort_key: Option<u64>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]

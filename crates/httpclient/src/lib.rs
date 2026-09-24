@@ -196,6 +196,8 @@ impl HttpClient {
             limit,
             offset,
             cursor,
+            min_sort_key: None,
+            max_sort_key: None,
         };
         self.client
             .post(format!(
