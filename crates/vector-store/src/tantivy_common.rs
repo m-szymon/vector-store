@@ -53,8 +53,20 @@ pub(crate) trait TantivyBackend: Send + Sync + 'static {
     /// Registers the tokenizers the schema refers to.
     fn register_tokenizers(&self, index: &tantivy::Index) -> anyhow::Result<()>;
 
-    /// Turns a row's text into a document for the index.
-    fn create_doc(&self, schema: &Schema, primary_id: PrimaryId, text: &str) -> TantivyDocument;
+    /// What a row contributes to the index besides its primary id.
+    ///
+    /// An associated type rather than a fixed `&str` so that a backend needing more than the text
+    /// -- a substring index also stores the value it orders by -- can say so without every other
+    /// backend growing a parameter it has no use for.
+    type Row<'a>;
+
+    /// Turns a row into a document for the index.
+    fn create_doc(
+        &self,
+        schema: &Schema,
+        primary_id: PrimaryId,
+        row: Self::Row<'_>,
+    ) -> TantivyDocument;
 }
 
 pub(crate) struct Writer {
@@ -164,12 +176,10 @@ pub(crate) fn commit<B: TantivyBackend>(state: &IndexState<B>, key: &IndexKey) {
 pub(crate) fn handle_add_document<B: TantivyBackend>(
     state: &IndexState<B>,
     primary_id: PrimaryId,
-    document: String,
+    row: B::Row<'_>,
     in_progress: AsyncInProgress,
 ) -> usize {
-    let doc = state
-        .backend
-        .create_doc(&state.schema, primary_id, &document);
+    let doc = state.backend.create_doc(&state.schema, primary_id, row);
     let mut writer = state.writer.write().unwrap();
     match writer.add_document(doc, in_progress) {
         Ok(pending) => pending,

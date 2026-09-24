@@ -338,6 +338,58 @@ fn uuid_timeuuid_msb(bytes: &[u8; 16]) -> u64 {
 /// Compare two CqlValues, returning an Ordering if they are comparable. `None` means "does
 /// not match" to callers, not an error, so a missing arm silently matches no rows. Supports
 /// Numeric, Text, Date, Time, Timestamp, Inet, Blob, Boolean, Uuid, and Timeuuid types.
+/// Maps a value to the `u64` a Tantivy `FAST` field sorts by, or `None` for a type that cannot be
+/// ordered that way.
+///
+/// The mapping has to be **order-preserving**: for any two values `cmp` orders, their sort keys
+/// must compare the same way. `ORDER BY` reads the sort key while a range restriction on the same
+/// column is checked with [`cmp`], so a disagreement between the two would page rows in one order
+/// and filter them in another -- a bug that shows up as rows missing from the middle of a result,
+/// not as an error.
+///
+/// Signed types are biased rather than cast: `-1i64 as u64` is `u64::MAX`, which would sort every
+/// negative value above every positive one. Flipping the sign bit maps the signed range onto the
+/// unsigned one in order.
+///
+/// Only the fixed-width integral types are supported. Text and the arbitrary-precision types have
+/// no order-preserving `u64` image, so an index is refused rather than ordered wrongly.
+pub(crate) fn to_sort_key(value: &CqlValue) -> Option<u64> {
+    fn biased(value: i64) -> u64 {
+        (value as u64) ^ (1 << 63)
+    }
+    match value {
+        CqlValue::TinyInt(v) => Some(biased(i64::from(*v))),
+        CqlValue::SmallInt(v) => Some(biased(i64::from(*v))),
+        CqlValue::Int(v) => Some(biased(i64::from(*v))),
+        CqlValue::BigInt(v) => Some(biased(*v)),
+        CqlValue::Counter(v) => Some(biased(v.0)),
+        // Timestamp is milliseconds since the epoch and Time nanoseconds since midnight, both
+        // signed; Date is already an unsigned day count centred on the epoch, so it needs no bias.
+        CqlValue::Timestamp(v) => Some(biased(v.0)),
+        CqlValue::Time(v) => Some(biased(v.0)),
+        CqlValue::Date(v) => Some(u64::from(v.0)),
+        _ => None,
+    }
+}
+
+/// Whether a column of this type can be a substring index's sort column.
+///
+/// Checked when the index is created, so that an index naming a column it cannot order is refused
+/// at that point rather than answering in an arbitrary order later.
+pub(crate) fn is_orderable(native_type: &NativeType) -> bool {
+    matches!(
+        native_type,
+        NativeType::TinyInt
+            | NativeType::SmallInt
+            | NativeType::Int
+            | NativeType::BigInt
+            | NativeType::Counter
+            | NativeType::Timestamp
+            | NativeType::Time
+            | NativeType::Date
+    )
+}
+
 pub(crate) fn cmp(lhs: &CqlValue, rhs: &CqlValue) -> Option<Ordering> {
     match (lhs, rhs) {
         // Numeric types
@@ -405,8 +457,11 @@ fn inet_cmp(lhs: &IpAddr, rhs: &IpAddr) -> Ordering {
 mod tests {
     use super::*;
     use scylla::value::Counter;
+    use scylla::value::CqlDate;
     use scylla::value::CqlDecimal;
     use scylla::value::CqlDuration;
+    use scylla::value::CqlTime;
+    use scylla::value::CqlTimestamp;
     use std::net::Ipv4Addr;
     use std::net::Ipv6Addr;
     use uuid::Uuid;
@@ -1252,5 +1307,97 @@ mod tests {
         );
         // On an equal prefix the shorter IPv4 form sorts first.
         assert_eq!(cmp(&v4(0, 0, 0, 0), &v6("::")), Some(Ordering::Less));
+    }
+
+    /// The contract `to_sort_key` exists to keep: whenever `cmp` orders two values, their sort keys
+    /// must order the same way. Checked over boundaries rather than a handful of samples, because
+    /// the failure this guards against -- a sign-bit slip -- only shows at the extremes.
+    #[test]
+    fn sort_keys_order_the_way_cmp_does() {
+        let bigints: Vec<CqlValue> = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX]
+            .into_iter()
+            .map(CqlValue::BigInt)
+            .collect();
+        let ints: Vec<CqlValue> = [i32::MIN, -1, 0, 1, i32::MAX]
+            .into_iter()
+            .map(CqlValue::Int)
+            .collect();
+        let timestamps: Vec<CqlValue> = [i64::MIN, -1, 0, 1, i64::MAX]
+            .into_iter()
+            .map(|v| CqlValue::Timestamp(CqlTimestamp(v)))
+            .collect();
+        let dates: Vec<CqlValue> = [0, 1, u32::MAX]
+            .into_iter()
+            .map(|v| CqlValue::Date(CqlDate(v)))
+            .collect();
+
+        for values in [&bigints, &ints, &timestamps, &dates] {
+            for lhs in values.iter() {
+                for rhs in values.iter() {
+                    let expected = cmp(lhs, rhs).expect("comparable");
+                    let lhs_key = to_sort_key(lhs).expect("orderable");
+                    let rhs_key = to_sort_key(rhs).expect("orderable");
+                    assert_eq!(
+                        lhs_key.cmp(&rhs_key),
+                        expected,
+                        "sort keys disagree with cmp for {lhs:?} vs {rhs:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A naive cast would put every negative value above every positive one, which is the whole
+    /// reason for the bias.
+    #[test]
+    fn negative_values_sort_below_positive_ones() {
+        let negative = to_sort_key(&CqlValue::BigInt(-1)).unwrap();
+        let zero = to_sort_key(&CqlValue::BigInt(0)).unwrap();
+        assert!(negative < zero);
+        assert!(zero < to_sort_key(&CqlValue::BigInt(1)).unwrap());
+        assert_eq!(to_sort_key(&CqlValue::BigInt(i64::MIN)).unwrap(), 0);
+        assert_eq!(to_sort_key(&CqlValue::BigInt(i64::MAX)).unwrap(), u64::MAX);
+    }
+
+    /// Types with no order-preserving u64 image get no sort key, so an index naming such a column
+    /// is refused rather than answering in an arbitrary order.
+    #[test]
+    fn unorderable_types_have_no_sort_key() {
+        assert!(to_sort_key(&CqlValue::Text("a".to_string())).is_none());
+        assert!(to_sort_key(&CqlValue::Boolean(true)).is_none());
+        assert!(to_sort_key(&CqlValue::Float(1.0)).is_none());
+        assert!(to_sort_key(&CqlValue::Double(1.0)).is_none());
+    }
+
+    /// `is_orderable` is what refuses such an index, so it has to agree with `to_sort_key`.
+    #[test]
+    fn is_orderable_agrees_with_to_sort_key() {
+        for native_type in SUPPORTED {
+            let sample = match native_type {
+                NativeType::TinyInt => CqlValue::TinyInt(0),
+                NativeType::SmallInt => CqlValue::SmallInt(0),
+                NativeType::Int => CqlValue::Int(0),
+                NativeType::BigInt => CqlValue::BigInt(0),
+                NativeType::Timestamp => CqlValue::Timestamp(CqlTimestamp(0)),
+                NativeType::Time => CqlValue::Time(CqlTime(0)),
+                NativeType::Date => CqlValue::Date(CqlDate(0)),
+                NativeType::Text => CqlValue::Text(String::new()),
+                NativeType::Ascii => CqlValue::Ascii(String::new()),
+                NativeType::Boolean => CqlValue::Boolean(false),
+                NativeType::Float => CqlValue::Float(0.0),
+                NativeType::Double => CqlValue::Double(0.0),
+                NativeType::Blob => CqlValue::Blob(Vec::new()),
+                NativeType::Inet => CqlValue::Inet("0.0.0.0".parse().unwrap()),
+                NativeType::Uuid => CqlValue::Uuid(uuid::Uuid::nil()),
+                NativeType::Timeuuid => continue,
+                NativeType::Decimal | NativeType::Varint => continue,
+                _ => continue,
+            };
+            assert_eq!(
+                is_orderable(native_type),
+                to_sort_key(&sample).is_some(),
+                "is_orderable and to_sort_key disagree about {native_type:?}"
+            );
+        }
     }
 }

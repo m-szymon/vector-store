@@ -28,6 +28,7 @@ use tantivy::query::BooleanQuery;
 use tantivy::query::EnableScoring;
 use tantivy::query::Query;
 use tantivy::query::TermQuery;
+use tantivy::schema::FAST;
 use tantivy::schema::INDEXED;
 use tantivy::schema::IndexRecordOption;
 use tantivy::schema::STORED;
@@ -49,6 +50,7 @@ use crate::memory::Memory;
 use crate::memory::MemoryExt;
 use crate::perf;
 use crate::table::IndexId;
+use crate::table::PartitionId;
 use crate::table::PrimaryId;
 use crate::table::Table;
 use crate::table::TableSearch;
@@ -103,6 +105,7 @@ impl SubstringIndexFactory for TantivySubstringIndexFactory {
 }
 
 const TEXT_FIELD: &str = "text";
+const SORT_FIELD: &str = "sort_key";
 const TOKENIZER_NAME: &str = "substring_ngram";
 /// Values are short, so a single cached store block per segment covers consecutive lookups.
 const STORE_CACHE_BLOCKS: usize = 1;
@@ -121,6 +124,19 @@ impl SubstringBackend {
     fn max_gram(&self) -> usize {
         self.options.max_gram.as_ref().get()
     }
+
+    /// Whether this index was given a column to order by. Without one it answers in whatever order
+    /// the walk finds matches, and carries no sort field at all.
+    fn orders_results(&self) -> bool {
+        self.options.order_by.as_ref().is_some()
+    }
+}
+
+/// What a row contributes to a substring index: the text to index, and the value to order by if
+/// the index was given a sort column.
+pub(crate) struct SubstringRow<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) sort_key: Option<u64>,
 }
 
 impl TantivyBackend for SubstringBackend {
@@ -138,6 +154,12 @@ impl TantivyBackend for SubstringBackend {
         let mut schema_builder = Schema::builder();
         schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED);
         schema_builder.add_text_field(TEXT_FIELD, text_options);
+        if self.orders_results() {
+            // FAST, not STORED: the walk reads it once per candidate, and a columnar read is far
+            // cheaper than the document store. Its per-segment min/max is also what lets an
+            // ordered search skip whole segments.
+            schema_builder.add_u64_field(SORT_FIELD, FAST);
+        }
         schema_builder.build()
     }
 
@@ -150,22 +172,58 @@ impl TantivyBackend for SubstringBackend {
         Ok(())
     }
 
-    fn create_doc(&self, schema: &Schema, primary_id: PrimaryId, text: &str) -> TantivyDocument {
+    type Row<'a> = SubstringRow<'a>;
+
+    fn create_doc(
+        &self,
+        schema: &Schema,
+        primary_id: PrimaryId,
+        row: SubstringRow<'_>,
+    ) -> TantivyDocument {
         let primary_id_field = schema.get_field(PRIMARY_ID_FIELD).unwrap();
         let text_field = schema.get_field(TEXT_FIELD).unwrap();
 
         // The normalized form is both indexed and stored, so that grams and the verification
         // compare like with like even when Unicode lowercasing changes the character count.
         // The stored value is never returned to clients.
-        let normalized = normalize(text, self.options.case_sensitive);
+        let normalized = normalize(row.text, self.options.case_sensitive);
         let mut doc = TantivyDocument::new();
         doc.add_u64(primary_id_field, u64::from(primary_id));
         doc.add_text(text_field, normalized.as_ref());
+        if self.orders_results() {
+            // A row whose sort column is null still belongs in the index; it just sorts lowest,
+            // which for "newest first" puts it last. Dropping it would make the index disagree
+            // with an unordered LIKE about which rows exist.
+            doc.add_u64(
+                schema.get_field(SORT_FIELD).unwrap(),
+                row.sort_key.unwrap_or(0),
+            );
+        }
         doc
     }
 }
 
 type SubstringIndexState = IndexState<SubstringBackend>;
+
+/// The value this row is ordered by, or `None` when the index has no sort column, the row has no
+/// value for it, or the value has no ordering the index can use.
+///
+/// `None` is not an error: the document is still indexed, it just sorts lowest. Refusing the row
+/// would make an ordered search disagree with an unordered one about which rows exist, which is a
+/// worse failure than a row appearing last.
+fn read_sort_key(
+    table: &RwLock<impl TableSearch>,
+    options: &IndexOptionsSubstring,
+    partition_id: PartitionId,
+    primary_id: PrimaryId,
+) -> Option<u64> {
+    let order_by = options.order_by.as_ref().as_ref()?;
+    let value = table
+        .read()
+        .unwrap()
+        .column_value_for(partition_id, primary_id, order_by)?;
+    crate::cql_types::to_sort_key(&value)
+}
 
 /// Brings a value or a query to the form the index compares: unchanged for a case-sensitive
 /// index, fully (Unicode) lowercased otherwise.
@@ -357,10 +415,20 @@ pub(crate) fn new(
                     };
                     match msg {
                         SubstringIndex::AddDocument {
+                            partition_id,
                             primary_id,
                             document,
                             in_progress,
                         } => {
+                            // Read before the index state is touched: Table::upsert writes the
+                            // column before it emits the operation that got us here, so the value
+                            // is already in place.
+                            let sort_key = read_sort_key(
+                                table.as_ref(),
+                                &index.options,
+                                partition_id,
+                                primary_id,
+                            );
                             let Some(state) = get_or_create_state(
                                 &mut states,
                                 table.as_ref(),
@@ -378,7 +446,10 @@ pub(crate) fn new(
                                     let pending = handle_add_document(
                                         &state,
                                         primary_id,
-                                        document,
+                                        SubstringRow {
+                                            text: &document,
+                                            sort_key,
+                                        },
                                         in_progress,
                                     );
                                     if pending >= commit_threshold {
@@ -494,6 +565,12 @@ mod tests {
 
     use super::super::actor::SubstringIndexExt;
 
+    /// The partition every test document lives in: these tests use a global index, so there is
+    /// only one, and it has to match what `make_table_with_keys` hands back.
+    fn test_partition_id() -> PartitionId {
+        PartitionId::global(IndexIdGenerator::new().next(true).unwrap())
+    }
+
     fn make_table_with_keys() -> Arc<RwLock<MockTableSearch>> {
         let index_id = IndexIdGenerator::new().next(true).unwrap();
         let partition_id = PartitionId::global(index_id);
@@ -564,6 +641,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         sender
             .add_document(
+                test_partition_id(),
                 primary.into(),
                 content.into(),
                 AsyncInProgress::Fullscan(tx),

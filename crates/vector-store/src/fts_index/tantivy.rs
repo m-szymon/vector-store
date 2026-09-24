@@ -122,6 +122,8 @@ impl TantivyBackend for FtsBackend {
         Ok(())
     }
 
+    type Row<'a> = &'a str;
+
     fn create_doc(&self, schema: &Schema, primary_id: PrimaryId, text: &str) -> TantivyDocument {
         create_doc(schema, primary_id, text)
     }
@@ -372,7 +374,7 @@ pub(crate) fn new(
                                     let pending = handle_add_document(
                                         &state,
                                         primary_id,
-                                        document,
+                                        &document,
                                         in_progress,
                                     );
                                     if pending >= commit_threshold {

@@ -396,6 +396,8 @@ impl Statements {
                 .map(|(name, typ)| (name.clone(), typ.clone())),
             is_alternator,
         ));
+        validate_sort_column(&metadata, &table_columns)?;
+
         let alternator_decode_types = alternator_decode_types(
             nonpk_partition_key_columns
                 .iter()
@@ -759,6 +761,43 @@ impl Statements {
 /// columns (`real_columns`), plus synthesized types for Alternator's
 /// virtual SearchSchema attributes (see
 /// IndexMetadata::alternator_attribute_types) and, only for an Alternator
+/// Refuses a substring index whose `order_by` names a column that cannot be ordered.
+///
+/// Checked here rather than where the option is parsed, because `get_substring_index_params` sees
+/// only names and an options map, while by this point the table's columns are resolved.
+///
+/// Refusing is deliberate. An unparsable scalar option falls back to its default, which is harmless
+/// -- a different gram size still answers correctly. A sort column that is quietly dropped would
+/// leave `ORDER BY` answering in the index's own order, which looks like a plausible result and is
+/// wrong. Better to have no index than one that silently misorders.
+fn validate_sort_column(
+    metadata: &IndexMetadata,
+    table_columns: &HashMap<ColumnName, NativeType>,
+) -> anyhow::Result<()> {
+    let Some(order_by) = metadata
+        .kind
+        .as_substring()
+        .and_then(|options| options.order_by.as_ref().as_ref())
+    else {
+        return Ok(());
+    };
+    let Some(native_type) = table_columns.get(order_by) else {
+        anyhow::bail!(
+            "substring index {}.{} orders by column {order_by}, which the table does not have",
+            metadata.keyspace_name,
+            metadata.index_name,
+        );
+    };
+    anyhow::ensure!(
+        crate::cql_types::is_orderable(native_type),
+        "substring index {}.{} orders by column {order_by} of type {native_type:?}, \
+         which has no ordering the index can use",
+        metadata.keyspace_name,
+        metadata.index_name,
+    );
+    Ok(())
+}
+
 /// table, a raw-Blob entry for any other filtering column with no real
 /// column (see Alternator's compute_extra_fc_attributes()) so it can still
 /// be stored for projection/return purposes. Real columns win on any name

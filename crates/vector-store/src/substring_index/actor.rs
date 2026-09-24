@@ -7,6 +7,7 @@ use crate::AsyncInProgress;
 use crate::IndexKey;
 use crate::Limit;
 use crate::PrimaryKey;
+use crate::table::PartitionId;
 use crate::table::PrimaryId;
 use crate::tantivy_common::TantivyStatsR;
 use crate::vs_index::CountR;
@@ -18,6 +19,9 @@ pub(crate) type SubstringSearchR = anyhow::Result<Vec<PrimaryKey>>;
 
 pub(crate) enum SubstringIndex {
     AddDocument {
+        /// Needed to read the sort column back out of the table: a value is keyed by the partition
+        /// it lives in as well as by its primary id.
+        partition_id: PartitionId,
         primary_id: PrimaryId,
         document: String,
         in_progress: AsyncInProgress,
@@ -47,6 +51,7 @@ pub(crate) enum SubstringIndex {
 pub(crate) trait SubstringIndexExt {
     async fn add_document(
         &self,
+        partition_id: PartitionId,
         primary_id: PrimaryId,
         document: String,
         in_progress: AsyncInProgress,
@@ -70,12 +75,14 @@ pub(crate) trait SubstringIndexExt {
 impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
     async fn add_document(
         &self,
+        partition_id: PartitionId,
         primary_id: PrimaryId,
         document: String,
         in_progress: AsyncInProgress,
     ) -> anyhow::Result<()> {
         Ok(self
             .send(SubstringIndex::AddDocument {
+                partition_id,
                 primary_id,
                 document,
                 in_progress,
