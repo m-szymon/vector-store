@@ -217,7 +217,9 @@ compaction work.
   needs an exemption for this case.
 - A range restriction on the sort column (`AND register_time < ?`) is the primitive; paging is a
   cursor expressed through it. Worth having in its own right, not only as a paging mechanism.
-- The paging state carries `(sort_value, primary_key)`. Offset paging is not extended.
+- The paging state carries the last sort value. It does not carry a primary key, so two rows
+  sharing a sort value are not separated across a page boundary; see the tie gap below. Offset
+  paging is not extended.
 - `substring_index::check_target` stays as it is; the sort column is an option, not a target.
 
 ## Implementation order
@@ -233,7 +235,21 @@ compaction work.
 P0 and P1 together give correct global ordering with no new concepts, and are honest about being
 slow for hot keywords; that limitation must be documented rather than discovered.
 
+**Status: P0, P1 and P2 are implemented** in both repos, unexecuted on the ScyllaDB side (that build
+tree expects a newer clang than is installed, so its changes were only compiled one translation unit
+at a time). P3a and P3b are not started, so an ordered query is *correct* always but *fast* only
+where segments happen to be value-tight — which, after an unordered backfill, they are not.
+
 ## Open questions and risks
+
+- **The sort-key encoding is written twice**, in `cql_types.rs` and in `index/substring_index.cc`,
+  and the two must agree bit for bit: the node stores the key that ScyllaDB produces a bound for, so
+  a disagreement would filter on one ordering and sort by another, dropping rows from the middle of
+  a result rather than raising an error. The list of orderable types is duplicated the same way.
+  Both couplings go away if the request carries typed values and the node converts them, which needs
+  a JSON encoding for typed CQL values.
+- **Ties are not separated across a page boundary.** The cursor is a sort value alone, so rows
+  sharing one are taken or skipped together. A tie-break key in the cursor fixes it.
 
 - **Write amplification under sustained historic rewrites** is unmeasured. One distribution pass is
   characterised; steady state is not, and it is what sizes `max_l0_fraction` on a rewrite-heavy
