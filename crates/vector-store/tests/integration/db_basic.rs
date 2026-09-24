@@ -530,7 +530,7 @@ fn process_db(db: &DbBasic, msg: Db, node_state: Sender<NodeState>) {
                 .keyspaces
                 .get(&keyspace)
                 .and_then(|keyspace| keyspace.indexes.get(&index))
-                .and_then(|index| index.metadata.substring().copied())))
+                .and_then(|index| index.metadata.substring().cloned())))
             .map_err(|_| anyhow!("Db::GetSubstringIndexParams: unable to send response"))
             .unwrap(),
 

@@ -252,6 +252,7 @@ async fn indexes_lists_all_indexes_with_options() {
         min_gram: "2".parse().unwrap(),
         max_gram: "4".parse().unwrap(),
         case_sensitive: false.into(),
+        ..Default::default()
     };
     let substring_index = make_substring_index_with_options(
         "fourth",

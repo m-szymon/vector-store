@@ -28,6 +28,7 @@ use crate::Metrics;
 use crate::MinGram;
 use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
+use crate::OrderBy;
 use crate::Positions;
 use crate::Quantization;
 use crate::SpaceType;
@@ -1135,10 +1136,14 @@ impl Statements {
             let min_gram: MinGram = parse_index_option(&options, "min_gram");
             let max_gram: MaxGram = parse_index_option(&options, "max_gram");
             let case_sensitive: CaseSensitive = parse_index_option(&options, "case_sensitive");
+            // Only that the option names something; that the column exists and can be ordered is
+            // checked later, where the table's schema is in hand.
+            let order_by: OrderBy = parse_index_option(&options, "order_by");
             IndexOptionsSubstring {
                 min_gram,
                 max_gram,
                 case_sensitive,
+                order_by,
             }
             .validated()
         }))

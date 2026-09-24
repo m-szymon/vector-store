@@ -279,7 +279,7 @@ impl SubstringIndexEntry {
         monitor: mpsc::Sender<MonitorItems>,
         db_index: mpsc::Sender<DbIndex>,
     ) -> anyhow::Result<Self> {
-        let options = *metadata.substring().ok_or_else(|| {
+        let options = metadata.substring().cloned().ok_or_else(|| {
             anyhow::anyhow!("add_index_substring must be called with a substring-search index")
         })?;
         let progress = db_index.full_scan_progress().await;

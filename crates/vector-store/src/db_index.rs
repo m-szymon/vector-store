@@ -374,7 +374,7 @@ impl Statements {
         );
 
         let target_columns = metadata.target_columns.clone();
-        let filtering_columns: Arc<[_]> = metadata.nonpk_filtering_columns().cloned().collect();
+        let filtering_columns: Arc<[_]> = metadata.ingested_value_columns().cloned().collect();
 
         let is_alternator = KeyspaceIdentifier::from(&metadata.keyspace_name).is_alternator();
         let real_columns: HashMap<ColumnName, NativeType> = table

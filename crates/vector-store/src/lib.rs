@@ -673,6 +673,26 @@ impl FromStr for CaseSensitive {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// The column a substring index orders its results by, if it was given one.
+///
+/// Unset means the index answers in unspecified order, which is what lets a search stop at the
+/// limit instead of examining every match. An index with a sort column pays for the ordering, so
+/// this is opt-in rather than always on.
+pub struct OrderBy(Option<ColumnName>);
+
+impl FromStr for OrderBy {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let name = s.trim();
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("order_by must name a column"));
+        }
+        Ok(Self(Some(ColumnName::from(name))))
+    }
+}
+
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
 pub struct Limit(NonZeroUsize);
@@ -786,12 +806,16 @@ pub struct IndexOptionsFts {
     pub positions: Positions,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 /// Substring-search-specific index configuration.
+///
+/// Not `Copy`: `order_by` holds a column name. Clone it rather than reaching for a `*`.
 pub struct IndexOptionsSubstring {
     pub min_gram: MinGram,
     pub max_gram: MaxGram,
     pub case_sensitive: CaseSensitive,
+    /// The column results are ordered by, or none for unspecified order.
+    pub order_by: OrderBy,
 }
 
 impl IndexOptionsSubstring {
@@ -805,7 +829,13 @@ impl IndexOptionsSubstring {
                 self.min_gram.as_ref(),
                 self.max_gram.as_ref()
             );
-            return Self::default();
+            // Only the grams are in doubt, so only the grams are reset. Dropping the sort column
+            // here would silently turn an ordered index into an unordered one, and the queries
+            // would come back in the wrong order rather than failing.
+            return Self {
+                order_by: self.order_by,
+                ..Self::default()
+            };
         }
         self
     }
@@ -933,6 +963,23 @@ impl IndexMetadata {
         self.filtering_columns
             .iter()
             .filter(|col| !self.primary_key_columns.contains(col))
+    }
+
+    /// Every column whose value has to be fetched and kept alongside the indexed one: the filtering
+    /// columns, plus a substring index's sort column.
+    ///
+    /// Three places have to agree on this set -- the full-scan SELECT, the CDC re-SELECT and the
+    /// table's column slots -- and a disagreement shows up as a row count mismatch far from the
+    /// cause, so they all go through here rather than each assembling their own list.
+    pub(crate) fn ingested_value_columns(&self) -> impl Iterator<Item = &ColumnName> {
+        let sort_column = self
+            .kind
+            .as_substring()
+            .and_then(|options| options.order_by.as_ref().as_ref())
+            .filter(|col| {
+                !self.primary_key_columns.contains(col) && !self.filtering_columns.contains(col)
+            });
+        self.nonpk_filtering_columns().chain(sort_column)
     }
 }
 
@@ -1287,15 +1334,33 @@ mod tests {
             min_gram: "4".parse().unwrap(),
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
+            order_by: OrderBy::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsSubstring::default());
+
+        // The sort column survives a gram fallback: dropping it would answer in the wrong order
+        // rather than failing, which is far harder to notice.
+        let inverted_ordered = IndexOptionsSubstring {
+            min_gram: "4".parse().unwrap(),
+            max_gram: "3".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+            order_by: "registered_at".parse().unwrap(),
+        };
+        assert_eq!(
+            inverted_ordered.validated(),
+            IndexOptionsSubstring {
+                order_by: "registered_at".parse().unwrap(),
+                ..IndexOptionsSubstring::default()
+            }
+        );
 
         let valid = IndexOptionsSubstring {
             min_gram: "2".parse().unwrap(),
             max_gram: "2".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
+            order_by: OrderBy::default(),
         };
-        assert_eq!(valid.validated(), valid);
+        assert_eq!(valid.clone().validated(), valid);
     }
 
     #[test]
@@ -1325,5 +1390,75 @@ mod tests {
 
         let filtering_columns: Vec<_> = metadata.nonpk_filtering_columns().cloned().collect();
         assert_eq!(filtering_columns, vec!["f".into()]);
+    }
+
+    fn substring_metadata(
+        filtering_columns: Arc<[ColumnName]>,
+        order_by: OrderBy,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            keyspace_name: "ks".into(),
+            index_name: "idx".into(),
+            table_name: "tbl".into(),
+            primary_key_columns: NonemptyArc::new(["pk"]).unwrap(),
+            partition_key_count: NonZeroUsize::new(1).unwrap(),
+            target_columns: NonemptyArc::new(["nickname"]).unwrap(),
+            partitioning: DbIndexPartitioning::Global,
+            filtering_columns,
+            alternator_attribute_types: Arc::new(BTreeMap::new()),
+            version: Uuid::new_v4().into(),
+            kind: IndexKind::Substring(IndexOptionsSubstring {
+                order_by,
+                ..IndexOptionsSubstring::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_sort_column_joins_the_columns_whose_value_is_ingested() {
+        let metadata = substring_metadata(Arc::new([]), "registered_at".parse().unwrap());
+        let columns: Vec<_> = metadata.ingested_value_columns().cloned().collect();
+        assert_eq!(columns, vec!["registered_at".into()]);
+    }
+
+    #[test]
+    fn without_a_sort_column_nothing_is_ingested_beyond_the_filtering_ones() {
+        let metadata = substring_metadata(Arc::new(["f".into()]), OrderBy::default());
+        let columns: Vec<_> = metadata.ingested_value_columns().cloned().collect();
+        assert_eq!(columns, vec!["f".into()]);
+    }
+
+    /// The three sites that build this list feed `Table::new()`'s column slots and the SELECT that
+    /// fills them. A column listed twice would be fetched twice and throw the row-length check off
+    /// far from the cause.
+    #[test]
+    fn a_sort_column_is_not_ingested_twice() {
+        let already_filtering = substring_metadata(Arc::new(["f".into()]), "f".parse().unwrap());
+        let columns: Vec<_> = already_filtering
+            .ingested_value_columns()
+            .cloned()
+            .collect();
+        assert_eq!(columns, vec!["f".into()]);
+
+        // A primary-key column is stored as a key offset rather than a value slot, so it must not
+        // be fetched as one either.
+        let primary_key = substring_metadata(Arc::new([]), "pk".parse().unwrap());
+        assert_eq!(primary_key.ingested_value_columns().count(), 0);
+    }
+
+    #[test]
+    fn order_by_names_a_column_or_nothing() {
+        assert_eq!(
+            *"registered_at".parse::<OrderBy>().unwrap().as_ref(),
+            Some("registered_at".into())
+        );
+        // Trimmed, because CQL options come through as free text.
+        assert_eq!(
+            *"  registered_at  ".parse::<OrderBy>().unwrap().as_ref(),
+            Some("registered_at".into())
+        );
+        assert!("".parse::<OrderBy>().is_err());
+        assert!("   ".parse::<OrderBy>().is_err());
+        assert_eq!(*OrderBy::default().as_ref(), None);
     }
 }

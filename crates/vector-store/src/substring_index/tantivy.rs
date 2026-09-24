@@ -340,7 +340,7 @@ pub(crate) fn new(
         debug!("substring index actor starting for {key}");
         let mut states: BTreeMap<IndexId, Arc<SubstringIndexState>> = BTreeMap::new();
         let make_backend = || SubstringBackend {
-            options: index.options,
+            options: index.options.clone(),
         };
 
         let mut allocate_prev = Allocate::Can;
@@ -481,6 +481,7 @@ mod tests {
     use crate::IndexKey;
     use crate::MaxGram;
     use crate::MinGram;
+    use crate::OrderBy;
     use crate::PrimaryKey;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
@@ -536,6 +537,7 @@ mod tests {
             min_gram: MinGram::from(NonZeroUsize::new(min_gram).unwrap()),
             max_gram: MaxGram::from(NonZeroUsize::new(max_gram).unwrap()),
             case_sensitive: CaseSensitive::from(case_sensitive),
+            order_by: OrderBy::default(),
         }
     }
 

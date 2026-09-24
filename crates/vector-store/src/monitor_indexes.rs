@@ -1208,6 +1208,7 @@ mod tests {
         mock_db
             .expect_get_substring_index_params()
             .returning(move |_, _, _, tx| {
+                let options = options.clone();
                 async move {
                     tx.send(Ok(options)).unwrap();
                 }
@@ -1237,8 +1238,9 @@ mod tests {
             min_gram: "2".parse().unwrap(),
             max_gram: "4".parse().unwrap(),
             case_sensitive: false.into(),
+            ..Default::default()
         };
-        let db = db::tests::new(mock_db_with_substring_index(Some(options)));
+        let db = db::tests::new(mock_db_with_substring_index(Some(options.clone())));
 
         let result = get_indexes(&db, Uuid::new_v4()).await.unwrap();
 

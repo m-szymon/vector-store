@@ -219,7 +219,7 @@ fn build_table(
     };
     // Must match the columns db_index.rs/db_cdc actually fetch a value for,
     // or Table::new()'s column list goes out of sync with update_columns().
-    let filtering_columns: Arc<[_]> = metadata.nonpk_filtering_columns().cloned().collect();
+    let filtering_columns: Arc<[_]> = metadata.ingested_value_columns().cloned().collect();
     Table::new(
         key.clone(),
         metadata.primary_key_columns.clone(),
@@ -381,7 +381,7 @@ async fn add_index_substring(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
     let substring_sender = ctx.index_factories.substring.create_index(
         SubstringIndexConfiguration {
             key: ctx.key.clone(),
-            options: *options,
+            options: options.clone(),
         },
         Arc::clone(&ctx.table),
     );

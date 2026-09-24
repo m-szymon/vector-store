@@ -426,6 +426,7 @@ async fn substring_index_appears_in_indexes_list_with_its_options() {
         min_gram: "2".parse().unwrap(),
         max_gram: "4".parse().unwrap(),
         case_sensitive: false.into(),
+        ..Default::default()
     };
     let (client, ks, idx, _db, _hold) = setup_and_wait(options, NICKNAMES).await;
 
