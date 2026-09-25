@@ -41,7 +41,10 @@ use std::ops::Bound;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use tantivy::DocAddress;
@@ -85,6 +88,7 @@ use crate::tantivy_common::MAX_UNCOMMITTED_THRESHOLD;
 use crate::tantivy_common::PRIMARY_ID_FIELD;
 use crate::tantivy_common::QueryError;
 use crate::tantivy_common::TantivyBackend;
+use crate::tantivy_common::TantivyStats;
 use crate::tantivy_common::can_allocate_memory;
 use crate::tantivy_common::commit;
 use crate::tantivy_common::find_partition_id;
@@ -140,7 +144,97 @@ const STORE_CACHE_BLOCKS: usize = 1;
 /// verification and indexed as all of its `min_gram..=max_gram`-long substrings.
 struct SubstringBackend {
     options: IndexOptionsSubstring,
+    /// What every search since the index was created has cost, for `/metrics` to export.
+    walk: WalkCounters,
 }
+
+/// Running totals of what the walks did, so that a rate of queries can be explained rather than
+/// guessed at: how many segments the pruning left, how many postings had to be scanned for them,
+/// how many candidates made the heap, and how often the document store was opened. Each search
+/// adds its own tally once, at the end, so the hot loop touches only locals.
+#[derive(Debug, Default)]
+struct WalkCounters {
+    searches: AtomicU64,
+    segments_considered: AtomicU64,
+    segments_opened: AtomicU64,
+    postings_scanned: AtomicU64,
+    heap_entrants: AtomicU64,
+    store_reads: AtomicU64,
+    walk_nanos: AtomicU64,
+}
+
+/// One search's tally, added to [`WalkCounters`] when it finishes.
+#[derive(Debug, Default, Clone, Copy)]
+struct WalkTally {
+    segments_considered: u64,
+    segments_opened: u64,
+    postings_scanned: u64,
+    heap_entrants: u64,
+    store_reads: u64,
+}
+
+impl WalkCounters {
+    fn record(&self, tally: WalkTally, elapsed: Duration) {
+        self.searches.fetch_add(1, Relaxed);
+        self.segments_considered
+            .fetch_add(tally.segments_considered, Relaxed);
+        self.segments_opened
+            .fetch_add(tally.segments_opened, Relaxed);
+        self.postings_scanned
+            .fetch_add(tally.postings_scanned, Relaxed);
+        self.heap_entrants.fetch_add(tally.heap_entrants, Relaxed);
+        self.store_reads.fetch_add(tally.store_reads, Relaxed);
+        self.walk_nanos
+            .fetch_add(elapsed.as_nanos().try_into().unwrap_or(u64::MAX), Relaxed);
+    }
+
+    fn snapshot(&self) -> WalkTotals {
+        WalkTotals {
+            searches: self.searches.load(Relaxed),
+            segments_considered: self.segments_considered.load(Relaxed),
+            segments_opened: self.segments_opened.load(Relaxed),
+            postings_scanned: self.postings_scanned.load(Relaxed),
+            heap_entrants: self.heap_entrants.load(Relaxed),
+            store_reads: self.store_reads.load(Relaxed),
+            walk_nanos: self.walk_nanos.load(Relaxed),
+        }
+    }
+}
+
+/// [`WalkCounters`] at one moment, as `Stats` reports them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalkTotals {
+    pub(crate) searches: u64,
+    pub(crate) segments_considered: u64,
+    pub(crate) segments_opened: u64,
+    pub(crate) postings_scanned: u64,
+    pub(crate) heap_entrants: u64,
+    pub(crate) store_reads: u64,
+    pub(crate) walk_nanos: u64,
+}
+
+/// One segment as the ordered walk sees it: how many rows it holds and the span of sort keys the
+/// pruning judges it by. The span is what decides whether ordering is cheap -- a segment covering
+/// the whole range can never be skipped -- and it is not visible from anything else the node
+/// reports. `None` bounds mean the index has no sort column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentLayout {
+    pub(crate) docs: u32,
+    pub(crate) deleted: u32,
+    pub(crate) sort_min: Option<u64>,
+    pub(crate) sort_max: Option<u64>,
+}
+
+/// What `Stats` reports for a substring index: the Tantivy figures every index has, plus what
+/// this one's searches have cost and how its segments are laid out.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SubstringStats {
+    pub(crate) tantivy: TantivyStats,
+    pub(crate) walk: WalkTotals,
+    pub(crate) segments: Vec<SegmentLayout>,
+}
+
+pub(crate) type SubstringStatsR = anyhow::Result<SubstringStats>;
 
 impl SubstringBackend {
     fn min_gram(&self) -> usize {
@@ -414,6 +508,8 @@ fn collect_matches_ordered(
         .weight(EnableScoring::disabled_from_searcher(&searcher))
         .map_err(|e| anyhow!("substring: failed to build the query: {e}"))?;
 
+    let started = Instant::now();
+    let mut tally = WalkTally::default();
     let mut segments = Vec::with_capacity(searcher.segment_readers().len());
     for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
         let column = segment
@@ -427,6 +523,7 @@ fn collect_matches_ordered(
         }
     }
     segments.sort_by_key(|(_, _, _, upper_bound)| Reverse(*upper_bound));
+    tally.segments_considered = segments.len() as u64;
 
     // Min-heap of the best `limit` so far, so the root is the entry to beat. It holds document
     // addresses, not primary ids: an entrant is often pushed out again by a later, higher one, and
@@ -443,6 +540,7 @@ fn collect_matches_ordered(
             break;
         }
 
+        tally.segments_opened += 1;
         let mut scorer = weight
             .scorer(segment, 1.0)
             .map_err(|e| anyhow!("substring: failed to run the query: {e}"))?;
@@ -454,6 +552,7 @@ fn collect_matches_ordered(
 
         let mut doc_id = scorer.doc();
         while doc_id != TERMINATED {
+            tally.postings_scanned += 1;
             if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
                 let sort_key = sort_column.first(doc_id).unwrap_or(0);
                 let beats_page = best.len() < limit
@@ -467,12 +566,14 @@ fn collect_matches_ordered(
                         None => true,
                         Some(store) => store
                             .get::<TantivyDocument>(doc_id)
+                            .inspect(|_| tally.store_reads += 1)
                             .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?
                             .get_first(text_field)
                             .and_then(|value| value.as_str())
                             .is_some_and(|text| text.contains(normalized)),
                     };
                     if verified {
+                        tally.heap_entrants += 1;
                         best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
                         if best.len() > limit {
                             best.pop();
@@ -494,6 +595,7 @@ fn collect_matches_ordered(
         .flatten();
     let mut page: Vec<(u64, DocAddress)> = best.into_iter().map(|Reverse(entry)| entry).collect();
     page.sort_unstable_by_key(|(sort_key, _)| Reverse(*sort_key));
+    tally.store_reads += page.len() as u64;
     let ids = page
         .into_iter()
         .map(|(_, address)| {
@@ -506,6 +608,7 @@ fn collect_matches_ordered(
                 .ok_or_else(|| anyhow!("substring: missing primary_id in doc"))
         })
         .collect::<anyhow::Result<_>>()?;
+    state.backend.walk.record(tally, started.elapsed());
     Ok((ids, next_cursor))
 }
 
@@ -528,9 +631,15 @@ fn collect_matches(
         .weight(EnableScoring::disabled_from_searcher(&searcher))
         .map_err(|e| anyhow!("substring: failed to build the query: {e}"))?;
 
+    let started = Instant::now();
+    let mut tally = WalkTally {
+        segments_considered: searcher.segment_readers().len() as u64,
+        ..WalkTally::default()
+    };
     let mut to_skip = offset;
     let mut matches = Vec::with_capacity(limit);
     'segments: for segment in searcher.segment_readers() {
+        tally.segments_opened += 1;
         let mut scorer = weight
             .scorer(segment, 1.0)
             .map_err(|e| anyhow!("substring: failed to run the query: {e}"))?;
@@ -541,7 +650,9 @@ fn collect_matches(
 
         let mut doc_id = scorer.doc();
         while doc_id != TERMINATED {
+            tally.postings_scanned += 1;
             if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                tally.store_reads += 1;
                 let doc: TantivyDocument = store
                     .get(doc_id)
                     .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
@@ -551,6 +662,7 @@ fn collect_matches(
                         .and_then(|value| value.as_str())
                         .is_some_and(|text| text.contains(normalized));
                 if verified {
+                    tally.heap_entrants += 1;
                     if to_skip > 0 {
                         to_skip -= 1;
                     } else {
@@ -568,7 +680,37 @@ fn collect_matches(
             doc_id = scorer.advance();
         }
     }
+    state.backend.walk.record(tally, started.elapsed());
     Ok(matches)
+}
+
+fn handle_substring_stats(state: &SubstringIndexState) -> SubstringStatsR {
+    let tantivy = handle_stats(state)?;
+    let searcher = state.reader.searcher();
+    let segments = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| {
+            let bounds = state
+                .backend
+                .orders_results()
+                .then(|| segment.fast_fields().u64(SORT_FIELD))
+                .transpose()
+                .map_err(|e| anyhow!("substring: failed to open the sort column: {e}"))?
+                .map(|column| (column.min_value(), column.max_value()));
+            Ok(SegmentLayout {
+                docs: segment.num_docs(),
+                deleted: segment.num_deleted_docs(),
+                sort_min: bounds.map(|(min, _)| min),
+                sort_max: bounds.map(|(_, max)| max),
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(SubstringStats {
+        tantivy,
+        walk: state.backend.walk.snapshot(),
+        segments,
+    })
 }
 
 fn handle_search(
@@ -617,6 +759,7 @@ pub(crate) fn new(
         debug!("substring index actor starting for {key}");
         let mut states: BTreeMap<IndexId, Arc<SubstringIndexState>> = BTreeMap::new();
         let make_backend = || SubstringBackend {
+            walk: WalkCounters::default(),
             options: index.options.clone(),
         };
 
@@ -745,7 +888,7 @@ pub(crate) fn new(
                             };
                             worker
                                 .spawn_blocking(move || {
-                                    let result = handle_stats(&state);
+                                    let result = handle_substring_stats(&state);
                                     _ = tx.send(result);
                                 })
                                 .await;
@@ -1207,9 +1350,11 @@ mod tests {
 
         let stats = sender.stats(make_index_key()).await.unwrap();
 
-        assert_eq!(stats.num_docs, 6);
-        assert!(stats.segment_count > 0);
-        assert!(stats.size_bytes > 0);
+        assert_eq!(stats.tantivy.num_docs, 6);
+        assert!(stats.tantivy.segment_count > 0);
+        assert!(stats.tantivy.size_bytes > 0);
+        assert_eq!(stats.segments.len(), stats.tantivy.segment_count);
+        assert_eq!(stats.segments.iter().map(|s| s.docs).sum::<u32>(), 6);
     }
 
     #[rstest]
@@ -1280,6 +1425,61 @@ mod tests {
         descending.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(ids, descending, "not ordered by the sort column");
         assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    /// `Stats` prices the searches served so far and describes the segments the pruning sees: an
+    /// ordered index reports each segment's sort bounds, and the walk's tally grows per search.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn stats_count_the_walk_and_describe_the_segments() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let before = sender.stats(make_index_key()).await.unwrap();
+        assert_eq!(before.walk.searches, 0);
+        assert_eq!(before.segments.len(), before.tantivy.segment_count);
+        let docs: u32 = before.segments.iter().map(|s| s.docs).sum();
+        assert_eq!(u64::from(docs), before.tantivy.num_docs);
+        for segment in &before.segments {
+            let (min, max) = (segment.sort_min.unwrap(), segment.sort_max.unwrap());
+            assert!(min <= max, "segment bounds inverted: {segment:?}");
+        }
+
+        search_ordered(&sender, "将军", 2, SortWindow::default()).await;
+
+        let after = sender.stats(make_index_key()).await.unwrap();
+        let walk = after.walk;
+        assert_eq!(walk.searches, 1);
+        assert!(walk.segments_opened >= 1 && walk.segments_opened <= walk.segments_considered);
+        // Two of the three matches fill the page; the third enters only if its segment was not
+        // pruned by then, which depends on how the documents were merged.
+        assert!(walk.postings_scanned >= 2, "{walk:?}");
+        assert!((2..=3).contains(&walk.heap_entrants), "{walk:?}");
+        // Only the page is read from the store: two rows, not every entrant.
+        assert_eq!(walk.store_reads, 2, "{walk:?}");
+    }
+
+    /// An unordered index has no sort column and says so, rather than inventing bounds.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_unordered_index_reports_segments_without_bounds() {
+        let sender = make_sender();
+        add_docs(&sender, NICKNAMES).await;
+        search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+
+        let stats = sender.stats(make_index_key()).await.unwrap();
+        assert!(!stats.segments.is_empty());
+        assert!(
+            stats
+                .segments
+                .iter()
+                .all(|s| s.sort_min.is_none() && s.sort_max.is_none())
+        );
+        assert_eq!(stats.walk.searches, 1);
+        // The unordered walk reads every match it keeps from the store.
+        assert_eq!(stats.walk.store_reads, stats.walk.heap_entrants);
     }
 
     /// Without a sort column nothing changes: the index answers as it did before, and reports no

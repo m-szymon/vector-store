@@ -642,17 +642,47 @@ async fn refresh_index_metrics(
             .metrics
             .size
             .with_label_values(&labels)
-            .set(stats.num_docs as f64);
+            .set(stats.tantivy.num_docs as f64);
         state
             .metrics
             .substring_index_size_bytes
             .with_label_values(&labels)
-            .set(stats.size_bytes as f64);
+            .set(stats.tantivy.size_bytes as f64);
         state
             .metrics
             .substring_segment_count
             .with_label_values(&labels)
-            .set(stats.segment_count as f64);
+            .set(stats.tantivy.segment_count as f64);
+        let walk = stats.walk;
+        let totals = [
+            walk.searches as f64,
+            walk.segments_considered as f64,
+            walk.segments_opened as f64,
+            walk.postings_scanned as f64,
+            walk.heap_entrants as f64,
+            walk.store_reads as f64,
+            walk.walk_nanos as f64 / 1e9,
+        ];
+        for (gauge, value) in state.metrics.substring_search_totals.iter().zip(totals) {
+            gauge.with_label_values(&labels).set(value);
+        }
+        // The bounds are exported as the column's own value rather than as the sort key, which
+        // is the value with its sign bit flipped so that it orders as an unsigned integer.
+        let decode = |sort_key: Option<u64>| sort_key.map(|key| (key ^ (1 << 63)) as i64 as f64);
+        let segments = stats
+            .segments
+            .iter()
+            .map(|segment| {
+                [
+                    Some(segment.docs as f64),
+                    decode(segment.sort_min),
+                    decode(segment.sort_max),
+                ]
+            })
+            .collect::<Vec<_>>();
+        state
+            .metrics
+            .set_substring_segments(labels[0], labels[1], &segments);
     }
 }
 

@@ -4,13 +4,13 @@
  */
 
 use super::tantivy::SortWindow;
+use super::tantivy::SubstringStatsR;
 use crate::AsyncInProgress;
 use crate::IndexKey;
 use crate::Limit;
 use crate::PrimaryKey;
 use crate::table::PartitionId;
 use crate::table::PrimaryId;
-use crate::tantivy_common::TantivyStatsR;
 use crate::vs_index::CountR;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -59,7 +59,7 @@ pub(crate) enum SubstringIndex {
     },
     Stats {
         index_key: IndexKey,
-        tx: oneshot::Sender<TantivyStatsR>,
+        tx: oneshot::Sender<SubstringStatsR>,
     },
 }
 
@@ -85,7 +85,7 @@ pub(crate) trait SubstringIndexExt {
         offset: usize,
         window: SortWindow,
     ) -> SubstringSearchR;
-    async fn stats(&self, index_key: IndexKey) -> TantivyStatsR;
+    async fn stats(&self, index_key: IndexKey) -> SubstringStatsR;
 }
 
 impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
@@ -146,7 +146,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         rx.await?
     }
 
-    async fn stats(&self, index_key: IndexKey) -> TantivyStatsR {
+    async fn stats(&self, index_key: IndexKey) -> SubstringStatsR {
         let (tx, rx) = oneshot::channel();
         self.send(SubstringIndex::Stats { index_key, tx }).await?;
         rx.await?

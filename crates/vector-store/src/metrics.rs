@@ -2,6 +2,7 @@
  * Copyright 2025-present ScyllaDB
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+use dashmap::DashMap;
 use dashmap::DashSet;
 use prometheus::CounterVec;
 use prometheus::GaugeVec;
@@ -29,8 +30,69 @@ pub(crate) struct Metrics {
     pub fts_segment_count: GaugeVec,
     pub substring_index_size_bytes: GaugeVec,
     pub substring_segment_count: GaugeVec,
+    /// What a substring index's searches have cost, summed since it was created. Read off the
+    /// index on scrape, so they are gauges that only ever grow; a client diffs two scrapes to
+    /// price the queries in between. One entry per [`SUBSTRING_SEARCH_TOTALS`].
+    pub substring_search_totals: Vec<GaugeVec>,
+    /// A substring index's segments, one label set per segment ordinal: how many rows each holds
+    /// and the span of sort keys its pruning is judged by. See [`SUBSTRING_SEGMENT_GAUGES`].
+    pub substring_segment_layout: Vec<GaugeVec>,
     dirty_indexes: Arc<DashSet<(String, String)>>,
+    /// How many segment label sets each substring index exported last time, so a scrape after a
+    /// merge can drop the ordinals that no longer exist.
+    substring_segments_exported: Arc<DashMap<(String, String), usize>>,
 }
+
+/// The per-index search totals, in the order `substring_search_totals` holds them.
+pub(crate) const SUBSTRING_SEARCH_TOTALS: &[(&str, &str)] = &[
+    (
+        "substring_search_total",
+        "Substring searches served by an index since it was created",
+    ),
+    (
+        "substring_search_segments_considered_total",
+        "Segments a substring search could not rule out from their bounds, summed over searches",
+    ),
+    (
+        "substring_search_segments_opened_total",
+        "Segments a substring search walked, summed over searches",
+    ),
+    (
+        "substring_search_postings_scanned_total",
+        "Postings a substring search visited, summed over searches",
+    ),
+    (
+        "substring_search_heap_entrants_total",
+        "Matches that entered a substring search's page or top-k heap, summed over searches",
+    ),
+    (
+        "substring_search_store_reads_total",
+        "Documents a substring search read from the document store, summed over searches",
+    ),
+    (
+        "substring_search_walk_seconds_total",
+        "Time substring searches spent walking the index, summed over searches",
+    ),
+];
+
+/// The per-segment gauges, in the order `substring_segment_layout` holds them. The sort bounds
+/// are exported with the sign bias of `cql_types::to_sort_key` undone, so a timestamp or integer
+/// column reads as its own value. A `date` column carries no bias and so comes out offset by
+/// 2^63; the spans and overlaps these gauges exist to show are unaffected.
+pub(crate) const SUBSTRING_SEGMENT_GAUGES: &[(&str, &str)] = &[
+    (
+        "substring_segment_docs",
+        "Live rows in one segment of a substring index",
+    ),
+    (
+        "substring_segment_sort_min",
+        "Lowest sort-column value in one segment of an ordered substring index",
+    ),
+    (
+        "substring_segment_sort_max",
+        "Highest sort-column value in one segment of an ordered substring index",
+    ),
+];
 
 impl Metrics {
     pub(crate) fn new() -> Self {
@@ -179,6 +241,27 @@ impl Metrics {
         )
         .unwrap();
 
+        let substring_search_totals = SUBSTRING_SEARCH_TOTALS
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let substring_segment_layout = SUBSTRING_SEGMENT_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name", "segment"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
         registry.register(Box::new(latency.clone())).unwrap();
         registry.register(Box::new(size.clone())).unwrap();
         registry.register(Box::new(modified.clone())).unwrap();
@@ -205,6 +288,12 @@ impl Metrics {
         registry
             .register(Box::new(substring_segment_count.clone()))
             .unwrap();
+        for gauge in substring_search_totals
+            .iter()
+            .chain(substring_segment_layout.iter())
+        {
+            registry.register(Box::new(gauge.clone())).unwrap();
+        }
 
         Self {
             registry,
@@ -220,7 +309,41 @@ impl Metrics {
             fts_segment_count,
             substring_index_size_bytes,
             substring_segment_count,
+            substring_search_totals,
+            substring_segment_layout,
             dirty_indexes: Arc::new(DashSet::new()),
+            substring_segments_exported: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Replace the segment label sets of one substring index with `segments`, dropping the
+    /// ordinals a merge has retired since the last scrape.
+    pub(crate) fn set_substring_segments(
+        &self,
+        keyspace: &str,
+        index_name: &str,
+        segments: &[[Option<f64>; 3]],
+    ) {
+        let key = (keyspace.to_owned(), index_name.to_owned());
+        let previous = self
+            .substring_segments_exported
+            .insert(key, segments.len())
+            .unwrap_or(0);
+        for (ordinal, values) in segments.iter().enumerate() {
+            let ordinal = ordinal.to_string();
+            let labels = [keyspace, index_name, ordinal.as_str()];
+            for (gauge, value) in self.substring_segment_layout.iter().zip(values) {
+                match value {
+                    Some(value) => gauge.with_label_values(&labels).set(*value),
+                    None => _ = gauge.remove_label_values(&labels),
+                }
+            }
+        }
+        for ordinal in segments.len()..previous {
+            let ordinal = ordinal.to_string();
+            for gauge in &self.substring_segment_layout {
+                let _ = gauge.remove_label_values(&[keyspace, index_name, ordinal.as_str()]);
+            }
         }
     }
 
@@ -259,6 +382,10 @@ impl Metrics {
         let _ = self
             .substring_segment_count
             .remove_label_values(&[keyspace, index_name]);
+        for gauge in &self.substring_search_totals {
+            let _ = gauge.remove_label_values(&[keyspace, index_name]);
+        }
+        self.set_substring_segments(keyspace, index_name, &[]);
         for op in OPERATIONS {
             let _ = self
                 .modified
@@ -324,6 +451,75 @@ mod tests {
         assert!(
             !output.contains(r#"keyspace="ks""#),
             "metric output should not contain labels for deleted index, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn substring_search_totals_and_segment_layout_are_exported() {
+        let metrics = Metrics::new();
+
+        metrics.substring_search_totals[0]
+            .with_label_values(&["ks", "idx"])
+            .set(7.0);
+        metrics.set_substring_segments(
+            "ks",
+            "idx",
+            &[[Some(10.0), Some(1.0), Some(5.0)], [Some(3.0), None, None]],
+        );
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            output.contains(r#"substring_search_total{index_name="idx",keyspace="ks"} 7"#),
+            "search total missing from export:\n{output}"
+        );
+        assert!(
+            output.contains(
+                r#"substring_segment_docs{index_name="idx",keyspace="ks",segment="0"} 10"#
+            ),
+            "segment 0 docs missing from export:\n{output}"
+        );
+        assert!(
+            output.contains(
+                r#"substring_segment_sort_max{index_name="idx",keyspace="ks",segment="0"} 5"#
+            ),
+            "segment 0 sort max missing from export:\n{output}"
+        );
+        assert!(
+            output.contains(
+                r#"substring_segment_docs{index_name="idx",keyspace="ks",segment="1"} 3"#
+            ),
+            "segment 1 docs missing from export:\n{output}"
+        );
+        assert!(
+            !output.contains(
+                r#"substring_segment_sort_min{index_name="idx",keyspace="ks",segment="1"}"#
+            ),
+            "an unordered segment must export no bounds:\n{output}"
+        );
+    }
+
+    #[test]
+    fn set_substring_segments_drops_retired_ordinals() {
+        let metrics = Metrics::new();
+        let segment = |docs| [Some(docs), Some(0.0), Some(1.0)];
+
+        metrics.set_substring_segments("ks", "idx", &[segment(1.0), segment(2.0), segment(3.0)]);
+        metrics.set_substring_segments("ks", "idx", &[segment(6.0)]);
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            output.contains(r#"segment="0"} 6"#),
+            "the merged segment should be exported:\n{output}"
+        );
+        assert!(
+            !output.contains(r#"segment="1""#) && !output.contains(r#"segment="2""#),
+            "retired ordinals should be gone:\n{output}"
+        );
+
+        metrics.remove_index_labels("ks", "idx");
+        assert!(
+            !metric_families_text(&metrics).contains("substring_segment"),
+            "removing the index should clear its segments"
         );
     }
 
