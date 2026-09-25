@@ -701,19 +701,20 @@ fn segment_pruned_ordered(corpus: &Corpus, keyword: &str, limit: usize) -> usize
     segment_pruned_walk(corpus, keyword, limit, false)
 }
 
-/// `segment_pruned_ordered` as the index node actually runs it.
+/// `segment_pruned_ordered` with a store read for every heap entrant.
 ///
-/// The node needs each row's primary key, which it keeps in the document store, so every candidate
-/// that enters the heap is read from the store whether or not it needs verifying.
-/// `segment_pruned_ordered` keeps only the doc id and reads nothing for a short keyword, which is
-/// the design the node could have but does not.
+/// This is the walk the index node ran until it learned to defer the primary-key read: the node
+/// keeps the primary key in the document store, and it read every candidate that entered the heap
+/// to learn it, whether or not the candidate needed verifying. The node now holds document
+/// addresses in the heap and reads the store for the surviving page only, which is what
+/// `segment_pruned_ordered` measures. Kept as the yardstick that explains the first AWS numbers.
 ///
 /// Measured on 500k names: 2.0 ms against 74 us at 5,000 matches, 7.8 ms against 0.9 ms at
-/// 100,000 -- the store reads, not the walk, are most of an ordered search. Insertion order made no
-/// difference to either, which rules out the obvious suspect: documents in ascending sort order do
-/// not make every match enter the heap often enough to matter. What costs is that each read
+/// 100,000 -- the store reads, not the walk, were most of an ordered search. Insertion order made
+/// no difference to either, which rules out the obvious suspect: documents in ascending sort order
+/// do not make every match enter the heap often enough to matter. What costs is that each read
 /// decompresses a store block, and the candidates that enter the heap are scattered across blocks.
-fn segment_pruned_ordered_as_shipped(corpus: &Corpus, keyword: &str, limit: usize) -> usize {
+fn segment_pruned_store_on_entry(corpus: &Corpus, keyword: &str, limit: usize) -> usize {
     segment_pruned_walk(corpus, keyword, limit, true)
 }
 
@@ -1175,10 +1176,10 @@ fn bench_segment_pruning(c: &mut Criterion) {
             |b, keyword| b.iter(|| black_box(segment_pruned_ordered(corpus, keyword, LIMIT))),
         );
         group.bench_with_input(
-            BenchmarkId::new("as_shipped", &label),
+            BenchmarkId::new("store_on_entry", &label),
             &planted.keyword,
             |b, keyword| {
-                b.iter(|| black_box(segment_pruned_ordered_as_shipped(corpus, keyword, LIMIT)))
+                b.iter(|| black_box(segment_pruned_store_on_entry(corpus, keyword, LIMIT)))
             },
         );
     }

@@ -44,6 +44,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use tantivy::DocAddress;
 use tantivy::DocSet;
 use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
@@ -414,7 +415,7 @@ fn collect_matches_ordered(
         .map_err(|e| anyhow!("substring: failed to build the query: {e}"))?;
 
     let mut segments = Vec::with_capacity(searcher.segment_readers().len());
-    for segment in searcher.segment_readers() {
+    for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
         let column = segment
             .fast_fields()
             .u64(sort_field_name)
@@ -422,14 +423,18 @@ fn collect_matches_ordered(
         let (min, max) = (column.min_value(), column.max_value());
         // Ruled out from the bounds alone, so the segment is never opened.
         if window.overlaps(min, max) {
-            segments.push((segment, column, max));
+            segments.push((segment_ord as u32, segment, column, max));
         }
     }
-    segments.sort_by_key(|(_, _, upper_bound)| Reverse(*upper_bound));
+    segments.sort_by_key(|(_, _, _, upper_bound)| Reverse(*upper_bound));
 
-    // Min-heap of the best `limit` so far, so the root is the entry to beat.
-    let mut best: BinaryHeap<Reverse<(u64, u64)>> = BinaryHeap::with_capacity(limit + 1);
-    for (segment, sort_column, upper_bound) in segments {
+    // Min-heap of the best `limit` so far, so the root is the entry to beat. It holds document
+    // addresses, not primary ids: an entrant is often pushed out again by a later, higher one, and
+    // reading the document store to learn the id of every entrant is what dominated the walk --
+    // 9-27x the cost of the walk itself (benches/substring_order.rs, `as_shipped`). The ids are
+    // read once, for the page that survives.
+    let mut best: BinaryHeap<Reverse<(u64, DocAddress)>> = BinaryHeap::with_capacity(limit + 1);
+    for (segment_ord, segment, sort_column, upper_bound) in segments {
         if best.len() == limit
             && let Some(Reverse((weakest, _))) = best.peek()
             && upper_bound <= *weakest
@@ -442,8 +447,9 @@ fn collect_matches_ordered(
             .scorer(segment, 1.0)
             .map_err(|e| anyhow!("substring: failed to run the query: {e}"))?;
         let alive = segment.alive_bitset();
-        let store = segment
-            .get_store_reader(STORE_CACHE_BLOCKS)
+        let store = needs_verification
+            .then(|| segment.get_store_reader(STORE_CACHE_BLOCKS))
+            .transpose()
             .map_err(|e| anyhow!("substring: failed to open the document store: {e}"))?;
 
         let mut doc_id = scorer.doc();
@@ -455,20 +461,19 @@ fn collect_matches_ordered(
                         .peek()
                         .is_none_or(|Reverse((weakest, _))| sort_key > *weakest);
                 if window.contains(sort_key) && beats_page {
-                    let doc: TantivyDocument = store
-                        .get(doc_id)
-                        .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
-                    let verified = !needs_verification
-                        || doc
+                    // Past max_gram the grams only nominate candidates, and the text is in the
+                    // store; below it every match is exact and the store is not touched here.
+                    let verified = match &store {
+                        None => true,
+                        Some(store) => store
+                            .get::<TantivyDocument>(doc_id)
+                            .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?
                             .get_first(text_field)
                             .and_then(|value| value.as_str())
-                            .is_some_and(|text| text.contains(normalized));
+                            .is_some_and(|text| text.contains(normalized)),
+                    };
                     if verified {
-                        let raw_id = doc
-                            .get_first(primary_id_field)
-                            .and_then(|value| value.as_u64())
-                            .ok_or_else(|| anyhow!("substring: missing primary_id in doc"))?;
-                        best.push(Reverse((sort_key, raw_id)));
+                        best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
                         if best.len() > limit {
                             best.pop();
                         }
@@ -487,14 +492,21 @@ fn collect_matches_ordered(
     let next_cursor = (best.len() == limit)
         .then(|| best.peek().map(|Reverse((sort_key, _))| *sort_key))
         .flatten();
-    let mut page: Vec<(u64, u64)> = best.into_iter().map(|Reverse(entry)| entry).collect();
+    let mut page: Vec<(u64, DocAddress)> = best.into_iter().map(|Reverse(entry)| entry).collect();
     page.sort_unstable_by_key(|(sort_key, _)| Reverse(*sort_key));
-    Ok((
-        page.into_iter()
-            .map(|(_, raw_id)| PrimaryId::from(raw_id))
-            .collect(),
-        next_cursor,
-    ))
+    let ids = page
+        .into_iter()
+        .map(|(_, address)| {
+            let doc: TantivyDocument = searcher
+                .doc(address)
+                .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
+            doc.get_first(primary_id_field)
+                .and_then(|value| value.as_u64())
+                .map(PrimaryId::from)
+                .ok_or_else(|| anyhow!("substring: missing primary_id in doc"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok((ids, next_cursor))
 }
 
 fn collect_matches(

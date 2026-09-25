@@ -113,6 +113,14 @@ expensive half. Measured on a corpus whose segments span the whole range and can
 100,000 matches fell from 1.40 ms to 0.35 ms, and a verified query at 5,000 matches from 12.1 ms to
 0.90 ms — **4–13×, with no dependency on segment layout.**
 
+The same reasoning applies to the primary key. It lives in the document store too, and the first
+stage-2 build read it for every row that entered the top-k heap — most of which a later, higher row
+then pushed out again. On AWS that put the ordered page-1 ceiling at 6.0k op/s against stage 1's
+9.6k, with the index node at 95% CPU; locally the walk with those reads was 9–27× slower than the
+same walk without them (`segment_pruned` vs `store_on_entry` in the benchmark). The heap now holds
+document addresses and the store is read once, for the `limit` rows that survive. A keyword past
+`max_gram` still reads each candidate to verify its text; that read cannot be deferred.
+
 ## Reaching and holding the target state
 
 ### Segments do not become tight on their own
