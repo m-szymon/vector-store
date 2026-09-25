@@ -698,6 +698,26 @@ fn windowed_ordered(corpus: &Corpus, keyword: &str, limit: usize, window: f64) -
 /// or shuffled ingestion order costs time and never answers. What insertion order decides is how
 /// tight the bounds are, which is what `SUBSTRING_BENCH_SHUFFLE` exists to measure.
 fn segment_pruned_ordered(corpus: &Corpus, keyword: &str, limit: usize) -> usize {
+    segment_pruned_walk(corpus, keyword, limit, false)
+}
+
+/// `segment_pruned_ordered` as the index node actually runs it.
+///
+/// The node needs each row's primary key, which it keeps in the document store, so every candidate
+/// that enters the heap is read from the store whether or not it needs verifying.
+/// `segment_pruned_ordered` keeps only the doc id and reads nothing for a short keyword, which is
+/// the design the node could have but does not.
+///
+/// Measured on 500k names: 2.0 ms against 74 us at 5,000 matches, 7.8 ms against 0.9 ms at
+/// 100,000 -- the store reads, not the walk, are most of an ordered search. Insertion order made no
+/// difference to either, which rules out the obvious suspect: documents in ascending sort order do
+/// not make every match enter the heap often enough to matter. What costs is that each read
+/// decompresses a store block, and the candidates that enter the heap are scattered across blocks.
+fn segment_pruned_ordered_as_shipped(corpus: &Corpus, keyword: &str, limit: usize) -> usize {
+    segment_pruned_walk(corpus, keyword, limit, true)
+}
+
+fn segment_pruned_walk(corpus: &Corpus, keyword: &str, limit: usize, read_on_entry: bool) -> usize {
     let text_field = corpus.schema.get_field(TEXT_FIELD).unwrap();
     let (query, needs_verification) = build_query(text_field, keyword);
 
@@ -746,12 +766,16 @@ fn segment_pruned_ordered(corpus: &Corpus, keyword: &str, limit: usize) -> usize
                 let worth_it = best.len() < limit
                     || best.peek().is_none_or(|Reverse((kth, _))| sort_key > *kth);
                 if worth_it {
-                    let verified = !needs_verification || {
+                    let verified = if needs_verification || read_on_entry {
                         let doc: TantivyDocument =
                             store.get(doc_id).expect("bench: failed to read a doc");
-                        doc.get_first(text_field)
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|text| text.contains(keyword))
+                        !needs_verification
+                            || doc
+                                .get_first(text_field)
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|text| text.contains(keyword))
+                    } else {
+                        true
                     };
                     if verified {
                         best.push(Reverse((sort_key, doc_id)));
@@ -1149,6 +1173,13 @@ fn bench_segment_pruning(c: &mut Criterion) {
             BenchmarkId::new("segment_pruned", &label),
             &planted.keyword,
             |b, keyword| b.iter(|| black_box(segment_pruned_ordered(corpus, keyword, LIMIT))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("as_shipped", &label),
+            &planted.keyword,
+            |b, keyword| {
+                b.iter(|| black_box(segment_pruned_ordered_as_shipped(corpus, keyword, LIMIT)))
+            },
         );
     }
     group.finish();
