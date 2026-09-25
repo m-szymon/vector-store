@@ -50,12 +50,15 @@ use std::time::Instant;
 use anyhow::anyhow;
 use tantivy::DocAddress;
 use tantivy::DocSet;
-use tantivy::index::SegmentId;
 use tantivy::SegmentReader;
 use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
 use tantivy::Term;
 use tantivy::columnar::Column;
+use tantivy::index::SegmentId;
+use tantivy::index::SegmentMeta;
+use tantivy::indexer::MergeCandidate;
+use tantivy::indexer::MergePolicy;
 use tantivy::query::BooleanQuery;
 use tantivy::query::EnableScoring;
 use tantivy::query::Query;
@@ -101,6 +104,7 @@ use crate::tantivy_common::get_state;
 use crate::tantivy_common::handle_add_document;
 use crate::tantivy_common::handle_remove_document;
 use crate::tantivy_common::handle_stats;
+use crate::tantivy_common::reload;
 use crate::worker::Worker;
 use crate::worker::WorkerExt;
 
@@ -156,6 +160,80 @@ struct SubstringBackend {
     /// the handle itself is a cheap clone. Keyed by segment id, so a merge simply leaves stale
     /// entries behind, which `prune_columns` drops once they outnumber the live segments.
     columns: RwLock<HashMap<SegmentId, SegmentColumns>>,
+    /// Each live segment's sort bounds, for the merge policy, which sees only segment metas.
+    /// Refreshed after every reload; shared with the policy the writer holds.
+    bounds: SharedBounds,
+}
+
+type SharedBounds = Arc<RwLock<HashMap<SegmentId, (u64, u64)>>>;
+
+/// P3a: merges neighbours in sort order, never past a size cap.
+///
+/// Tantivy's default policy merges segments of similar size whatever they hold, which is how an
+/// index ends up with 1.3M-row segments spanning a quarter of the range each and a tail of small
+/// ones that all reach the top: a page-1 query opens every tail segment and a deep page scans
+/// whichever big segment its cursor lands in. This one sorts the segments by their lowest sort
+/// key and merges runs of neighbours while the run stays under `max_docs`, so a segment only ever
+/// grows into the rows next to it in sort order and never past the cap. A segment at or over the
+/// cap is left alone. Segments whose bounds are not known yet (committed but not reloaded) wait
+/// for the next round.
+///
+/// The price is write amplification on the tail: each commit adds a small segment next to it
+/// and the run is rewritten, up to `max_docs` rows per commit. Acceptable for measuring the
+/// layout; a levelled tail is the obvious refinement.
+#[derive(Debug)]
+struct RangeMergePolicy {
+    max_docs: u32,
+    bounds: SharedBounds,
+}
+
+impl MergePolicy for RangeMergePolicy {
+    fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
+        let bounds = self.bounds.read().unwrap();
+        let known = segments
+            .iter()
+            .filter_map(|meta| {
+                bounds
+                    .get(&meta.id())
+                    .map(|&(low, high)| (low, high, meta.num_docs(), meta.id()))
+            })
+            .collect::<Vec<_>>();
+        merge_runs(known, self.max_docs)
+            .into_iter()
+            .map(MergeCandidate)
+            .collect()
+    }
+}
+
+/// The runs of sort-order neighbours worth merging: each at least two segments, each under
+/// `max_docs` rows in total. Pure, so it can be tested without a writer.
+fn merge_runs(mut segments: Vec<(u64, u64, u32, SegmentId)>, max_docs: u32) -> Vec<Vec<SegmentId>> {
+    segments.sort_by_key(|&(low, high, _, _)| (low, high));
+    let mut runs = Vec::new();
+    let mut run: Vec<SegmentId> = Vec::new();
+    let mut run_docs = 0u32;
+    let mut flush = |run: &mut Vec<SegmentId>, run_docs: &mut u32| {
+        if run.len() >= 2 {
+            runs.push(std::mem::take(run));
+        } else {
+            run.clear();
+        }
+        *run_docs = 0;
+    };
+    for (_, _, docs, id) in segments {
+        if docs >= max_docs {
+            // Full already: it ends the run it would have joined and stands alone.
+            flush(&mut run, &mut run_docs);
+            continue;
+        }
+        if run_docs + docs > max_docs {
+            flush(&mut run, &mut run_docs);
+        }
+        run.push(id);
+        run_docs += docs;
+    }
+    flush(&mut run, &mut run_docs);
+    runs
 }
 
 /// One segment's columnar handles and the sort bounds the pruning reads from them.
@@ -415,6 +493,59 @@ impl TantivyBackend for SubstringBackend {
             );
         }
         doc
+    }
+
+    fn merge_policy(&self) -> Option<Box<dyn MergePolicy>> {
+        let max_docs = (*self.options.segment_max_docs.as_ref())?;
+        if !self.orders_results() {
+            // Nothing to order the segments by; the cap alone is not worth a policy.
+            return None;
+        }
+        Some(Box::new(RangeMergePolicy {
+            max_docs: max_docs.get(),
+            bounds: Arc::clone(&self.bounds),
+        }))
+    }
+
+    /// Learns every live segment's bounds (which also warms the column cache), drops the retired
+    /// ones, and asks the writer to merge what the policy would: Tantivy evaluates merges on its
+    /// own after a commit, but at that moment the bounds of the segments the commit produced are
+    /// not known yet, so the runs they belong to would otherwise wait for a commit that may never
+    /// come once the writes stop.
+    fn after_reload(&self, state: &IndexState<Self>) {
+        if !self.orders_results() {
+            return;
+        }
+        let searcher = state.reader.searcher();
+        let mut opened = 0;
+        let mut live = HashMap::with_capacity(searcher.segment_readers().len());
+        for segment in searcher.segment_readers() {
+            match self.columns_for(segment, &mut opened) {
+                Ok(columns) => {
+                    live.insert(segment.segment_id(), (columns.sort_min, columns.sort_max));
+                }
+                Err(err) => debug!("substring: {err}"),
+            }
+        }
+        self.prune_columns(searcher.segment_readers());
+        *self.bounds.write().unwrap() = live;
+
+        let Some(max_docs) = *self.options.segment_max_docs.as_ref() else {
+            return;
+        };
+        let known = searcher
+            .segment_readers()
+            .iter()
+            .filter_map(|segment| {
+                let (low, high) = *self.bounds.read().unwrap().get(&segment.segment_id())?;
+                Some((low, high, segment.num_docs(), segment.segment_id()))
+            })
+            .collect();
+        for run in merge_runs(known, max_docs.get()) {
+            // The merge runs on Tantivy's own thread; the future only reports its outcome, and
+            // the next reload picks the merged segment up either way.
+            drop(state.writer.write().unwrap().merge(&run));
+        }
     }
 }
 
@@ -886,6 +1017,7 @@ pub(crate) fn new(
         let make_backend = || SubstringBackend {
             walk: WalkCounters::default(),
             columns: RwLock::new(HashMap::new()),
+            bounds: Arc::new(RwLock::new(HashMap::new())),
             options: index.options.clone(),
         };
 
@@ -1023,12 +1155,15 @@ pub(crate) fn new(
                 }
                 _ = interval.tick() => {
                     for state in states.values() {
-                        if !state.writer.read().unwrap().has_uncommitted_docs() {
-                            continue;
-                        }
+                        let pending = state.writer.read().unwrap().has_uncommitted_docs();
                         let state = Arc::clone(state);
                         let key = key.clone();
-                        worker.spawn_blocking(move || commit(&state, &key)).await;
+                        if pending {
+                            worker.spawn_blocking(move || commit(&state, &key)).await;
+                        } else {
+                            // Merges finish after the writes stop; let the reader see them.
+                            worker.spawn_blocking(move || reload(&state, &key)).await;
+                        }
                     }
                 }
             }
@@ -1048,6 +1183,7 @@ mod tests {
     use crate::OrderBy;
     use crate::PrimaryIdFast;
     use crate::PrimaryKey;
+    use crate::SegmentMaxDocs;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
     use crate::table::PartitionId;
@@ -1116,6 +1252,7 @@ mod tests {
             case_sensitive: CaseSensitive::from(case_sensitive),
             order_by: OrderBy::default(),
             primary_id_fast: PrimaryIdFast::default(),
+            segment_max_docs: SegmentMaxDocs::default(),
         }
     }
 
@@ -1611,8 +1748,107 @@ mod tests {
         assert!(walk.page_resolve_nanos <= walk.walk_nanos);
     }
 
-    /// The columns are opened once per segment: a second search over the same segments opens
-    /// nothing, and the time before the first posting is part of the walk time.
+    fn id(n: u8) -> SegmentId {
+        SegmentId::from_uuid_string(&format!("00000000-0000-0000-0000-0000000000{n:02}")).unwrap()
+    }
+
+    /// Neighbours in sort order merge while under the cap; a full segment stands alone and ends
+    /// the run; a lone segment is left as it is.
+    #[test]
+    fn merge_runs_follow_sort_order_under_the_cap() {
+        // (low, high, docs, id), deliberately out of order: the tail (7, 8, 9) all reach the top.
+        let segments = vec![
+            (0, 100, 300, id(1)),   // full: stands alone
+            (100, 200, 120, id(2)), // with 3 -> 220 <= 250
+            (200, 300, 100, id(3)),
+            (300, 400, 200, id(4)), // 220 + 200 > 250: new run; with 5 -> 250
+            (400, 500, 50, id(5)),
+            (500, 600, 300, id(6)), // full again
+            (990, 1000, 10, id(7)), // the tail: three small overlapping segments
+            (985, 1000, 20, id(8)),
+            (995, 1000, 5, id(9)),
+        ];
+        let runs = merge_runs(segments, 250);
+        assert_eq!(
+            runs,
+            vec![
+                vec![id(2), id(3)],
+                vec![id(4), id(5)],
+                vec![id(8), id(7), id(9)],
+            ]
+        );
+        assert!(merge_runs(vec![(0, 1, 10, id(1))], 250).is_empty());
+        assert!(merge_runs(vec![], 250).is_empty());
+    }
+
+    /// With the cap set, an index built from many small commits ends with segments that hold
+    /// contiguous slices of the sort range, none past the cap, and still answers correctly.
+    #[rstest]
+    #[timeout(Duration::from_secs(30))]
+    #[tokio::test]
+    async fn the_range_policy_keeps_segments_narrow_and_capped() {
+        // A commit of TEST_COMMIT_THRESHOLD rows lands as one segment per writer thread; the cap
+        // lets the pieces of a commit merge and stops a run growing past two commits' worth.
+        let cap = 120u32;
+        let sender = make_sender_with_options(IndexOptionsSubstring {
+            segment_max_docs: cap.to_string().parse().unwrap(),
+            ..ordered_options()
+        });
+        // 400 rows in sort order, sort key = primary id, sent as one batch: `add_doc` waits for
+        // the commit that carries its row, and one wait per row would be 400 commit ticks.
+        let mut acks = Vec::with_capacity(400);
+        for primary in 1..=400u64 {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    format!("user{primary}将军"),
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        // Merges finish on their own thread and become visible on the actor's idle reloads.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            if stats.tantivy.segment_count <= 6 || Instant::now() > deadline {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            stats.segments.iter().all(|s| s.docs <= cap),
+            "a segment grew past the cap: {:?}",
+            stats.segments
+        );
+        let mut spans: Vec<(u64, u64)> = stats
+            .segments
+            .iter()
+            .map(|s| (s.sort_min.unwrap(), s.sort_max.unwrap()))
+            .collect();
+        spans.sort_unstable();
+        assert!(
+            stats.tantivy.segment_count <= 6,
+            "{} segments: {spans:?}",
+            stats.tantivy.segment_count
+        );
+        // Sorted by low bound, each segment ends before the next one begins: contiguous slices.
+        for pair in spans.windows(2) {
+            assert!(pair[0].1 < pair[1].0, "segments overlap: {spans:?}");
+        }
+
+        let (ids, _) = search_ordered(&sender, "将军", 5, SortWindow::default()).await;
+        assert_eq!(ids, vec![400, 399, 398, 397, 396]);
+    }
+
+    /// The columns are opened once per segment, by the reload that follows a commit, so a search
+    /// opens nothing -- and the time before the first posting is part of the walk time.
     #[rstest]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
@@ -1622,20 +1858,13 @@ mod tests {
 
         search_ordered(&sender, "将军", 10, SortWindow::default()).await;
         let first = sender.stats(make_index_key()).await.unwrap();
-        assert_eq!(
-            first.walk.column_opens, first.tantivy.segment_count as u64,
-            "{:?}",
-            first.walk
-        );
+        assert_eq!(first.walk.column_opens, 0, "{:?}", first.walk);
         assert!(first.walk.prepare_nanos <= first.walk.walk_nanos);
 
         search_ordered(&sender, "将军", 10, SortWindow::default()).await;
         let second = sender.stats(make_index_key()).await.unwrap();
-        assert_eq!(
-            second.walk.column_opens, first.walk.column_opens,
-            "{:?}",
-            second.walk
-        );
+        assert_eq!(second.walk.column_opens, 0, "{:?}", second.walk);
+        assert_eq!(second.walk.searches, 2);
     }
 
     /// An unordered index has no sort column and says so, rather than inventing bounds.

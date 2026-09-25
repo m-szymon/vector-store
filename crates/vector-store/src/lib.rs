@@ -80,6 +80,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -715,6 +716,28 @@ impl FromStr for PrimaryIdFast {
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// The cap on a segment's size for a substring index that merges by sort range (P3a), or none
+/// to keep Tantivy's default merge policy. ScyllaDB knows this only as the placeholder
+/// `poc_option_2`; the meaning lives here.
+pub struct SegmentMaxDocs(Option<NonZeroU32>);
+
+impl FromStr for SegmentMaxDocs {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let docs: u32 = s
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("segment_max_docs must be a positive integer: {e}"))?;
+        NonZeroU32::new(docs)
+            .map(|docs| Self(Some(docs)))
+            .ok_or_else(|| anyhow::anyhow!("segment_max_docs must be positive"))
+    }
+}
+
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
 pub struct Limit(NonZeroUsize);
@@ -841,6 +864,9 @@ pub struct IndexOptionsSubstring {
     /// Whether the primary id is also kept as a columnar (`FAST`) field, so that resolving a page
     /// never touches the document store. Read from the `poc_option_1` placeholder.
     pub primary_id_fast: PrimaryIdFast,
+    /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
+    /// default policy. Read from the `poc_option_2` placeholder.
+    pub segment_max_docs: SegmentMaxDocs,
 }
 
 impl IndexOptionsSubstring {
@@ -860,6 +886,7 @@ impl IndexOptionsSubstring {
             return Self {
                 order_by: self.order_by,
                 primary_id_fast: self.primary_id_fast,
+                segment_max_docs: self.segment_max_docs,
                 ..Self::default()
             };
         }
@@ -1362,6 +1389,7 @@ mod tests {
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
             primary_id_fast: PrimaryIdFast::default(),
+            segment_max_docs: SegmentMaxDocs::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsSubstring::default());
 
@@ -1373,12 +1401,14 @@ mod tests {
             case_sensitive: CaseSensitive::from(false),
             order_by: "registered_at".parse().unwrap(),
             primary_id_fast: PrimaryIdFast::from(true),
+            segment_max_docs: "250000".parse().unwrap(),
         };
         assert_eq!(
             inverted_ordered.validated(),
             IndexOptionsSubstring {
                 order_by: "registered_at".parse().unwrap(),
                 primary_id_fast: PrimaryIdFast::from(true),
+                segment_max_docs: "250000".parse().unwrap(),
                 ..IndexOptionsSubstring::default()
             }
         );
@@ -1389,8 +1419,11 @@ mod tests {
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
             primary_id_fast: PrimaryIdFast::default(),
+            segment_max_docs: SegmentMaxDocs::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
+        assert!("0".parse::<SegmentMaxDocs>().is_err());
+        assert!("many".parse::<SegmentMaxDocs>().is_err());
 
         assert!(*"TRUE".parse::<PrimaryIdFast>().unwrap().as_ref());
         assert!(!*"off".parse::<PrimaryIdFast>().unwrap().as_ref());

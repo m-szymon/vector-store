@@ -19,7 +19,9 @@ use anyhow::anyhow;
 use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
 use tantivy::TantivyDocument;
+use tantivy::index::SegmentId;
 use tantivy::indexer::IndexWriterOptions;
+use tantivy::indexer::MergePolicy;
 use tantivy::schema::Schema;
 use tokio::sync::watch;
 use tracing::error;
@@ -67,6 +69,20 @@ pub(crate) trait TantivyBackend: Send + Sync + 'static {
         primary_id: PrimaryId,
         row: Self::Row<'_>,
     ) -> TantivyDocument;
+
+    /// The merge policy the writer should use instead of Tantivy's default, if the backend has
+    /// one. Asked once, when the index is created.
+    fn merge_policy(&self) -> Option<Box<dyn MergePolicy>> {
+        None
+    }
+
+    /// Called after every reload of the reader, with the state the reader belongs to, for a
+    /// backend that keeps something per segment (a cache, the bounds its merge policy reads).
+    fn after_reload(&self, _state: &IndexState<Self>)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 pub(crate) struct Writer {
@@ -108,6 +124,15 @@ impl Writer {
     pub(crate) fn has_uncommitted_docs(&self) -> bool {
         !self.uncommitted_docs_in_progress_guards.is_empty()
     }
+
+    /// Asks the writer to merge `segments`. The merge runs on Tantivy's own thread; the returned
+    /// future only reports its outcome and can be dropped.
+    pub(crate) fn merge(
+        &mut self,
+        segments: &[SegmentId],
+    ) -> tantivy::FutureResult<Option<tantivy::SegmentMeta>> {
+        self.writer.merge(segments)
+    }
 }
 
 pub(crate) struct IndexState<B: TantivyBackend> {
@@ -129,6 +154,9 @@ impl<B: TantivyBackend> IndexState<B> {
         let writer = index
             .writer_with_options(options)
             .map_err(|e| anyhow!("{}: failed to create writer: {e}", B::NAME))?;
+        if let Some(policy) = backend.merge_policy() {
+            writer.set_merge_policy(policy);
+        }
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -168,8 +196,19 @@ pub(crate) fn commit<B: TantivyBackend>(state: &IndexState<B>, key: &IndexKey) {
         .write()
         .unwrap()
         .commit(|| state.reader.reload());
-    if let Err(err) = result {
-        error!("{}: failed to commit for {key}: {err}", B::NAME);
+    match result {
+        Ok(()) => state.backend.after_reload(state),
+        Err(err) => error!("{}: failed to commit for {key}: {err}", B::NAME),
+    }
+}
+
+/// Makes merges that finished since the last commit visible to the reader. A commit reloads on
+/// its own; this is for the quiet time after the writes stop, when merges are still completing
+/// and nothing else would reload.
+pub(crate) fn reload<B: TantivyBackend>(state: &IndexState<B>, key: &IndexKey) {
+    match state.reader.reload() {
+        Ok(()) => state.backend.after_reload(state),
+        Err(err) => error!("{}: failed to reload the reader for {key}: {err}", B::NAME),
     }
 }
 

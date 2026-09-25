@@ -32,6 +32,7 @@ use crate::OrderBy;
 use crate::Positions;
 use crate::PrimaryIdFast;
 use crate::Quantization;
+use crate::SegmentMaxDocs;
 use crate::SpaceType;
 use crate::TableName;
 use crate::cql_types;
@@ -1143,12 +1144,15 @@ impl Statements {
             // The placeholders ScyllaDB passes through untouched; what each one means is decided
             // here. `poc_option_1` is the FAST primary id.
             let primary_id_fast: PrimaryIdFast = parse_index_option(&options, "poc_option_1");
+            // `poc_option_2` caps segment size and switches on the range-aware merge policy.
+            let segment_max_docs: SegmentMaxDocs = parse_index_option(&options, "poc_option_2");
             IndexOptionsSubstring {
                 min_gram,
                 max_gram,
                 case_sensitive,
                 order_by,
                 primary_id_fast,
+                segment_max_docs,
             }
             .validated()
         }))
