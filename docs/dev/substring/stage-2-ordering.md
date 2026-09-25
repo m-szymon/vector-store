@@ -288,8 +288,30 @@ the column cache, and the actor asks the writer for the merges the policy would 
 Tantivy evaluates merges right after a commit, before the new segments' bounds are known; idle
 ticks reload the reader so merges finishing after the writes stop become visible. Write
 amplification on the tail (rewritten every commit, up to the cap) is the known cost; a levelled
-tail is the refinement. Not yet measured at 10M; the A/B plan (`aws_page1_config.yaml`, default
-policy against a 250k cap) is what measures it.
+tail is the refinement.
+
+Measured the same evening, three indexes over one 10M load (default policy, 250k cap, 100k cap):
+
+| | default | cap 250k | cap 100k |
+|---|---|---|---|
+| segments, mean span, widest | 16, 10.8%, 35.7% | 41, 3.3%, 5.2% | 100, 1.0%, 1.0% |
+| caught up after the load | 15 s | 15 s | 15 s |
+| page 1, 2-char keyword | 10.2k/s, 28 µs, 2 segments | 9.6k/s, 111 µs, 2 | 9.8k/s, 81 µs, 1 |
+| unthrottled | — | 9.7k/s | 10.1k/s |
+| deep page, cursor at 5M | — (3.1k–4.5k on earlier layouts) | 9.75k/s, 168 µs, 15k postings | **9.85k/s, 76 µs, 3k postings** |
+| 1-char keyword | — | 10.0k/s | 10.0k/s |
+| 4-char keyword (verified) | — | 9.6k/s, 112 store reads | 5.8k/s, 207 store reads |
+
+The column cache alone took page 1 to the offered rate on the default layout; the policy makes
+that independent of luck and gives the deep page the cost of page 1, which was the design's
+claim. Neither cap slowed ingestion measurably at 5k rows/s. The ceiling is ScyllaDB's base-table
+reads again, above stage 1's unordered 9.6k on the same nodes.
+
+What remains: the verified path. In a single narrow newest segment scanned in ascending sort
+order every later candidate beats the page's weakest entry, so all of them are read before the
+heap can reject any -- 207 store reads for a 4-char keyword at the 100k cap. Collecting the
+candidates' sort keys first and verifying from the top down would cut that to the page plus the
+false positives.
 
 ## Open questions and risks
 
