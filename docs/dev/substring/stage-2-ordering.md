@@ -243,10 +243,53 @@ compaction work.
 P0 and P1 together give correct global ordering with no new concepts, and are honest about being
 slow for hot keywords; that limitation must be documented rather than discovered.
 
-**Status: P0, P1 and P2 are implemented** in both repos, unexecuted on the ScyllaDB side (that build
-tree expects a newer clang than is installed, so its changes were only compiled one translation unit
-at a time). P3a and P3b are not started, so an ordered query is *correct* always but *fast* only
-where segments happen to be value-tight — which, after an unordered backfill, they are not.
+**Status: P0, P1, P2 and a first P3a are implemented** in both repos and measured on AWS at 10M
+names (below). P3b is not started, so an index built by a full scan of an existing table — every
+segment spanning the whole range — is *correct* but not *fast*, and stays so until rewritten.
+
+## Measured at 10M names (AWS, 2026-09-25)
+
+Four runs on the sequential corpus, one `i4i.xlarge` for ScyllaDB and one 4-core `c8g.xlarge` for
+the index node, 20 rows per page, 10k queries/s offered. Stage 1 (unordered, stops after 20
+matches) reached 9.7k on the same nodes, bounded by ScyllaDB's base-table reads.
+
+| build | page 1, 2-char keyword | deep page (cursor at 5M) |
+|---|---|---|
+| store read per heap entrant | 6,176 | 1,066 |
+| store read for the final page only | 7,326 | 4,451 |
+| same, second layout | 6,795 | 3,085 |
+| primary id as a column (A/B, one load) | 3,896 / 7,100 | 4,317 / 3,135 |
+
+The per-query counters and the per-segment layout report (`substring_search_*_total`,
+`substring_segment_*`) turned the throughput into an explanation:
+
+- **Reading the store per heap entrant** was the first bottleneck: 9–27× the walk locally, and
+  deferring the reads to the final page was worth +20% on page 1 and 4× on the deep page.
+- **The scan is cheap**: 8–16 ns per posting, as benchmarked. A deep page costs whatever its
+  segments hold — 76k postings, 1.2 ms, when the cursor lands in a 1.3M-row segment.
+- **Resolving the page is cheap either way**: ~20 µs from the store, ~40 µs from a `FAST` primary
+  id column. The column is not worth its bytes; it stays available behind `poc_option_1` only.
+- **What capped page 1 was a fixed ~450 µs per query**, constant across 1–8 opened segments and
+  2k–85k postings: every query opened every segment's sort column to read its bounds, and a column
+  open costs time proportional to the segment's size (2.7 µs at 77k rows; seven 1.3M-row segments
+  on a Graviton core add up). Fixed by caching the columns per segment (`columns_for`).
+- **The layout the default merge policy produces** with CDC ingestion: ~20 segments, mean span
+  8–9%, seven contiguous 1.3M-row slices and a tail of small segments that all reach the top of
+  the range, so page 1 opens six to eight of them. Two indexes fed the same stream got different
+  tails (one had a 1.7M-row segment reaching the top), which alone made page 1 cost 2×. Ingestion
+  order does not give a layout; only a policy does.
+
+### P3a as implemented
+
+`poc_option_2` = the segment cap in rows. An ordered index with it installs `RangeMergePolicy`:
+segments sorted by lowest sort key, runs of neighbours merged while under the cap, a segment at
+the cap left alone. The side map of bounds the note called for is filled after every reload from
+the column cache, and the actor asks the writer for the merges the policy would choose, since
+Tantivy evaluates merges right after a commit, before the new segments' bounds are known; idle
+ticks reload the reader so merges finishing after the writes stop become visible. Write
+amplification on the tail (rewritten every commit, up to the cap) is the known cost; a levelled
+tail is the refinement. Not yet measured at 10M; the A/B plan (`aws_page1_config.yaml`, default
+policy against a 250k cap) is what measures it.
 
 ## Open questions and risks
 
