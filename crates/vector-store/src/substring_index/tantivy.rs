@@ -52,6 +52,7 @@ use tantivy::DocSet;
 use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
 use tantivy::Term;
+use tantivy::columnar::Column;
 use tantivy::query::BooleanQuery;
 use tantivy::query::EnableScoring;
 use tantivy::query::Query;
@@ -161,6 +162,7 @@ struct WalkCounters {
     heap_entrants: AtomicU64,
     store_reads: AtomicU64,
     walk_nanos: AtomicU64,
+    page_resolve_nanos: AtomicU64,
 }
 
 /// One search's tally, added to [`WalkCounters`] when it finishes.
@@ -174,7 +176,7 @@ struct WalkTally {
 }
 
 impl WalkCounters {
-    fn record(&self, tally: WalkTally, elapsed: Duration) {
+    fn record(&self, tally: WalkTally, elapsed: Duration, page_resolve: Duration) {
         self.searches.fetch_add(1, Relaxed);
         self.segments_considered
             .fetch_add(tally.segments_considered, Relaxed);
@@ -186,6 +188,10 @@ impl WalkCounters {
         self.store_reads.fetch_add(tally.store_reads, Relaxed);
         self.walk_nanos
             .fetch_add(elapsed.as_nanos().try_into().unwrap_or(u64::MAX), Relaxed);
+        self.page_resolve_nanos.fetch_add(
+            page_resolve.as_nanos().try_into().unwrap_or(u64::MAX),
+            Relaxed,
+        );
     }
 
     fn snapshot(&self) -> WalkTotals {
@@ -197,6 +203,7 @@ impl WalkCounters {
             heap_entrants: self.heap_entrants.load(Relaxed),
             store_reads: self.store_reads.load(Relaxed),
             walk_nanos: self.walk_nanos.load(Relaxed),
+            page_resolve_nanos: self.page_resolve_nanos.load(Relaxed),
         }
     }
 }
@@ -210,7 +217,10 @@ pub(crate) struct WalkTotals {
     pub(crate) postings_scanned: u64,
     pub(crate) heap_entrants: u64,
     pub(crate) store_reads: u64,
+    /// Time spent turning the walk's page into primary ids, included in `walk_nanos`. For an
+    /// index without a FAST primary id that is the store reads; it is what they cost.
     pub(crate) walk_nanos: u64,
+    pub(crate) page_resolve_nanos: u64,
 }
 
 /// One segment as the ordered walk sees it: how many rows it holds and the span of sort keys the
@@ -272,7 +282,14 @@ impl TantivyBackend for SubstringBackend {
             .set_indexing_options(indexing)
             .set_stored();
         let mut schema_builder = Schema::builder();
-        schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED);
+        if *self.options.primary_id_fast.as_ref() {
+            // Also columnar, so a page's primary ids are read in nanoseconds rather than by
+            // decompressing a store block per row. The store keeps its copy for the verified
+            // path, which reads the document anyway.
+            schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED | FAST);
+        } else {
+            schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED);
+        }
         schema_builder.add_text_field(TEXT_FIELD, text_options);
         if self.orders_results() {
             // FAST, not STORED: the walk reads it once per candidate, and a columnar read is far
@@ -595,20 +612,49 @@ fn collect_matches_ordered(
         .flatten();
     let mut page: Vec<(u64, DocAddress)> = best.into_iter().map(|Reverse(entry)| entry).collect();
     page.sort_unstable_by_key(|(sort_key, _)| Reverse(*sort_key));
-    tally.store_reads += page.len() as u64;
-    let ids = page
-        .into_iter()
-        .map(|(_, address)| {
-            let doc: TantivyDocument = searcher
-                .doc(address)
-                .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
-            doc.get_first(primary_id_field)
-                .and_then(|value| value.as_u64())
-                .map(PrimaryId::from)
-                .ok_or_else(|| anyhow!("substring: missing primary_id in doc"))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    state.backend.walk.record(tally, started.elapsed());
+    let resolving = Instant::now();
+    let ids = if *state.backend.options.primary_id_fast.as_ref() {
+        // One column handle per segment the page touches, opened on first use.
+        let mut columns: Vec<Option<Column<u64>>> = vec![None; searcher.segment_readers().len()];
+        page.into_iter()
+            .map(|(_, address)| {
+                let ordinal = address.segment_ord as usize;
+                if columns[ordinal].is_none() {
+                    let column = searcher.segment_readers()[ordinal]
+                        .fast_fields()
+                        .u64(PRIMARY_ID_FIELD)
+                        .map_err(|e| {
+                            anyhow!("substring: failed to open the primary id column: {e}")
+                        })?;
+                    columns[ordinal] = Some(column);
+                }
+                columns[ordinal]
+                    .as_ref()
+                    .unwrap()
+                    .first(address.doc_id)
+                    .map(PrimaryId::from)
+                    .ok_or_else(|| anyhow!("substring: missing primary_id in the column"))
+            })
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        tally.store_reads += page.len() as u64;
+        page.into_iter()
+            .map(|(_, address)| {
+                let doc: TantivyDocument = searcher
+                    .doc(address)
+                    .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
+                doc.get_first(primary_id_field)
+                    .and_then(|value| value.as_u64())
+                    .map(PrimaryId::from)
+                    .ok_or_else(|| anyhow!("substring: missing primary_id in doc"))
+            })
+            .collect::<anyhow::Result<_>>()?
+    };
+    let page_resolve = resolving.elapsed();
+    state
+        .backend
+        .walk
+        .record(tally, started.elapsed(), page_resolve);
     Ok((ids, next_cursor))
 }
 
@@ -680,7 +726,10 @@ fn collect_matches(
             doc_id = scorer.advance();
         }
     }
-    state.backend.walk.record(tally, started.elapsed());
+    state
+        .backend
+        .walk
+        .record(tally, started.elapsed(), Duration::ZERO);
     Ok(matches)
 }
 
@@ -920,6 +969,7 @@ mod tests {
     use crate::MaxGram;
     use crate::MinGram;
     use crate::OrderBy;
+    use crate::PrimaryIdFast;
     use crate::PrimaryKey;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
@@ -988,6 +1038,7 @@ mod tests {
             max_gram: MaxGram::from(NonZeroUsize::new(max_gram).unwrap()),
             case_sensitive: CaseSensitive::from(case_sensitive),
             order_by: OrderBy::default(),
+            primary_id_fast: PrimaryIdFast::default(),
         }
     }
 
@@ -1458,6 +1509,29 @@ mod tests {
         assert!((2..=3).contains(&walk.heap_entrants), "{walk:?}");
         // Only the page is read from the store: two rows, not every entrant.
         assert_eq!(walk.store_reads, 2, "{walk:?}");
+    }
+
+    /// With the primary id kept as a column, an ordered page is resolved without the store:
+    /// same rows, same order, zero store reads for a keyword the grams answer exactly.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_fast_primary_id_resolves_the_page_without_the_store() {
+        let sender = make_sender_with_options(IndexOptionsSubstring {
+            primary_id_fast: PrimaryIdFast::from(true),
+            ..ordered_options()
+        });
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, cursor) = search_ordered(&sender, "将军", 2, SortWindow::default()).await;
+        assert_eq!(ids, vec![3, 2]);
+        // The cursor is the sort key, which carries the sign bias, not the value.
+        assert_eq!(cursor, Some(2 ^ (1 << 63)));
+
+        let walk = sender.stats(make_index_key()).await.unwrap().walk;
+        assert_eq!(walk.searches, 1);
+        assert_eq!(walk.store_reads, 0, "{walk:?}");
+        assert!(walk.page_resolve_nanos <= walk.walk_nanos);
     }
 
     /// An unordered index has no sort column and says so, rather than inventing bounds.

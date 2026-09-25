@@ -73,6 +73,10 @@ pub(crate) const SUBSTRING_SEARCH_TOTALS: &[(&str, &str)] = &[
         "substring_search_walk_seconds_total",
         "Time substring searches spent walking the index, summed over searches",
     ),
+    (
+        "substring_search_page_resolve_seconds_total",
+        "Time substring searches spent turning the page into primary ids (part of the walk time), summed over searches",
+    ),
 ];
 
 /// The per-segment gauges, in the order `substring_segment_layout` holds them. The sort bounds

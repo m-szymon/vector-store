@@ -30,6 +30,7 @@ use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
 use crate::OrderBy;
 use crate::Positions;
+use crate::PrimaryIdFast;
 use crate::Quantization;
 use crate::SpaceType;
 use crate::TableName;
@@ -1139,11 +1140,15 @@ impl Statements {
             // Only that the option names something; that the column exists and can be ordered is
             // checked later, where the table's schema is in hand.
             let order_by: OrderBy = parse_index_option(&options, "order_by");
+            // The placeholders ScyllaDB passes through untouched; what each one means is decided
+            // here. `poc_option_1` is the FAST primary id.
+            let primary_id_fast: PrimaryIdFast = parse_index_option(&options, "poc_option_1");
             IndexOptionsSubstring {
                 min_gram,
                 max_gram,
                 case_sensitive,
                 order_by,
+                primary_id_fast,
             }
             .validated()
         }))

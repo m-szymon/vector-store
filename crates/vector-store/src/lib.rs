@@ -693,6 +693,28 @@ impl FromStr for OrderBy {
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// Whether a substring index keeps the primary id as a `FAST` column as well as in the document
+/// store. Off by default: it costs index size, and exists to measure what the store reads cost.
+///
+/// ScyllaDB knows this only as the placeholder `poc_option_1`, which it validates as non-empty and
+/// hands through; the meaning lives here.
+pub struct PrimaryIdFast(bool);
+
+impl FromStr for PrimaryIdFast {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => Ok(Self(true)),
+            "false" | "0" | "off" | "no" => Ok(Self(false)),
+            _ => Err(anyhow::anyhow!("Unknown primary_id_fast value: {s}")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
 pub struct Limit(NonZeroUsize);
@@ -816,6 +838,9 @@ pub struct IndexOptionsSubstring {
     pub case_sensitive: CaseSensitive,
     /// The column results are ordered by, or none for unspecified order.
     pub order_by: OrderBy,
+    /// Whether the primary id is also kept as a columnar (`FAST`) field, so that resolving a page
+    /// never touches the document store. Read from the `poc_option_1` placeholder.
+    pub primary_id_fast: PrimaryIdFast,
 }
 
 impl IndexOptionsSubstring {
@@ -834,6 +859,7 @@ impl IndexOptionsSubstring {
             // would come back in the wrong order rather than failing.
             return Self {
                 order_by: self.order_by,
+                primary_id_fast: self.primary_id_fast,
                 ..Self::default()
             };
         }
@@ -1335,6 +1361,7 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            primary_id_fast: PrimaryIdFast::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsSubstring::default());
 
@@ -1345,11 +1372,13 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: "registered_at".parse().unwrap(),
+            primary_id_fast: PrimaryIdFast::from(true),
         };
         assert_eq!(
             inverted_ordered.validated(),
             IndexOptionsSubstring {
                 order_by: "registered_at".parse().unwrap(),
+                primary_id_fast: PrimaryIdFast::from(true),
                 ..IndexOptionsSubstring::default()
             }
         );
@@ -1359,8 +1388,13 @@ mod tests {
             max_gram: "2".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            primary_id_fast: PrimaryIdFast::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
+
+        assert!(*"TRUE".parse::<PrimaryIdFast>().unwrap().as_ref());
+        assert!(!*"off".parse::<PrimaryIdFast>().unwrap().as_ref());
+        assert!("maybe".parse::<PrimaryIdFast>().is_err());
     }
 
     #[test]
