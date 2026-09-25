@@ -1342,6 +1342,11 @@ async fn post_index_contains(
         .await;
 
     timer.observe_duration();
+    // A scrape refreshes an index's gauges only when something changed it, and a search changes
+    // its walk totals; without this the totals would stay at whatever the last write left them.
+    state
+        .metrics
+        .mark_dirty(keyspace.as_ref(), index_name.as_ref());
 
     match search_result {
         Err(err) => {
