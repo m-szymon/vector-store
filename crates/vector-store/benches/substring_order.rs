@@ -1186,6 +1186,41 @@ fn bench_segment_pruning(c: &mut Criterion) {
     group.finish();
 }
 
+/// What a query pays before it scans a single posting: opening the sort column of every segment
+/// (to read its bounds) and building a scorer for the ones it walks. Measured on AWS, an ordered
+/// query carried a fixed cost of ~450 us that neither postings nor opened segments explained; the
+/// suspects are these two, and this prices them per segment.
+fn bench_segment_setup(c: &mut Criterion) {
+    let corpus = &*CORPUS;
+    let searcher = corpus.reader.searcher();
+    let segments = searcher.segment_readers().len();
+    let text_field = corpus.schema.get_field(TEXT_FIELD).unwrap();
+    let keyword = &corpus.short[0].keyword;
+    let (query, _) = build_query(text_field, keyword);
+    let weight = query
+        .weight(EnableScoring::disabled_from_searcher(&searcher))
+        .unwrap();
+    let mut group = c.benchmark_group("segment_setup");
+    group.throughput(Throughput::Elements(segments as u64));
+    group.bench_function(BenchmarkId::new("open_sort_columns", segments), |b| {
+        b.iter(|| {
+            for segment in searcher.segment_readers() {
+                let column = segment.fast_fields().u64(SORT_FIELD).unwrap();
+                black_box((column.min_value(), column.max_value()));
+            }
+        })
+    });
+    group.bench_function(BenchmarkId::new("build_scorers", segments), |b| {
+        b.iter(|| {
+            for segment in searcher.segment_readers() {
+                let scorer = weight.scorer(segment, 1.0).unwrap();
+                black_box(scorer.doc());
+            }
+        })
+    });
+    group.finish();
+}
+
 /// The same, for keywords past `max_gram`, where a skipped candidate also skips a store read.
 fn bench_segment_pruning_verified(c: &mut Criterion) {
     let corpus = &*CORPUS;
@@ -1394,6 +1429,7 @@ criterion_group!(
     bench_windowed_verified,
     bench_segment_pruning,
     bench_segment_pruning_verified,
+    bench_segment_setup,
     bench_paged,
     bench_distribution
 );

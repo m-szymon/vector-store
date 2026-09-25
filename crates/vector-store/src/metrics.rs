@@ -74,6 +74,14 @@ pub(crate) const SUBSTRING_SEARCH_TOTALS: &[(&str, &str)] = &[
         "Time substring searches spent walking the index, summed over searches",
     ),
     (
+        "substring_search_column_opens_total",
+        "Columns a substring search had to open (misses of the per-segment column cache), summed over searches",
+    ),
+    (
+        "substring_search_prepare_seconds_total",
+        "Time substring searches spent reading segment bounds before the first posting (part of the walk time), summed over searches",
+    ),
+    (
         "substring_search_page_resolve_seconds_total",
         "Time substring searches spent turning the page into primary ids (part of the walk time), summed over searches",
     ),

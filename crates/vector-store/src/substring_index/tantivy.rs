@@ -37,6 +37,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -49,6 +50,8 @@ use std::time::Instant;
 use anyhow::anyhow;
 use tantivy::DocAddress;
 use tantivy::DocSet;
+use tantivy::index::SegmentId;
+use tantivy::SegmentReader;
 use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
 use tantivy::Term;
@@ -147,6 +150,64 @@ struct SubstringBackend {
     options: IndexOptionsSubstring,
     /// What every search since the index was created has cost, for `/metrics` to export.
     walk: WalkCounters,
+    /// The columns an ordered search reads, opened once per segment rather than once per query.
+    /// Opening a column costs time proportional to the segment's size -- measured at 2.7 us for
+    /// 77k rows, and it was most of a query's fixed cost against 1.3M-row segments on AWS -- while
+    /// the handle itself is a cheap clone. Keyed by segment id, so a merge simply leaves stale
+    /// entries behind, which `prune_columns` drops once they outnumber the live segments.
+    columns: RwLock<HashMap<SegmentId, SegmentColumns>>,
+}
+
+/// One segment's columnar handles and the sort bounds the pruning reads from them.
+#[derive(Clone)]
+struct SegmentColumns {
+    sort: Column<u64>,
+    sort_min: u64,
+    sort_max: u64,
+    /// Present only when the index keeps the primary id as a column (`primary_id_fast`).
+    primary_id: Option<Column<u64>>,
+}
+
+impl SubstringBackend {
+    /// The cached columns of `segment`, opened on first sight. `opened` counts a miss, so a
+    /// search can report how much opening it did.
+    fn columns_for(
+        &self,
+        segment: &SegmentReader,
+        opened: &mut u64,
+    ) -> anyhow::Result<SegmentColumns> {
+        let id = segment.segment_id();
+        if let Some(columns) = self.columns.read().unwrap().get(&id) {
+            return Ok(columns.clone());
+        }
+        let sort = segment
+            .fast_fields()
+            .u64(SORT_FIELD)
+            .map_err(|e| anyhow!("substring: failed to open the sort column: {e}"))?;
+        let primary_id = (*self.options.primary_id_fast.as_ref())
+            .then(|| segment.fast_fields().u64(PRIMARY_ID_FIELD))
+            .transpose()
+            .map_err(|e| anyhow!("substring: failed to open the primary id column: {e}"))?;
+        let columns = SegmentColumns {
+            sort_min: sort.min_value(),
+            sort_max: sort.max_value(),
+            sort,
+            primary_id,
+        };
+        *opened += 1;
+        self.columns.write().unwrap().insert(id, columns.clone());
+        Ok(columns)
+    }
+
+    /// Drops cache entries for segments a merge has retired, once they outnumber the live ones.
+    fn prune_columns(&self, live: &[SegmentReader]) {
+        let mut cache = self.columns.write().unwrap();
+        if cache.len() > 2 * live.len().max(1) {
+            let keep: std::collections::HashSet<SegmentId> =
+                live.iter().map(|segment| segment.segment_id()).collect();
+            cache.retain(|id, _| keep.contains(id));
+        }
+    }
 }
 
 /// Running totals of what the walks did, so that a rate of queries can be explained rather than
@@ -161,7 +222,9 @@ struct WalkCounters {
     postings_scanned: AtomicU64,
     heap_entrants: AtomicU64,
     store_reads: AtomicU64,
+    column_opens: AtomicU64,
     walk_nanos: AtomicU64,
+    prepare_nanos: AtomicU64,
     page_resolve_nanos: AtomicU64,
 }
 
@@ -173,10 +236,19 @@ struct WalkTally {
     postings_scanned: u64,
     heap_entrants: u64,
     store_reads: u64,
+    column_opens: u64,
+}
+
+/// How long the parts of one search took.
+#[derive(Debug, Default, Clone, Copy)]
+struct WalkTimes {
+    walk: Duration,
+    prepare: Duration,
+    page_resolve: Duration,
 }
 
 impl WalkCounters {
-    fn record(&self, tally: WalkTally, elapsed: Duration, page_resolve: Duration) {
+    fn record(&self, tally: WalkTally, times: WalkTimes) {
         self.searches.fetch_add(1, Relaxed);
         self.segments_considered
             .fetch_add(tally.segments_considered, Relaxed);
@@ -186,12 +258,12 @@ impl WalkCounters {
             .fetch_add(tally.postings_scanned, Relaxed);
         self.heap_entrants.fetch_add(tally.heap_entrants, Relaxed);
         self.store_reads.fetch_add(tally.store_reads, Relaxed);
-        self.walk_nanos
-            .fetch_add(elapsed.as_nanos().try_into().unwrap_or(u64::MAX), Relaxed);
-        self.page_resolve_nanos.fetch_add(
-            page_resolve.as_nanos().try_into().unwrap_or(u64::MAX),
-            Relaxed,
-        );
+        self.column_opens.fetch_add(tally.column_opens, Relaxed);
+        let nanos = |d: Duration| d.as_nanos().try_into().unwrap_or(u64::MAX);
+        self.walk_nanos.fetch_add(nanos(times.walk), Relaxed);
+        self.prepare_nanos.fetch_add(nanos(times.prepare), Relaxed);
+        self.page_resolve_nanos
+            .fetch_add(nanos(times.page_resolve), Relaxed);
     }
 
     fn snapshot(&self) -> WalkTotals {
@@ -202,7 +274,9 @@ impl WalkCounters {
             postings_scanned: self.postings_scanned.load(Relaxed),
             heap_entrants: self.heap_entrants.load(Relaxed),
             store_reads: self.store_reads.load(Relaxed),
+            column_opens: self.column_opens.load(Relaxed),
             walk_nanos: self.walk_nanos.load(Relaxed),
+            prepare_nanos: self.prepare_nanos.load(Relaxed),
             page_resolve_nanos: self.page_resolve_nanos.load(Relaxed),
         }
     }
@@ -217,9 +291,13 @@ pub(crate) struct WalkTotals {
     pub(crate) postings_scanned: u64,
     pub(crate) heap_entrants: u64,
     pub(crate) store_reads: u64,
+    /// Columns opened, i.e. misses of the per-segment column cache.
+    pub(crate) column_opens: u64,
+    pub(crate) walk_nanos: u64,
+    /// Time spent before the first posting: reading every segment's bounds. Part of `walk_nanos`.
+    pub(crate) prepare_nanos: u64,
     /// Time spent turning the walk's page into primary ids, included in `walk_nanos`. For an
     /// index without a FAST primary id that is the store reads; it is what they cost.
-    pub(crate) walk_nanos: u64,
     pub(crate) page_resolve_nanos: u64,
 }
 
@@ -513,7 +591,6 @@ fn collect_matches_ordered(
 ) -> anyhow::Result<(Vec<PrimaryId>, Option<u64>)> {
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
-    let sort_field_name = SORT_FIELD;
 
     let (query, needs_verification) = match build_query(state, normalized)? {
         SubstringQuery::Exact(query) => (query, false),
@@ -529,18 +606,19 @@ fn collect_matches_ordered(
     let mut tally = WalkTally::default();
     let mut segments = Vec::with_capacity(searcher.segment_readers().len());
     for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
-        let column = segment
-            .fast_fields()
-            .u64(sort_field_name)
-            .map_err(|e| anyhow!("substring: failed to open the sort column: {e}"))?;
-        let (min, max) = (column.min_value(), column.max_value());
+        let columns = state
+            .backend
+            .columns_for(segment, &mut tally.column_opens)?;
         // Ruled out from the bounds alone, so the segment is never opened.
-        if window.overlaps(min, max) {
-            segments.push((segment_ord as u32, segment, column, max));
+        if window.overlaps(columns.sort_min, columns.sort_max) {
+            let upper_bound = columns.sort_max;
+            segments.push((segment_ord as u32, segment, columns.sort, upper_bound));
         }
     }
+    state.backend.prune_columns(searcher.segment_readers());
     segments.sort_by_key(|(_, _, _, upper_bound)| Reverse(*upper_bound));
     tally.segments_considered = segments.len() as u64;
+    let prepare = started.elapsed();
 
     // Min-heap of the best `limit` so far, so the root is the entry to beat. It holds document
     // addresses, not primary ids: an entrant is often pushed out again by a later, higher one, and
@@ -614,24 +692,15 @@ fn collect_matches_ordered(
     page.sort_unstable_by_key(|(sort_key, _)| Reverse(*sort_key));
     let resolving = Instant::now();
     let ids = if *state.backend.options.primary_id_fast.as_ref() {
-        // One column handle per segment the page touches, opened on first use.
-        let mut columns: Vec<Option<Column<u64>>> = vec![None; searcher.segment_readers().len()];
         page.into_iter()
             .map(|(_, address)| {
-                let ordinal = address.segment_ord as usize;
-                if columns[ordinal].is_none() {
-                    let column = searcher.segment_readers()[ordinal]
-                        .fast_fields()
-                        .u64(PRIMARY_ID_FIELD)
-                        .map_err(|e| {
-                            anyhow!("substring: failed to open the primary id column: {e}")
-                        })?;
-                    columns[ordinal] = Some(column);
-                }
-                columns[ordinal]
+                let segment = &searcher.segment_readers()[address.segment_ord as usize];
+                state
+                    .backend
+                    .columns_for(segment, &mut tally.column_opens)?
+                    .primary_id
                     .as_ref()
-                    .unwrap()
-                    .first(address.doc_id)
+                    .and_then(|column| column.first(address.doc_id))
                     .map(PrimaryId::from)
                     .ok_or_else(|| anyhow!("substring: missing primary_id in the column"))
             })
@@ -651,10 +720,14 @@ fn collect_matches_ordered(
             .collect::<anyhow::Result<_>>()?
     };
     let page_resolve = resolving.elapsed();
-    state
-        .backend
-        .walk
-        .record(tally, started.elapsed(), page_resolve);
+    state.backend.walk.record(
+        tally,
+        WalkTimes {
+            walk: started.elapsed(),
+            prepare,
+            page_resolve,
+        },
+    );
     Ok((ids, next_cursor))
 }
 
@@ -726,10 +799,13 @@ fn collect_matches(
             doc_id = scorer.advance();
         }
     }
-    state
-        .backend
-        .walk
-        .record(tally, started.elapsed(), Duration::ZERO);
+    state.backend.walk.record(
+        tally,
+        WalkTimes {
+            walk: started.elapsed(),
+            ..WalkTimes::default()
+        },
+    );
     Ok(matches)
 }
 
@@ -740,13 +816,13 @@ fn handle_substring_stats(state: &SubstringIndexState) -> SubstringStatsR {
         .segment_readers()
         .iter()
         .map(|segment| {
+            let mut opened = 0;
             let bounds = state
                 .backend
                 .orders_results()
-                .then(|| segment.fast_fields().u64(SORT_FIELD))
-                .transpose()
-                .map_err(|e| anyhow!("substring: failed to open the sort column: {e}"))?
-                .map(|column| (column.min_value(), column.max_value()));
+                .then(|| state.backend.columns_for(segment, &mut opened))
+                .transpose()?
+                .map(|columns| (columns.sort_min, columns.sort_max));
             Ok(SegmentLayout {
                 docs: segment.num_docs(),
                 deleted: segment.num_deleted_docs(),
@@ -809,6 +885,7 @@ pub(crate) fn new(
         let mut states: BTreeMap<IndexId, Arc<SubstringIndexState>> = BTreeMap::new();
         let make_backend = || SubstringBackend {
             walk: WalkCounters::default(),
+            columns: RwLock::new(HashMap::new()),
             options: index.options.clone(),
         };
 
@@ -1532,6 +1609,33 @@ mod tests {
         assert_eq!(walk.searches, 1);
         assert_eq!(walk.store_reads, 0, "{walk:?}");
         assert!(walk.page_resolve_nanos <= walk.walk_nanos);
+    }
+
+    /// The columns are opened once per segment: a second search over the same segments opens
+    /// nothing, and the time before the first posting is part of the walk time.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn columns_are_opened_once_per_segment() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        let first = sender.stats(make_index_key()).await.unwrap();
+        assert_eq!(
+            first.walk.column_opens, first.tantivy.segment_count as u64,
+            "{:?}",
+            first.walk
+        );
+        assert!(first.walk.prepare_nanos <= first.walk.walk_nanos);
+
+        search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        let second = sender.stats(make_index_key()).await.unwrap();
+        assert_eq!(
+            second.walk.column_opens, first.walk.column_opens,
+            "{:?}",
+            second.walk
+        );
     }
 
     /// An unordered index has no sort column and says so, rather than inventing bounds.
