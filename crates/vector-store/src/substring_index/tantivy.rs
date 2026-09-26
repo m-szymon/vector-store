@@ -773,10 +773,11 @@ impl SubstringBackend {
             .filter(|segment| wide.contains(&segment.segment_id()))
             .map(|segment| u64::from(segment.num_docs()))
             .sum();
-        self.rewrite.l0_docs.store(l0_docs, Relaxed);
         if l0_docs < u64::from(cap) {
             return;
         }
+        // Recorded per plan, so the size row of a finished rewrite still says what it moved.
+        self.rewrite.l0_docs.store(l0_docs, Relaxed);
         let stride = (l0_docs / REWRITE_SAMPLE_TARGET).max(1) as u32;
         let mut sample = Vec::new();
         let mut opened = 0;
