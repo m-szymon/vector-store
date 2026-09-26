@@ -317,17 +317,30 @@ test: 30 matching rows, a page of 5, 5 verification reads). Not yet measured at 
 
 ### P3b as implemented (stage 3, not yet measured)
 
-`poc_option_3` turns on the rewrite of wide segments; it needs the cap. After every reload the
-backend looks for segments that are *wide* -- covering more than 8× their share of the rows, the
-signature of a full-scan build or a shuffled load -- or simply over the cap, which no merge can
-bring under it. When such segments hold at least a cap's worth of rows, it samples their sort
-keys, splits the key space into ranges of about a cap each by quantiles, and records a plan.
-Every idle tick then moves one range: under the writer lock it commits, reads each live row of a
-wide segment whose key falls in the range from the store, deletes it by primary id and re-adds
-it, and commits again. The lock is what keeps a concurrent update or delete of one of those rows
-from being undone by the re-add; searches take the reader and never wait. The range's rows land
-in a new segment, which the merge policy folds together with its neighbours. Progress and the
-rows involved are on `/metrics` (`substring_rewrite_*`, `substring_l0_docs`).
+`poc_option_3` turns on the rewrite of wide segments; it needs the cap. A segment is *wide* when
+it spans more of the sort range than eight caps' worth of contiguous rows would (or is over the
+cap, which no merge can bring under it). The limit is measured against the cap rather than the
+segment's own row count on purpose: the pieces a commit's writer threads leave -- a fraction of
+the commit's rows each, over the commit's whole key range -- are narrow however many threads
+there are, while a segment built by a full scan spans everything and is wide whatever its size.
+The merge policy keeps the two apart: wide segments merge among themselves, never into a narrow
+run, and a narrow run stops growing where its combined span would pass the limit.
+
+After every reload the backend counts the rows in wide segments; when they come to at least a
+cap and at least one wide segment holds half a cap, it samples their sort keys, splits the key
+space into ranges of about a cap each by quantiles, and records a plan of ranges. Every idle tick
+then moves one range: under the writer lock it commits, reads from the store each live row of a
+segment *that is wide at that moment* whose key falls in the range, deletes it by primary id and
+re-adds it, and commits again. The lock is what keeps a concurrent update or delete of one of
+those rows from being undone by the re-add; searches take the reader and never wait. The range's
+rows land in pieces spanning no more than the range, narrow by construction, which the policy
+folds into one segment. Progress and the rows involved are on `/metrics` (`substring_rewrite_*`,
+`substring_l0_docs`), and the plan, its end and every merge request are in the log.
+
+Two things the first docker smoke (2026-09-26) taught, both fixed: a plan that names the segments
+to take apart finds them retired by the policy within a tick, so it names ranges only; and a wide
+sliver merged into the narrow run it sorts next to widens that run, so the next plan finds the
+rows it just moved wide again and the rewrite never converges.
 
 The cost model is the design note's distribution pass: each range scans the wide segments' sort
 column once (`ranges × rows` column reads) and every row is read from the store and re-indexed
