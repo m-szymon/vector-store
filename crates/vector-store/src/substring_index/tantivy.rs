@@ -811,6 +811,34 @@ fn collect_matches_ordered(
         let store = segment
             .get_store_reader(STORE_CACHE_BLOCKS)
             .map_err(|e| anyhow!("substring: failed to open the document store: {e}"))?;
+        if *state.backend.options.verify_in_order.as_ref() {
+            // The first stage-2 build's walk, kept to measure the two passes against.
+            let mut doc_id = scorer.doc();
+            while doc_id != TERMINATED {
+                tally.postings_scanned += 1;
+                if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                    let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                    if window.contains(sort_key) && beats_page(&best, sort_key) {
+                        tally.store_reads += 1;
+                        let verified = store
+                            .get::<TantivyDocument>(doc_id)
+                            .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?
+                            .get_first(text_field)
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| text.contains(normalized));
+                        if verified {
+                            tally.heap_entrants += 1;
+                            best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
+                            if best.len() > limit {
+                                best.pop();
+                            }
+                        }
+                    }
+                }
+                doc_id = scorer.advance();
+            }
+            continue;
+        }
         candidates.clear();
         let mut doc_id = scorer.doc();
         while doc_id != TERMINATED {
@@ -1218,6 +1246,7 @@ mod tests {
     use crate::PrimaryIdFast;
     use crate::PrimaryKey;
     use crate::SegmentMaxDocs;
+    use crate::VerifyInOrder;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
     use crate::table::PartitionId;
@@ -1287,6 +1316,7 @@ mod tests {
             order_by: OrderBy::default(),
             primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
+            verify_in_order: VerifyInOrder::default(),
         }
     }
 
@@ -1929,6 +1959,42 @@ mod tests {
         assert!(walk.postings_scanned >= 5, "{walk:?}");
         assert_eq!(walk.heap_entrants, 5, "{walk:?}");
         assert_eq!(walk.store_reads, 10, "{walk:?}");
+    }
+
+    /// With `verify_in_order` the old walk is back: candidates are read as the postings come, so
+    /// a segment scanned in ascending sort order reads nearly all of them. Kept for measurement.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn verifying_in_order_reads_every_candidate_that_beats_the_page() {
+        let sender = make_sender_with_options(IndexOptionsSubstring {
+            verify_in_order: VerifyInOrder::from(true),
+            ..ordered_options()
+        });
+        let mut acks = Vec::new();
+        for n in 1..=30u64 {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    n.into(),
+                    format!("x{n}abcdx"),
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+
+        let (ids, _) = search_ordered(&sender, "abcd", 5, SortWindow::default()).await;
+        assert_eq!(ids, vec![30, 29, 28, 27, 26]);
+        let walk = sender.stats(make_index_key()).await.unwrap().walk;
+        // Every candidate that beat the page at its moment was read, plus the page itself; with
+        // rows in ascending order that is well over the 5 + 5 the two-pass walk needs.
+        assert!(walk.store_reads > 10, "{walk:?}");
     }
 
     /// The columns are opened once per segment, by the reload that follows a commit, so a search

@@ -719,6 +719,21 @@ impl FromStr for PrimaryIdFast {
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
 )]
+/// Whether a substring index verifies a long keyword's candidates in posting order rather than
+/// from the highest sort key down. The slow way, kept for measurement; `poc_option_4`.
+pub struct VerifyInOrder(bool);
+
+impl FromStr for VerifyInOrder {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        PrimaryIdFast::from_str(s).map(|flag| Self(*flag.as_ref()))
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
 /// The cap on a segment's size for a substring index that merges by sort range (P3a), or none
 /// to keep Tantivy's default merge policy. ScyllaDB knows this only as the placeholder
 /// `poc_option_2`; the meaning lives here.
@@ -867,6 +882,10 @@ pub struct IndexOptionsSubstring {
     /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
     /// default policy. Read from the `poc_option_2` placeholder.
     pub segment_max_docs: SegmentMaxDocs,
+    /// Verify a long keyword's candidates in posting order, reading the store for each, as the
+    /// first stage-2 build did -- kept only to measure the two-pass walk against it. Read from
+    /// the `poc_option_4` placeholder.
+    pub verify_in_order: VerifyInOrder,
 }
 
 impl IndexOptionsSubstring {
@@ -887,6 +906,7 @@ impl IndexOptionsSubstring {
                 order_by: self.order_by,
                 primary_id_fast: self.primary_id_fast,
                 segment_max_docs: self.segment_max_docs,
+                verify_in_order: self.verify_in_order,
                 ..Self::default()
             };
         }
@@ -1390,6 +1410,7 @@ mod tests {
             order_by: OrderBy::default(),
             primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
+            verify_in_order: VerifyInOrder::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsSubstring::default());
 
@@ -1402,6 +1423,7 @@ mod tests {
             order_by: "registered_at".parse().unwrap(),
             primary_id_fast: PrimaryIdFast::from(true),
             segment_max_docs: "250000".parse().unwrap(),
+            verify_in_order: VerifyInOrder::from(true),
         };
         assert_eq!(
             inverted_ordered.validated(),
@@ -1409,6 +1431,7 @@ mod tests {
                 order_by: "registered_at".parse().unwrap(),
                 primary_id_fast: PrimaryIdFast::from(true),
                 segment_max_docs: "250000".parse().unwrap(),
+                verify_in_order: VerifyInOrder::from(true),
                 ..IndexOptionsSubstring::default()
             }
         );
@@ -1420,6 +1443,7 @@ mod tests {
             order_by: OrderBy::default(),
             primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
+            verify_in_order: VerifyInOrder::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
         assert!("0".parse::<SegmentMaxDocs>().is_err());

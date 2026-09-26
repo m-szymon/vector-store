@@ -35,6 +35,7 @@ use crate::Quantization;
 use crate::SegmentMaxDocs;
 use crate::SpaceType;
 use crate::TableName;
+use crate::VerifyInOrder;
 use crate::cql_types;
 use crate::db_index;
 use crate::db_index::DbIndex;
@@ -1146,6 +1147,8 @@ impl Statements {
             let primary_id_fast: PrimaryIdFast = parse_index_option(&options, "poc_option_1");
             // `poc_option_2` caps segment size and switches on the range-aware merge policy.
             let segment_max_docs: SegmentMaxDocs = parse_index_option(&options, "poc_option_2");
+            // `poc_option_4` keeps the posting-order verification, for measurement only.
+            let verify_in_order: VerifyInOrder = parse_index_option(&options, "poc_option_4");
             IndexOptionsSubstring {
                 min_gram,
                 max_gram,
@@ -1153,6 +1156,7 @@ impl Statements {
                 order_by,
                 primary_id_fast,
                 segment_max_docs,
+                verify_in_order,
             }
             .validated()
         }))
