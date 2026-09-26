@@ -110,7 +110,26 @@ impl Writer {
         self.uncommitted_docs()
     }
 
-    fn commit(&mut self, reload: impl FnOnce() -> tantivy::Result<()>) -> tantivy::Result<()> {
+    /// Re-adds `docs` under fresh opstamps after deleting whatever carried their terms: the delete
+    /// applies to documents added before it, so the new copy survives. Used to move rows between
+    /// segments; nothing in-progress is attached since the rows were already indexed.
+    pub(crate) fn rewrite_documents(
+        &mut self,
+        docs: impl IntoIterator<Item = (tantivy::Term, TantivyDocument)>,
+    ) -> tantivy::Result<usize> {
+        let mut count = 0;
+        for (term, doc) in docs {
+            self.writer.delete_term(term);
+            self.writer.add_document(doc)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        reload: impl FnOnce() -> tantivy::Result<()>,
+    ) -> tantivy::Result<()> {
         self.writer.commit()?;
         reload()?;
         self.uncommitted_docs_in_progress_guards.clear();

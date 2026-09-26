@@ -28,9 +28,13 @@
 //!   shorter than the limit, and must follow the cursor instead. The converse is exact: the walk
 //!   reports a cursor only when it filled the page, so no cursor does mean no more results.
 //! * **Pruning depends on segment layout.** Cost is flat only where a segment's span of the sort
-//!   column is narrow. After an unordered backfill every segment spans everything and the search
-//!   degrades to visiting every match -- correct, but not fast. Keeping segments narrow is a
-//!   separate piece of work (see `docs/dev/substring/stage-2-ordering.md`).
+//!   column is narrow. Two options keep it so: `segment_max_docs` (`poc_option_2`) installs a
+//!   merge policy that only joins neighbours in sort order under a cap, and
+//!   `rewrite_wide_segments` (`poc_option_3`) moves the rows of segments that span far more than
+//!   their share -- an index built by a full scan, a shuffled load -- into range-aligned ones,
+//!   one range per idle tick. Without them, after an unordered backfill every segment spans
+//!   everything and the search degrades to visiting every match: correct, but not fast. See
+//!   `docs/dev/substring/stage-2-ordering.md`.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -41,6 +45,7 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -75,6 +80,7 @@ use tantivy::tokenizer::NgramTokenizer;
 use tantivy::tokenizer::TextAnalyzer;
 use tokio::sync::mpsc;
 use tracing::debug;
+use tracing::error;
 
 use crate::CaseSensitive;
 use crate::IndexKey;
@@ -104,6 +110,7 @@ use crate::tantivy_common::get_state;
 use crate::tantivy_common::handle_add_document;
 use crate::tantivy_common::handle_remove_document;
 use crate::tantivy_common::handle_stats;
+use crate::tantivy_common::primary_id_term;
 use crate::tantivy_common::reload;
 use crate::worker::Worker;
 use crate::worker::WorkerExt;
@@ -163,6 +170,89 @@ struct SubstringBackend {
     /// Each live segment's sort bounds, for the merge policy, which sees only segment metas.
     /// Refreshed after every reload; shared with the policy the writer holds.
     bounds: SharedBounds,
+    /// P3b: the rewrite of wide segments in progress, if any, and what it has done so far.
+    plan: Mutex<Option<RewritePlan>>,
+    rewrite: RewriteCounters,
+}
+
+/// A wide segment holds this many times more of the sort range than its share of the rows. An
+/// aligned segment's two shares are equal; one built by a full scan spans everything with a
+/// small share of the rows. The factor leaves room for the pieces a commit's writer threads
+/// produce, which are merged away by the policy before they could count.
+const WIDE_SEGMENT_FACTOR: f64 = 8.0;
+/// Sort keys sampled from the wide segments to place the range boundaries.
+const REWRITE_SAMPLE_TARGET: u64 = 200_000;
+
+/// P3b: which segments to empty and the sort ranges to move their rows into, one range per
+/// idle tick so that ingestion and searches interleave with the rewrite.
+#[derive(Debug)]
+struct RewritePlan {
+    l0: Vec<SegmentId>,
+    /// `[low, high)` in sort-key space, ascending, covering everything.
+    ranges: Vec<(u64, u64)>,
+    next: usize,
+}
+
+#[derive(Debug, Default)]
+struct RewriteCounters {
+    ranges_total: AtomicU64,
+    ranges_done: AtomicU64,
+    docs_rewritten: AtomicU64,
+    l0_docs: AtomicU64,
+}
+
+/// [`RewriteCounters`] at one moment, as `Stats` reports them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RewriteTotals {
+    pub(crate) ranges_total: u64,
+    pub(crate) ranges_done: u64,
+    pub(crate) docs_rewritten: u64,
+    /// Rows in wide segments when the current (or last) plan was made.
+    pub(crate) l0_docs: u64,
+}
+
+/// The segments the rewrite has to take apart: those spanning far more of the sort range than
+/// their share of the rows, and those over the cap, which no merge can ever bring under it.
+/// Input tuples are `(docs, sort_min, sort_max, id)`; `min_docs` ignores the small fresh
+/// segments a commit's writer threads leave, which the merge policy folds away on its own.
+fn wide_segments(
+    segments: &[(u32, u64, u64, SegmentId)],
+    total_docs: u64,
+    min_docs: u32,
+    cap: u32,
+) -> Vec<SegmentId> {
+    let low = segments.iter().map(|s| s.1).min().unwrap_or(0);
+    let high = segments.iter().map(|s| s.2).max().unwrap_or(0);
+    if total_docs == 0 {
+        return Vec::new();
+    }
+    let range = (high - low).max(1) as f64;
+    segments
+        .iter()
+        .filter(|(docs, min, max, _)| {
+            *docs >= min_docs
+                && (*docs > cap
+                    || (max - min) as f64 / range
+                        > WIDE_SEGMENT_FACTOR * *docs as f64 / total_docs as f64)
+        })
+        .map(|(_, _, _, id)| *id)
+        .collect()
+}
+
+/// `count` ranges `[low, high)` with about as many of the sampled keys in each, covering the
+/// whole key space; fewer when the sample has ties at a boundary.
+fn quantile_ranges(mut sample: Vec<u64>, count: usize) -> Vec<(u64, u64)> {
+    sample.sort_unstable();
+    let count = count.max(1);
+    let mut bounds = vec![0u64];
+    for k in 1..count {
+        let key = sample[k * sample.len() / count];
+        if key > *bounds.last().unwrap() {
+            bounds.push(key);
+        }
+    }
+    bounds.push(u64::MAX);
+    bounds.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
 type SharedBounds = Arc<RwLock<HashMap<SegmentId, (u64, u64)>>>;
@@ -397,6 +487,7 @@ pub(crate) struct SegmentLayout {
 pub(crate) struct SubstringStats {
     pub(crate) tantivy: TantivyStats,
     pub(crate) walk: WalkTotals,
+    pub(crate) rewrite: RewriteTotals,
     pub(crate) segments: Vec<SegmentLayout>,
 }
 
@@ -546,7 +637,196 @@ impl TantivyBackend for SubstringBackend {
             // the next reload picks the merged segment up either way.
             drop(state.writer.write().unwrap().merge(&run));
         }
+        if *self.options.rewrite_wide_segments.as_ref() {
+            self.maybe_plan_rewrite(&searcher, max_docs.get());
+        }
     }
+}
+
+impl SubstringBackend {
+    /// Starts a rewrite when wide segments hold at least a cap's worth of rows and none is in
+    /// progress. The boundaries come from a sample of the wide segments' sort keys, so skewed
+    /// keys still give ranges of about `cap` rows each.
+    fn maybe_plan_rewrite(&self, searcher: &tantivy::Searcher, cap: u32) {
+        if self.plan.lock().unwrap().is_some() {
+            return;
+        }
+        let bounds = self.bounds.read().unwrap();
+        let segments: Vec<(u32, u64, u64, SegmentId)> = searcher
+            .segment_readers()
+            .iter()
+            .filter_map(|segment| {
+                let (low, high) = *bounds.get(&segment.segment_id())?;
+                Some((segment.num_docs(), low, high, segment.segment_id()))
+            })
+            .collect();
+        drop(bounds);
+        // Big wide segments trigger a plan; once there is one, every wide segment goes in it,
+        // slivers included, since a sliver between two full neighbours has nowhere to merge.
+        let wide = if wide_segments(&segments, searcher.num_docs(), cap / 2, cap).is_empty() {
+            Vec::new()
+        } else {
+            wide_segments(&segments, searcher.num_docs(), 1, cap)
+        };
+        let l0_docs: u64 = searcher
+            .segment_readers()
+            .iter()
+            .filter(|segment| wide.contains(&segment.segment_id()))
+            .map(|segment| u64::from(segment.num_docs()))
+            .sum();
+        self.rewrite.l0_docs.store(l0_docs, Relaxed);
+        if l0_docs < u64::from(cap) {
+            return;
+        }
+        let stride = (l0_docs / REWRITE_SAMPLE_TARGET).max(1) as u32;
+        let mut sample = Vec::new();
+        let mut opened = 0;
+        for segment in searcher.segment_readers() {
+            if !wide.contains(&segment.segment_id()) {
+                continue;
+            }
+            let Ok(columns) = self.columns_for(segment, &mut opened) else {
+                continue;
+            };
+            let alive = segment.alive_bitset();
+            for doc_id in (0..segment.max_doc()).step_by(stride as usize) {
+                if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                    sample.push(columns.sort.first(doc_id).unwrap_or(0));
+                }
+            }
+        }
+        if sample.is_empty() {
+            return;
+        }
+        let count = l0_docs.div_ceil(u64::from(cap)) as usize;
+        let ranges = quantile_ranges(sample, count);
+        debug!(
+            "substring: rewriting {l0_docs} rows of {} wide segments into {} ranges",
+            wide.len(),
+            ranges.len()
+        );
+        self.rewrite
+            .ranges_total
+            .store(ranges.len() as u64, Relaxed);
+        self.rewrite.ranges_done.store(0, Relaxed);
+        *self.plan.lock().unwrap() = Some(RewritePlan {
+            l0: wide,
+            ranges,
+            next: 0,
+        });
+    }
+
+    fn rewrite_in_progress(&self) -> bool {
+        self.plan.lock().unwrap().is_some()
+    }
+
+    fn rewrite_totals(&self) -> RewriteTotals {
+        RewriteTotals {
+            ranges_total: self.rewrite.ranges_total.load(Relaxed),
+            ranges_done: self.rewrite.ranges_done.load(Relaxed),
+            docs_rewritten: self.rewrite.docs_rewritten.load(Relaxed),
+            l0_docs: self.rewrite.l0_docs.load(Relaxed),
+        }
+    }
+}
+
+/// Moves the plan's next range: every live row of a wide segment whose sort key falls in it is
+/// deleted by primary id and re-added, and the writer is committed before and after, all under
+/// the writer lock. The lock is what keeps a concurrent update or delete of one of those rows
+/// from being undone by the re-add: it waits, and lands with a higher opstamp. Searches take the
+/// reader, not this lock. Returns whether a range was processed.
+fn rewrite_next_range(state: &SubstringIndexState, key: &IndexKey) -> anyhow::Result<bool> {
+    let backend = &state.backend;
+    let Some((low, high, l0)) = backend.plan.lock().unwrap().as_ref().and_then(|plan| {
+        plan.ranges
+            .get(plan.next)
+            .map(|&(low, high)| (low, high, plan.l0.clone()))
+    }) else {
+        return Ok(false);
+    };
+    let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
+    let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
+
+    let mut writer = state.writer.write().unwrap();
+    writer
+        .commit(|| state.reader.reload())
+        .map_err(|e| anyhow!("substring: failed to commit before a rewrite: {e}"))?;
+    let searcher = state.reader.searcher();
+    let mut moved = Vec::new();
+    let mut opened = 0;
+    for segment in searcher.segment_readers() {
+        if !l0.contains(&segment.segment_id()) {
+            continue;
+        }
+        let columns = backend.columns_for(segment, &mut opened)?;
+        let alive = segment.alive_bitset();
+        let store = segment
+            .get_store_reader(STORE_CACHE_BLOCKS)
+            .map_err(|e| anyhow!("substring: failed to open the document store: {e}"))?;
+        for doc_id in 0..segment.max_doc() {
+            if alive.is_some_and(|alive| !alive.is_alive(doc_id)) {
+                continue;
+            }
+            let sort_key = columns.sort.first(doc_id).unwrap_or(0);
+            if sort_key < low || sort_key >= high {
+                continue;
+            }
+            let doc: TantivyDocument = store
+                .get(doc_id)
+                .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
+            let primary_id = doc
+                .get_first(primary_id_field)
+                .and_then(|value| value.as_u64())
+                .map(PrimaryId::from)
+                .ok_or_else(|| anyhow!("substring: missing primary_id in doc"))?;
+            let text = doc
+                .get_first(text_field)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let new_doc = backend.create_doc(
+                &state.schema,
+                primary_id,
+                SubstringRow {
+                    text,
+                    sort_key: Some(sort_key),
+                },
+            );
+            moved.push((primary_id_term(&state.schema, primary_id), new_doc));
+        }
+    }
+    let count = writer
+        .rewrite_documents(moved)
+        .map_err(|e| anyhow!("substring: failed to rewrite a range: {e}"))?;
+    writer
+        .commit(|| state.reader.reload())
+        .map_err(|e| anyhow!("substring: failed to commit a rewrite: {e}"))?;
+    drop(writer);
+
+    backend
+        .rewrite
+        .docs_rewritten
+        .fetch_add(count as u64, Relaxed);
+    backend.rewrite.ranges_done.fetch_add(1, Relaxed);
+    let finished = {
+        let mut plan = backend.plan.lock().unwrap();
+        if let Some(inner) = plan.as_mut() {
+            inner.next += 1;
+            if inner.next >= inner.ranges.len() {
+                *plan = None;
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    };
+    if finished {
+        debug!("substring: rewrite of {key} finished");
+    }
+    // Learn the new segments' bounds and let the policy fold the pieces together.
+    backend.after_reload(state);
+    Ok(true)
 }
 
 type SubstringIndexState = IndexState<SubstringBackend>;
@@ -1027,6 +1307,7 @@ fn handle_substring_stats(state: &SubstringIndexState) -> SubstringStatsR {
     Ok(SubstringStats {
         tantivy,
         walk: state.backend.walk.snapshot(),
+        rewrite: state.backend.rewrite_totals(),
         segments,
     })
 }
@@ -1080,6 +1361,8 @@ pub(crate) fn new(
             walk: WalkCounters::default(),
             columns: RwLock::new(HashMap::new()),
             bounds: Arc::new(RwLock::new(HashMap::new())),
+            plan: Mutex::new(None),
+            rewrite: RewriteCounters::default(),
             options: index.options.clone(),
         };
 
@@ -1223,8 +1506,19 @@ pub(crate) fn new(
                         if pending {
                             worker.spawn_blocking(move || commit(&state, &key)).await;
                         } else {
-                            // Merges finish after the writes stop; let the reader see them.
-                            worker.spawn_blocking(move || reload(&state, &key)).await;
+                            // Merges finish after the writes stop; let the reader see them. Then
+                            // one range of a rewrite in progress, so the rewrite paces itself to
+                            // the ticks and never starves ingestion or searches.
+                            worker
+                                .spawn_blocking(move || {
+                                    reload(&state, &key);
+                                    if state.backend.rewrite_in_progress()
+                                        && let Err(err) = rewrite_next_range(&state, &key)
+                                    {
+                                        error!("substring: rewrite of {key} failed: {err}");
+                                    }
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1245,6 +1539,7 @@ mod tests {
     use crate::OrderBy;
     use crate::PrimaryIdFast;
     use crate::PrimaryKey;
+    use crate::RewriteWideSegments;
     use crate::SegmentMaxDocs;
     use crate::VerifyInOrder;
     use crate::table::IndexIdGenerator;
@@ -1317,6 +1612,7 @@ mod tests {
             primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             verify_in_order: VerifyInOrder::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
         }
     }
 
@@ -1339,6 +1635,13 @@ mod tests {
     }
 
     fn make_sender_with_options(options: IndexOptionsSubstring) -> mpsc::Sender<SubstringIndex> {
+        make_sender_with_threshold(options, TEST_COMMIT_THRESHOLD)
+    }
+
+    fn make_sender_with_threshold(
+        options: IndexOptionsSubstring,
+        commit_threshold: usize,
+    ) -> mpsc::Sender<SubstringIndex> {
         new(
             SubstringIndexConfiguration {
                 key: make_index_key(),
@@ -1348,7 +1651,7 @@ mod tests {
             worker::new(),
             make_memory_actor(),
             TEST_COMMIT_INTERVAL,
-            TEST_COMMIT_THRESHOLD,
+            commit_threshold,
         )
     }
 
@@ -1959,6 +2262,132 @@ mod tests {
         assert!(walk.postings_scanned >= 5, "{walk:?}");
         assert_eq!(walk.heap_entrants, 5, "{walk:?}");
         assert_eq!(walk.store_reads, 10, "{walk:?}");
+    }
+
+    /// A segment is wide when it covers far more of the range than its share of the rows; small
+    /// fresh segments are ignored whatever they span.
+    #[test]
+    fn wide_segments_are_those_spanning_more_than_their_share() {
+        let total = 1000;
+        let segments = vec![
+            (500, 0, 499, id(1)),   // half the rows, half the range: aligned
+            (400, 500, 999, id(2)), // aligned
+            (100, 0, 999, id(3)),   // a tenth of the rows, all of the range: wide
+            (10, 0, 999, id(4)),    // wide but too small to bother with
+        ];
+        assert_eq!(wide_segments(&segments, total, 50, 1000), vec![id(3)]);
+        // Over the cap, an aligned segment is a rewrite target too: no merge can shrink it.
+        assert_eq!(wide_segments(&segments, total, 50, 450), vec![id(1), id(3)]);
+        assert!(wide_segments(&[], 0, 50, 100).is_empty());
+        assert!(wide_segments(&[(10, 7, 7, id(1))], 10, 1, 100).is_empty());
+        assert_eq!(wide_segments(&[(10, 7, 7, id(1))], 10, 1, 5), vec![id(1)]);
+    }
+
+    /// Ranges follow the sample's quantiles, cover the whole key space, and collapse on ties.
+    #[test]
+    fn quantile_ranges_cover_the_key_space_in_order() {
+        let sample: Vec<u64> = (0..100).map(|n| n * 10).collect();
+        let ranges = quantile_ranges(sample, 4);
+        assert_eq!(
+            ranges,
+            vec![(0, 250), (250, 500), (500, 750), (750, u64::MAX)]
+        );
+        assert_eq!(
+            quantile_ranges(vec![5, 5, 5, 5], 3),
+            vec![(0, 5), (5, u64::MAX)]
+        );
+        assert_eq!(quantile_ranges(vec![1, 2], 1), vec![(0, u64::MAX)]);
+    }
+
+    /// The whole of P3b: rows arriving in shuffled sort order make wide segments; with the
+    /// rewrite on they end up in narrow, contiguous, capped segments, and the search still
+    /// answers correctly throughout.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn wide_segments_are_rewritten_into_narrow_ones() {
+        let cap = 200u32;
+        // One commit for the whole batch, so the segments it produces are big and span nearly
+        // the whole range, like a full-scan build's. (Committed in small chunks instead, the
+        // pieces are too small to count as wide until the policy has merged them into capped
+        // segments that are, and the rewrite then proceeds in several smaller plans; the end
+        // state is the same.)
+        let sender = make_sender_with_threshold(
+            IndexOptionsSubstring {
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: RewriteWideSegments::from(true),
+                ..ordered_options()
+            },
+            2000,
+        );
+        // 2000 rows in a fixed shuffled order: i -> i * 1103 + 977 (mod 2000) is a permutation,
+        // since 1103 and 2000 are coprime.
+        let mut acks = Vec::new();
+        for i in 0..2000u64 {
+            let primary = (i * 1103 + 977) % 2000 + 1;
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    format!("user{primary}将军"),
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+
+        let widest_of = |stats: &SubstringStats| {
+            stats
+                .segments
+                .iter()
+                .map(|s| s.sort_max.unwrap() - s.sort_min.unwrap())
+                .max()
+                .unwrap_or(0)
+        };
+        // Until every segment is capped and no wider than two ranges, with no rewrite pending.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let idle = stats.rewrite.ranges_done == stats.rewrite.ranges_total;
+            let capped = stats.segments.iter().all(|s| s.docs <= cap);
+            let narrow = widest_of(&stats) <= 2 * u64::from(cap);
+            if (idle && capped && narrow && stats.rewrite.docs_rewritten > 0)
+                || Instant::now() > deadline
+            {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(
+            stats.rewrite.ranges_done, stats.rewrite.ranges_total,
+            "{:?}",
+            stats.rewrite
+        );
+        assert!(stats.rewrite.docs_rewritten >= 1000, "{:?}", stats.rewrite);
+        assert_eq!(stats.tantivy.num_docs, 2000);
+        assert!(
+            stats.segments.iter().all(|s| s.docs <= cap),
+            "a segment is past the cap: {:?}",
+            stats.segments
+        );
+        let mut spans: Vec<(u64, u64, u32)> = stats
+            .segments
+            .iter()
+            .map(|s| (s.sort_min.unwrap(), s.sort_max.unwrap(), s.docs))
+            .collect();
+        spans.sort_unstable();
+        assert!(
+            widest_of(&stats) <= 2 * u64::from(cap),
+            "a segment is still wide: {spans:?}"
+        );
+
+        let (ids, _) = search_ordered(&sender, "将军", 3, SortWindow::default()).await;
+        assert_eq!(ids, vec![2000, 1999, 1998]);
     }
 
     /// With `verify_in_order` the old walk is back: candidates are read as the postings come, so

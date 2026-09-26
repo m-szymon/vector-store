@@ -719,6 +719,20 @@ impl FromStr for PrimaryIdFast {
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
 )]
+/// Whether a substring index rewrites wide segments into range-aligned ones (P3b); `poc_option_3`.
+pub struct RewriteWideSegments(bool);
+
+impl FromStr for RewriteWideSegments {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        PrimaryIdFast::from_str(s).map(|flag| Self(*flag.as_ref()))
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
 /// Whether a substring index verifies a long keyword's candidates in posting order rather than
 /// from the highest sort key down. The slow way, kept for measurement; `poc_option_4`.
 pub struct VerifyInOrder(bool);
@@ -886,6 +900,10 @@ pub struct IndexOptionsSubstring {
     /// first stage-2 build did -- kept only to measure the two-pass walk against it. Read from
     /// the `poc_option_4` placeholder.
     pub verify_in_order: VerifyInOrder,
+    /// Rewrite segments that span far more of the sort range than their share of the rows
+    /// (P3b: an index built by a full scan, or a shuffled load) into range-aligned ones of
+    /// `segment_max_docs` rows. Needs the cap. Read from the `poc_option_3` placeholder.
+    pub rewrite_wide_segments: RewriteWideSegments,
 }
 
 impl IndexOptionsSubstring {
@@ -907,6 +925,7 @@ impl IndexOptionsSubstring {
                 primary_id_fast: self.primary_id_fast,
                 segment_max_docs: self.segment_max_docs,
                 verify_in_order: self.verify_in_order,
+                rewrite_wide_segments: self.rewrite_wide_segments,
                 ..Self::default()
             };
         }
@@ -1411,6 +1430,7 @@ mod tests {
             primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             verify_in_order: VerifyInOrder::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsSubstring::default());
 
@@ -1424,6 +1444,7 @@ mod tests {
             primary_id_fast: PrimaryIdFast::from(true),
             segment_max_docs: "250000".parse().unwrap(),
             verify_in_order: VerifyInOrder::from(true),
+            rewrite_wide_segments: RewriteWideSegments::from(true),
         };
         assert_eq!(
             inverted_ordered.validated(),
@@ -1432,6 +1453,7 @@ mod tests {
                 primary_id_fast: PrimaryIdFast::from(true),
                 segment_max_docs: "250000".parse().unwrap(),
                 verify_in_order: VerifyInOrder::from(true),
+                rewrite_wide_segments: RewriteWideSegments::from(true),
                 ..IndexOptionsSubstring::default()
             }
         );
@@ -1444,6 +1466,7 @@ mod tests {
             primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             verify_in_order: VerifyInOrder::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
         assert!("0".parse::<SegmentMaxDocs>().is_err());

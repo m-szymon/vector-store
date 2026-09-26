@@ -32,6 +32,7 @@ use crate::OrderBy;
 use crate::Positions;
 use crate::PrimaryIdFast;
 use crate::Quantization;
+use crate::RewriteWideSegments;
 use crate::SegmentMaxDocs;
 use crate::SpaceType;
 use crate::TableName;
@@ -1149,6 +1150,9 @@ impl Statements {
             let segment_max_docs: SegmentMaxDocs = parse_index_option(&options, "poc_option_2");
             // `poc_option_4` keeps the posting-order verification, for measurement only.
             let verify_in_order: VerifyInOrder = parse_index_option(&options, "poc_option_4");
+            // `poc_option_3` rewrites wide segments into range-aligned ones (needs the cap).
+            let rewrite_wide_segments: RewriteWideSegments =
+                parse_index_option(&options, "poc_option_3");
             IndexOptionsSubstring {
                 min_gram,
                 max_gram,
@@ -1157,6 +1161,7 @@ impl Statements {
                 primary_id_fast,
                 segment_max_docs,
                 verify_in_order,
+                rewrite_wide_segments,
             }
             .validated()
         }))

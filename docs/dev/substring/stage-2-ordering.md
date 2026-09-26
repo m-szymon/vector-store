@@ -315,6 +315,26 @@ the column, then verifies from the highest down and stops at the first that can 
 the page, so the store is read for the page's rows plus the false positives above them (a unit
 test: 30 matching rows, a page of 5, 5 verification reads). Not yet measured at 10M.
 
+### P3b as implemented (stage 3, not yet measured)
+
+`poc_option_3` turns on the rewrite of wide segments; it needs the cap. After every reload the
+backend looks for segments that are *wide* -- covering more than 8× their share of the rows, the
+signature of a full-scan build or a shuffled load -- or simply over the cap, which no merge can
+bring under it. When such segments hold at least a cap's worth of rows, it samples their sort
+keys, splits the key space into ranges of about a cap each by quantiles, and records a plan.
+Every idle tick then moves one range: under the writer lock it commits, reads each live row of a
+wide segment whose key falls in the range from the store, deletes it by primary id and re-adds
+it, and commits again. The lock is what keeps a concurrent update or delete of one of those rows
+from being undone by the re-add; searches take the reader and never wait. The range's rows land
+in a new segment, which the merge policy folds together with its neighbours. Progress and the
+rows involved are on `/metrics` (`substring_rewrite_*`, `substring_l0_docs`).
+
+The cost model is the design note's distribution pass: each range scans the wide segments' sort
+column once (`ranges × rows` column reads) and every row is read from the store and re-indexed
+exactly once. Unmeasured at 10M; the plan for that is the `names_10M_backfill` dataset of
+`aws_variants_config.yaml`, an index created after the load with the rewrite on against one
+without.
+
 ## Open questions and risks
 
 - **The sort-key encoding is written twice**, in `cql_types.rs` and in `index/substring_index.cc`,

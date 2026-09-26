@@ -34,6 +34,9 @@ pub(crate) struct Metrics {
     /// index on scrape, so they are gauges that only ever grow; a client diffs two scrapes to
     /// price the queries in between. One entry per [`SUBSTRING_SEARCH_TOTALS`].
     pub substring_search_totals: Vec<GaugeVec>,
+    /// Progress of a substring index's rewrite of wide segments. One entry per
+    /// [`SUBSTRING_REWRITE_GAUGES`].
+    pub substring_rewrite: Vec<GaugeVec>,
     /// A substring index's segments, one label set per segment ordinal: how many rows each holds
     /// and the span of sort keys its pruning is judged by. See [`SUBSTRING_SEGMENT_GAUGES`].
     pub substring_segment_layout: Vec<GaugeVec>,
@@ -84,6 +87,26 @@ pub(crate) const SUBSTRING_SEARCH_TOTALS: &[(&str, &str)] = &[
     (
         "substring_search_page_resolve_seconds_total",
         "Time substring searches spent turning the page into primary ids (part of the walk time), summed over searches",
+    ),
+];
+
+/// The rewrite (P3b) gauges, in the order `substring_rewrite` holds them.
+pub(crate) const SUBSTRING_REWRITE_GAUGES: &[(&str, &str)] = &[
+    (
+        "substring_rewrite_ranges_total",
+        "Ranges the current or last rewrite of wide segments was split into",
+    ),
+    (
+        "substring_rewrite_ranges_done",
+        "Ranges of that rewrite moved so far",
+    ),
+    (
+        "substring_rewrite_docs_total",
+        "Rows moved by rewrites since the index was created",
+    ),
+    (
+        "substring_l0_docs",
+        "Rows in wide segments when the current or last rewrite was planned",
     ),
 ];
 
@@ -263,6 +286,16 @@ impl Metrics {
                 .unwrap()
             })
             .collect::<Vec<_>>();
+        let substring_rewrite = SUBSTRING_REWRITE_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
         let substring_segment_layout = SUBSTRING_SEGMENT_GAUGES
             .iter()
             .map(|(name, help)| {
@@ -302,6 +335,7 @@ impl Metrics {
             .unwrap();
         for gauge in substring_search_totals
             .iter()
+            .chain(substring_rewrite.iter())
             .chain(substring_segment_layout.iter())
         {
             registry.register(Box::new(gauge.clone())).unwrap();
@@ -322,6 +356,7 @@ impl Metrics {
             substring_index_size_bytes,
             substring_segment_count,
             substring_search_totals,
+            substring_rewrite,
             substring_segment_layout,
             dirty_indexes: Arc::new(DashSet::new()),
             substring_segments_exported: Arc::new(DashMap::new()),
@@ -394,7 +429,11 @@ impl Metrics {
         let _ = self
             .substring_segment_count
             .remove_label_values(&[keyspace, index_name]);
-        for gauge in &self.substring_search_totals {
+        for gauge in self
+            .substring_search_totals
+            .iter()
+            .chain(self.substring_rewrite.iter())
+        {
             let _ = gauge.remove_label_values(&[keyspace, index_name]);
         }
         self.set_substring_segments(keyspace, index_name, &[]);

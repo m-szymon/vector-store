@@ -669,6 +669,16 @@ async fn refresh_index_metrics(
         for (gauge, value) in state.metrics.substring_search_totals.iter().zip(totals) {
             gauge.with_label_values(&labels).set(value);
         }
+        let rewrite = stats.rewrite;
+        let progress = [
+            rewrite.ranges_total as f64,
+            rewrite.ranges_done as f64,
+            rewrite.docs_rewritten as f64,
+            rewrite.l0_docs as f64,
+        ];
+        for (gauge, value) in state.metrics.substring_rewrite.iter().zip(progress) {
+            gauge.with_label_values(&labels).set(value);
+        }
         // The bounds are exported as the column's own value rather than as the sort key, which
         // is the value with its sign bit flipped so that it orders as an unsigned integer.
         let decode = |sort_key: Option<u64>| sort_key.map(|key| (key ^ (1 << 63)) as i64 as f64);
