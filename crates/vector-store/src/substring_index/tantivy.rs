@@ -757,6 +757,15 @@ fn collect_matches_ordered(
     // 9-27x the cost of the walk itself (benches/substring_order.rs, `as_shipped`). The ids are
     // read once, for the page that survives.
     let mut best: BinaryHeap<Reverse<(u64, DocAddress)>> = BinaryHeap::with_capacity(limit + 1);
+    // Whether a sort key can still enter the page: always while it is not full, and above the
+    // weakest entry once it is.
+    let beats_page = |best: &BinaryHeap<Reverse<(u64, DocAddress)>>, sort_key: u64| {
+        best.len() < limit
+            || best
+                .peek()
+                .is_none_or(|Reverse((weakest, _))| sort_key > *weakest)
+    };
+    let mut candidates: Vec<(u64, u32)> = Vec::new();
     for (segment_ord, segment, sort_column, upper_bound) in segments {
         if best.len() == limit
             && let Some(Reverse((weakest, _))) = best.peek()
@@ -771,34 +780,15 @@ fn collect_matches_ordered(
             .scorer(segment, 1.0)
             .map_err(|e| anyhow!("substring: failed to run the query: {e}"))?;
         let alive = segment.alive_bitset();
-        let store = needs_verification
-            .then(|| segment.get_store_reader(STORE_CACHE_BLOCKS))
-            .transpose()
-            .map_err(|e| anyhow!("substring: failed to open the document store: {e}"))?;
 
-        let mut doc_id = scorer.doc();
-        while doc_id != TERMINATED {
-            tally.postings_scanned += 1;
-            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
-                let sort_key = sort_column.first(doc_id).unwrap_or(0);
-                let beats_page = best.len() < limit
-                    || best
-                        .peek()
-                        .is_none_or(|Reverse((weakest, _))| sort_key > *weakest);
-                if window.contains(sort_key) && beats_page {
-                    // Past max_gram the grams only nominate candidates, and the text is in the
-                    // store; below it every match is exact and the store is not touched here.
-                    let verified = match &store {
-                        None => true,
-                        Some(store) => store
-                            .get::<TantivyDocument>(doc_id)
-                            .inspect(|_| tally.store_reads += 1)
-                            .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?
-                            .get_first(text_field)
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|text| text.contains(normalized)),
-                    };
-                    if verified {
+        if !needs_verification {
+            // Every match is exact, so it enters the page straight from the column.
+            let mut doc_id = scorer.doc();
+            while doc_id != TERMINATED {
+                tally.postings_scanned += 1;
+                if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                    let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                    if window.contains(sort_key) && beats_page(&best, sort_key) {
                         tally.heap_entrants += 1;
                         best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
                         if best.len() > limit {
@@ -806,8 +796,52 @@ fn collect_matches_ordered(
                         }
                     }
                 }
+                doc_id = scorer.advance();
+            }
+            continue;
+        }
+
+        // Past max_gram the grams only nominate candidates, and the text that decides is in the
+        // document store. Postings arrive in doc order, which is roughly ascending sort order
+        // within a segment, so verifying as they come reads nearly every candidate: each later
+        // one beats the page the earlier ones built. Two passes instead: gather the candidates'
+        // sort keys from the column, then verify from the highest down and stop at the first
+        // that can no longer enter the page. The store is read for the page's rows plus the
+        // false positives above them, whatever the segment holds.
+        let store = segment
+            .get_store_reader(STORE_CACHE_BLOCKS)
+            .map_err(|e| anyhow!("substring: failed to open the document store: {e}"))?;
+        candidates.clear();
+        let mut doc_id = scorer.doc();
+        while doc_id != TERMINATED {
+            tally.postings_scanned += 1;
+            if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
+                let sort_key = sort_column.first(doc_id).unwrap_or(0);
+                if window.contains(sort_key) && beats_page(&best, sort_key) {
+                    candidates.push((sort_key, doc_id));
+                }
             }
             doc_id = scorer.advance();
+        }
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        for &(sort_key, doc_id) in &candidates {
+            if !beats_page(&best, sort_key) {
+                break;
+            }
+            tally.store_reads += 1;
+            let verified = store
+                .get::<TantivyDocument>(doc_id)
+                .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?
+                .get_first(text_field)
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| text.contains(normalized));
+            if verified {
+                tally.heap_entrants += 1;
+                best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
+                if best.len() > limit {
+                    best.pop();
+                }
+            }
         }
     }
 
@@ -1845,6 +1879,56 @@ mod tests {
 
         let (ids, _) = search_ordered(&sender, "将军", 5, SortWindow::default()).await;
         assert_eq!(ids, vec![400, 399, 398, 397, 396]);
+    }
+
+    /// A keyword past max_gram reads the store only for the page and the false positives above
+    /// it, not for every candidate: 30 rows all matching, a page of 5, and 5 verification reads
+    /// plus the 5 that resolve the page.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_verified_search_reads_the_store_for_the_page_only() {
+        let sender = make_sender_with_options(ordered_options());
+        // Sort key = primary id; "abcd" is past max_gram (3) and every row contains it.
+        // Sent as one batch so they share a commit and land in a few segments together; one
+        // segment per row would make every segment a single candidate and prove nothing.
+        let mut acks = Vec::new();
+        for n in 1..=30u64 {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    n.into(),
+                    format!("x{n}abcdx"),
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        let segments = sender
+            .stats(make_index_key())
+            .await
+            .unwrap()
+            .tantivy
+            .segment_count;
+        assert!(
+            segments < 30,
+            "expected the rows to share segments, got {segments}"
+        );
+
+        let (ids, _) = search_ordered(&sender, "abcd", 5, SortWindow::default()).await;
+        assert_eq!(ids, vec![30, 29, 28, 27, 26]);
+
+        // The candidates the walk scanned (the top segment's, at least; a lower segment may be
+        // pruned by its bounds) versus the 5 it read to verify and the 5 it read for the page.
+        let walk = sender.stats(make_index_key()).await.unwrap().walk;
+        assert!(walk.postings_scanned >= 5, "{walk:?}");
+        assert_eq!(walk.heap_entrants, 5, "{walk:?}");
+        assert_eq!(walk.store_reads, 10, "{walk:?}");
     }
 
     /// The columns are opened once per segment, by the reload that follows a commit, so a search

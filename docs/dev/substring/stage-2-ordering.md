@@ -307,11 +307,13 @@ that independent of luck and gives the deep page the cost of page 1, which was t
 claim. Neither cap slowed ingestion measurably at 5k rows/s. The ceiling is ScyllaDB's base-table
 reads again, above stage 1's unordered 9.6k on the same nodes.
 
-What remains: the verified path. In a single narrow newest segment scanned in ascending sort
-order every later candidate beats the page's weakest entry, so all of them are read before the
-heap can reject any -- 207 store reads for a 4-char keyword at the 100k cap. Collecting the
-candidates' sort keys first and verifying from the top down would cut that to the page plus the
-false positives.
+What remained was the verified path. In a single narrow newest segment scanned in ascending sort
+order every later candidate beats the page's weakest entry, so all of them were read before the
+heap could reject any -- 207 store reads for a 4-char keyword at the 100k cap. The walk now runs
+two passes per segment for a keyword past `max_gram`: it gathers the candidates' sort keys from
+the column, then verifies from the highest down and stops at the first that can no longer enter
+the page, so the store is read for the page's rows plus the false positives above them (a unit
+test: 30 matching rows, a page of 5, 5 verification reads). Not yet measured at 10M.
 
 ## Open questions and risks
 
