@@ -81,6 +81,8 @@ use tantivy::tokenizer::TextAnalyzer;
 use tokio::sync::mpsc;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
+use tracing::warn;
 
 use crate::CaseSensitive;
 use crate::IndexKey;
@@ -615,7 +617,10 @@ impl TantivyBackend for SubstringBackend {
                 Ok(columns) => {
                     live.insert(segment.segment_id(), (columns.sort_min, columns.sort_max));
                 }
-                Err(err) => debug!("substring: {err}"),
+                Err(err) => warn!(
+                    "substring: no bounds for segment {}: {err}",
+                    segment.segment_id().short_uuid_string()
+                ),
             }
         }
         self.prune_columns(searcher.segment_readers());
@@ -632,7 +637,16 @@ impl TantivyBackend for SubstringBackend {
                 Some((low, high, segment.num_docs(), segment.segment_id()))
             })
             .collect();
-        for run in merge_runs(known, max_docs.get()) {
+        let runs = merge_runs(known, max_docs.get());
+        if !runs.is_empty() {
+            info!(
+                "substring: asking for {} merges of {} segments ({} live)",
+                runs.len(),
+                runs.iter().map(Vec::len).sum::<usize>(),
+                searcher.segment_readers().len()
+            );
+        }
+        for run in runs {
             // The merge runs on Tantivy's own thread; the future only reports its outcome, and
             // the next reload picks the merged segment up either way.
             drop(state.writer.write().unwrap().merge(&run));
@@ -700,7 +714,7 @@ impl SubstringBackend {
         }
         let count = l0_docs.div_ceil(u64::from(cap)) as usize;
         let ranges = quantile_ranges(sample, count);
-        debug!(
+        info!(
             "substring: rewriting {l0_docs} rows of {} wide segments into {} ranges",
             wide.len(),
             ranges.len()
@@ -822,7 +836,10 @@ fn rewrite_next_range(state: &SubstringIndexState, key: &IndexKey) -> anyhow::Re
         }
     };
     if finished {
-        debug!("substring: rewrite of {key} finished");
+        info!(
+            "substring: rewrite of {key} finished, {} rows moved",
+            backend.rewrite.docs_rewritten.load(Relaxed)
+        );
     }
     // Learn the new segments' bounds and let the policy fold the pieces together.
     backend.after_reload(state);
@@ -1674,6 +1691,14 @@ mod tests {
         rx.recv().await;
     }
 
+    async fn rm_doc_no_wait(sender: &mpsc::Sender<SubstringIndex>, primary: u64) {
+        let (tx, _rx) = mpsc::channel(1);
+        sender
+            .remove_document(primary.into(), AsyncInProgress::Fullscan(tx))
+            .await
+            .unwrap();
+    }
+
     async fn rm_doc(sender: &mpsc::Sender<SubstringIndex>, primary: u64) {
         let (tx, mut rx) = mpsc::channel(1);
         sender
@@ -2219,6 +2244,73 @@ mod tests {
     /// plus the 5 that resolve the page.
     #[rstest]
     #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn the_range_policy_folds_the_tail_a_stream_of_updates_leaves() {
+        // What the docker smoke saw (2026-09-26): 3000 shuffled rows in one build, then every row
+        // delivered again as an update in small commits, as the CDC reader replays the load. The
+        // updates land as small segments spanning the whole range; once the writes stop, the
+        // idle reloads must fold them together under the cap rather than leave two dozen slivers.
+        let cap = 500u32;
+        let sender = make_sender_with_threshold(
+            IndexOptionsSubstring {
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                ..ordered_options()
+            },
+            3000,
+        );
+        let ids: Vec<u64> = (0..3000u64).map(|i| (i * 1103 + 977) % 3000 + 1).collect();
+        let send = |primary: u64| {
+            let sender = sender.clone();
+            async move {
+                let (tx, rx) = mpsc::channel(1);
+                sender
+                    .add_document(
+                        test_partition_id(),
+                        primary.into(),
+                        format!("user{primary}将军"),
+                        AsyncInProgress::Fullscan(tx),
+                    )
+                    .await
+                    .unwrap();
+                rx
+            }
+        };
+        let mut acks = Vec::with_capacity(3000);
+        for &primary in &ids {
+            acks.push(send(primary).await);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        // The replay: rows come back in the same order, a commit interval apart per hundred.
+        for chunk in ids.chunks(100) {
+            let mut acks = Vec::with_capacity(chunk.len());
+            for &primary in chunk {
+                rm_doc_no_wait(&sender, primary).await;
+                acks.push(send(primary).await);
+            }
+            for mut ack in acks {
+                ack.recv().await;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            if stats.tantivy.segment_count <= 8 || Instant::now() > deadline {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(stats.tantivy.num_docs, 3000);
+        assert!(
+            stats.tantivy.segment_count <= 8,
+            "{} segments: {:?}",
+            stats.tantivy.segment_count,
+            stats.segments
+        );
+        assert!(stats.segments.iter().all(|s| s.docs <= cap));
+    }
+
     #[tokio::test]
     async fn a_verified_search_reads_the_store_for_the_page_only() {
         let sender = make_sender_with_options(ordered_options());
