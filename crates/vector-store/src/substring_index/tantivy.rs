@@ -233,8 +233,8 @@ fn narrow_span(segments: &[(u32, u64, u64, SegmentId)], total_docs: u64, cap: u3
     }
 }
 
-/// The segments the rewrite has to take apart: those spanning more than `narrow_span`, and
-/// those over the cap, which no merge can ever bring under it. Input tuples are
+/// The segments that call for a rewrite: those spanning more than `narrow_span`, and those over
+/// the cap, which no merge can ever bring under it. Input tuples are
 /// `(docs, sort_min, sort_max, id)`; `min_docs` says how big a wide segment has to be to count.
 fn wide_segments(
     segments: &[(u32, u64, u64, SegmentId)],
@@ -246,6 +246,25 @@ fn wide_segments(
     segments
         .iter()
         .filter(|(docs, min, max, _)| *docs >= min_docs && (*docs > cap || max - min > narrow))
+        .map(|(_, _, _, id)| *id)
+        .collect()
+}
+
+/// The segments a rewrite in progress takes rows from: everything the policy would not fold
+/// into a narrow run, i.e. spanning more than a narrow run may, or over the cap. Wider than
+/// [`wide_segments`] on purpose: the rewrite moves ranges in ascending key order, so what is
+/// left in the segments it drains is a shrinking band of the highest keys, and once that band
+/// spans under eight caps their merged remains would stop counting as wide and escape with a
+/// cap's rows over several caps' width, at the top of the range where "newest first" looks.
+fn spread_segments(
+    segments: &[(u32, u64, u64, SegmentId)],
+    total_docs: u64,
+    cap: u32,
+) -> Vec<SegmentId> {
+    let run_span = narrow_span(segments, total_docs, cap) / NARROW_RUN_SPAN_DIVISOR;
+    segments
+        .iter()
+        .filter(|(docs, min, max, _)| *docs > cap || max - min > run_span)
         .map(|(_, _, _, id)| *id)
         .collect()
 }
@@ -313,21 +332,30 @@ impl MergePolicy for RangeMergePolicy {
     }
 }
 
+/// How much of `narrow_span` a merged narrow run may cover: a quarter, i.e. two caps' worth of
+/// rows. The pieces of one rewritten range fit in one cap's width; letting a run reach the
+/// eight of the wide limit would fold the sparse pieces of several ranges into one segment
+/// holding a cap's rows over four caps' width, which nothing would take apart again.
+const NARROW_RUN_SPAN_DIVISOR: u64 = 4;
+
 /// The runs of sort-order neighbours worth merging: each at least two segments, each under
-/// `max_docs` rows in total. Segments spanning more than `narrow_span` are wide: they form runs
-/// of their own and never join a narrow one, and a narrow run stops growing where its combined
-/// span would pass `narrow_span`. Input tuples are `(docs, sort_min, sort_max, id)`. Pure, so it
-/// can be tested without a writer.
+/// `max_docs` rows in total. A narrow run -- segments spanning no more than a quarter of
+/// `narrow_span` each -- stops growing where its combined span would pass that quarter. Anything
+/// spanning more than that never joins a narrow run, which would only widen it; those segments
+/// merge among themselves with no limit on the span, so slivers grow into a segment the rewrite
+/// will find wide. Input tuples are `(docs, sort_min, sort_max, id)`. Pure, so it can be tested
+/// without a writer.
 fn merge_runs(
     segments: Vec<(u32, u64, u64, SegmentId)>,
     max_docs: u32,
     narrow_span: u64,
 ) -> Vec<Vec<SegmentId>> {
-    let (wide, narrow): (Vec<_>, Vec<_>) = segments
+    let run_span = narrow_span / NARROW_RUN_SPAN_DIVISOR;
+    let (spread, narrow): (Vec<_>, Vec<_>) = segments
         .into_iter()
-        .partition(|&(_, low, high, _)| high - low > narrow_span);
-    let mut runs = runs_under(narrow, max_docs, narrow_span);
-    runs.extend(runs_under(wide, max_docs, u64::MAX));
+        .partition(|&(_, low, high, _)| high - low > run_span);
+    let mut runs = runs_under(narrow, max_docs, run_span);
+    runs.extend(runs_under(spread, max_docs, u64::MAX));
     runs
 }
 
@@ -700,31 +728,33 @@ impl TantivyBackend for SubstringBackend {
             // the next reload picks the merged segment up either way.
             drop(state.writer.write().unwrap().merge(&run));
         }
-        if *self.options.rewrite_wide_segments.as_ref() {
-            self.maybe_plan_rewrite(&searcher, &geometry, max_docs.get());
-        }
     }
 }
 
 impl SubstringBackend {
     /// Starts a rewrite when wide segments hold at least a cap's worth of rows and none is in
     /// progress. The boundaries come from a sample of the wide segments' sort keys, so skewed
-    /// keys still give ranges of about `cap` rows each.
-    fn maybe_plan_rewrite(
-        &self,
-        searcher: &tantivy::Searcher,
-        segments: &[(u32, u64, u64, SegmentId)],
-        cap: u32,
-    ) {
-        if self.plan.lock().unwrap().is_some() {
+    /// keys still give ranges of about `cap` rows each. Called on idle ticks only: a plan made
+    /// while a build is still committing samples the rows so far and cuts too few, too wide
+    /// ranges, whose segments end up spanning several caps and never get revisited.
+    fn maybe_plan_rewrite(&self, state: &IndexState<Self>) {
+        if !*self.options.rewrite_wide_segments.as_ref() || self.plan.lock().unwrap().is_some() {
             return;
         }
-        // Big wide segments trigger a plan; once there is one, every wide segment is in it,
-        // slivers included, since a sliver has nowhere narrow to merge.
+        let Some(cap) = *self.options.segment_max_docs.as_ref() else {
+            return;
+        };
+        let cap = cap.get();
+        let searcher = state.reader.searcher();
+        let searcher = &searcher;
+        let geometry = self.geometry(searcher);
+        let segments = geometry.as_slice();
+        // Big wide segments trigger a plan; once there is one, everything that is not narrow is
+        // in it, slivers included, since a sliver has nowhere narrow to merge.
         let wide = if wide_segments(segments, searcher.num_docs(), cap / 2, cap).is_empty() {
             Vec::new()
         } else {
-            wide_segments(segments, searcher.num_docs(), 1, cap)
+            spread_segments(segments, searcher.num_docs(), cap)
         };
         let l0_docs: u64 = searcher
             .segment_readers()
@@ -784,8 +814,8 @@ impl SubstringBackend {
     }
 }
 
-/// Moves the plan's next range: every live row of a segment that is wide now whose sort key
-/// falls in it is deleted by primary id and re-added, and the writer is committed before and
+/// Moves the plan's next range: every live row of a segment that is not narrow now whose sort
+/// key falls in it is deleted by primary id and re-added, and the writer is committed before and
 /// after, all under the writer lock. The rows land in pieces spanning no more than the range,
 /// narrow by construction, which the policy folds into one segment. The lock is what keeps a concurrent update or delete of one of those rows
 /// from being undone by the re-add: it waits, and lands with a higher opstamp. Searches take the
@@ -812,12 +842,7 @@ fn rewrite_next_range(state: &SubstringIndexState, key: &IndexKey) -> anyhow::Re
         .commit(|| state.reader.reload())
         .map_err(|e| anyhow!("substring: failed to commit before a rewrite: {e}"))?;
     let searcher = state.reader.searcher();
-    let wide = wide_segments(
-        &backend.geometry(&searcher),
-        searcher.num_docs(),
-        1,
-        cap.get(),
-    );
+    let wide = spread_segments(&backend.geometry(&searcher), searcher.num_docs(), cap.get());
     let mut moved = Vec::new();
     let mut opened = 0;
     for segment in searcher.segment_readers() {
@@ -1581,6 +1606,9 @@ pub(crate) fn new(
                             worker
                                 .spawn_blocking(move || {
                                     reload(&state, &key);
+                                    if !state.backend.rewrite_in_progress() {
+                                        state.backend.maybe_plan_rewrite(&state);
+                                    }
                                     if state.backend.rewrite_in_progress()
                                         && let Err(err) = rewrite_next_range(&state, &key)
                                     {
@@ -2212,7 +2240,8 @@ mod tests {
             (20, 985, 1000, id(8)),
             (5, 995, 1000, id(9)),
         ];
-        let runs = merge_runs(segments, 250, 400);
+        // A narrow limit of 1600 lets a run span 400: room for every run here.
+        let runs = merge_runs(segments, 250, 1600);
         assert_eq!(
             runs,
             vec![
@@ -2221,24 +2250,25 @@ mod tests {
                 vec![id(8), id(7), id(9)],
             ]
         );
-        assert!(merge_runs(vec![(10, 0, 1, id(1))], 250, 400).is_empty());
-        assert!(merge_runs(vec![], 250, 400).is_empty());
+        assert!(merge_runs(vec![(10, 0, 1, id(1))], 250, 1600).is_empty());
+        assert!(merge_runs(vec![], 250, 1600).is_empty());
     }
 
-    /// A wide sliver never joins the narrow run it sorts into; wide segments merge among
-    /// themselves, and a narrow run stops where its span would pass the limit.
+    /// A sliver never joins the narrow run it sorts into; slivers merge among themselves, and
+    /// a narrow run stops where its span would pass a quarter of the limit.
     #[test]
-    fn merge_runs_keep_wide_segments_out_of_narrow_runs() {
+    fn merge_runs_keep_spread_segments_out_of_narrow_runs() {
+        // A limit of 400: a narrow run spans at most 100.
         let segments = vec![
-            (50, 0, 99, id(1)), // narrow, with 2 -> 100 rows over 0..199
-            (50, 100, 199, id(2)),
-            (30, 5, 990, id(3)),   // a wide sliver sorting between 1 and 2
-            (50, 200, 299, id(4)), // 1 + 2 + 4 would be 150 rows: still under the cap, but
-            (50, 800, 899, id(5)), // 1 + 2 + 4 + 5 would span 0..899: past the 500 limit
-            (20, 300, 950, id(6)), // wide, merges with 3
+            (50, 0, 49, id(1)), // narrow, with 2 -> 100 rows over 0..99
+            (50, 50, 99, id(2)),
+            (30, 5, 990, id(3)),   // a sliver sorting between 1 and 2
+            (50, 100, 149, id(4)), // 1 + 2 + 4 would be 150 rows under the cap, but span 0..149
+            (50, 800, 849, id(5)), // narrow, nothing within a run's span of it
+            (20, 300, 950, id(6)), // a sliver: merges with 3, whatever the two span together
         ];
-        let runs = merge_runs(segments, 250, 500);
-        assert_eq!(runs, vec![vec![id(1), id(2), id(4)], vec![id(3), id(6)]]);
+        let runs = merge_runs(segments, 250, 400);
+        assert_eq!(runs, vec![vec![id(1), id(2)], vec![id(3), id(6)]]);
     }
 
     /// With the cap set, an index built from many small commits ends with segments that hold
@@ -2377,6 +2407,82 @@ mod tests {
             stats.segments
         );
         assert!(stats.segments.iter().all(|s| s.docs <= cap));
+    }
+
+    /// The docker smoke's case: thirty caps' worth of shuffled rows, built in one commit or in
+    /// commits of a few caps as a full scan would, must end narrow and capped after the rewrite,
+    /// with every row exactly once.
+    #[rstest]
+    #[case::one_commit(3000)]
+    #[case::scan_commits(500)]
+    #[timeout(Duration::from_secs(90))]
+    #[tokio::test]
+    async fn many_caps_of_shuffled_rows_end_narrow_and_capped(#[case] threshold: usize) {
+        let rows = 3000u64;
+        let cap = 100u32;
+        let sender = make_sender_with_threshold(
+            IndexOptionsSubstring {
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: RewriteWideSegments::from(true),
+                ..ordered_options()
+            },
+            threshold,
+        );
+        let mut acks = Vec::new();
+        for i in 0..rows {
+            let primary = (i * 1103 + 977) % rows + 1;
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    format!("user{primary}将军"),
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let idle = stats.rewrite.ranges_done == stats.rewrite.ranges_total;
+            let capped = stats.segments.iter().all(|s| s.docs <= cap);
+            let narrow = stats
+                .segments
+                .iter()
+                .all(|s| s.sort_max.unwrap() - s.sort_min.unwrap() <= 2 * u64::from(cap));
+            if (idle && capped && narrow && stats.rewrite.docs_rewritten > 0)
+                || Instant::now() > deadline
+            {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let layout: Vec<(u32, u64, u64)> = stats
+            .segments
+            .iter()
+            .map(|s| (s.docs, s.sort_min.unwrap(), s.sort_max.unwrap()))
+            .collect();
+        assert_eq!(stats.tantivy.num_docs, rows, "{layout:?}");
+        assert_eq!(
+            stats.rewrite.ranges_done, stats.rewrite.ranges_total,
+            "{:?}",
+            stats.rewrite
+        );
+        assert!(
+            layout
+                .iter()
+                .all(|&(docs, low, high)| docs <= cap && high - low <= 2 * u64::from(cap)),
+            "{} segments, rewrite {:?}: {layout:?}",
+            layout.len(),
+            stats.rewrite
+        );
+        let (ids, _) = search_ordered(&sender, "将军", 3, SortWindow::default()).await;
+        assert_eq!(ids, vec![3000, 2999, 2998]);
     }
 
     #[tokio::test]
