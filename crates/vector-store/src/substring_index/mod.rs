@@ -10,11 +10,13 @@ mod factory;
 mod tantivy;
 
 use crate::memory::Memory;
+use crate::metrics::Metrics;
 use crate::worker::Worker;
 pub(crate) use actor::SubstringIndex;
 pub(crate) use actor::SubstringIndexExt;
 pub(crate) use factory::SubstringIndexConfiguration;
 pub(crate) use factory::SubstringIndexFactory;
+use std::sync::Arc;
 pub(crate) use tantivy::SortWindow;
 use tantivy::TantivySubstringIndexFactory;
 use tokio::sync::mpsc;
@@ -22,6 +24,7 @@ use tokio::sync::mpsc;
 pub(crate) fn new_substring_index_factory_tantivy(
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    metrics: Arc<Metrics>,
 ) -> Box<dyn SubstringIndexFactory + Send + Sync> {
-    Box::new(TantivySubstringIndexFactory::new(worker, memory))
+    Box::new(TantivySubstringIndexFactory::new(worker, memory, metrics))
 }

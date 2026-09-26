@@ -91,6 +91,7 @@ use crate::Limit;
 use crate::memory::Allocate;
 use crate::memory::Memory;
 use crate::memory::MemoryExt;
+use crate::metrics::Metrics;
 use crate::perf;
 use crate::table::IndexId;
 use crate::table::PartitionId;
@@ -126,11 +127,20 @@ use super::factory::SubstringIndexFactory;
 pub(crate) struct TantivySubstringIndexFactory {
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
+    metrics: Arc<Metrics>,
 }
 
 impl TantivySubstringIndexFactory {
-    pub(crate) fn new(worker: async_channel::Sender<Worker>, memory: mpsc::Sender<Memory>) -> Self {
-        Self { worker, memory }
+    pub(crate) fn new(
+        worker: async_channel::Sender<Worker>,
+        memory: mpsc::Sender<Memory>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            worker,
+            memory,
+            metrics,
+        }
     }
 }
 
@@ -147,6 +157,7 @@ impl SubstringIndexFactory for TantivySubstringIndexFactory {
             self.memory.clone(),
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
+            Some(Arc::clone(&self.metrics)),
         )
     }
 }
@@ -1445,10 +1456,18 @@ pub(crate) fn new(
     memory: mpsc::Sender<Memory>,
     commit_interval: Duration,
     commit_threshold: usize,
+    metrics: Option<Arc<Metrics>>,
 ) -> mpsc::Sender<SubstringIndex> {
     let (tx, mut rx) = mpsc::channel::<SubstringIndex>(perf::channel_size().into());
     tokio::spawn(async move {
         let key = index.key.clone();
+        // The layout changes on the ticks -- merges after the writes stop, a rewrite in progress
+        // -- with no write or search to mark the index for a refresh, so the ticks mark it.
+        let mark_dirty = |key: &IndexKey| {
+            if let Some(metrics) = &metrics {
+                metrics.mark_dirty(key.keyspace().as_ref(), key.index().as_ref());
+            }
+        };
         debug!("substring index actor starting for {key}");
         let mut states: BTreeMap<IndexId, Arc<SubstringIndexState>> = BTreeMap::new();
         let make_backend = || SubstringBackend {
@@ -1599,6 +1618,7 @@ pub(crate) fn new(
                         let key = key.clone();
                         if pending {
                             worker.spawn_blocking(move || commit(&state, &key)).await;
+                            mark_dirty(&index.key);
                         } else {
                             // Merges finish after the writes stop; let the reader see them. Then
                             // one range of a rewrite in progress, so the rewrite paces itself to
@@ -1616,6 +1636,7 @@ pub(crate) fn new(
                                     }
                                 })
                                 .await;
+                            mark_dirty(&index.key);
                         }
                     }
                 }
@@ -1749,6 +1770,7 @@ mod tests {
             make_memory_actor(),
             TEST_COMMIT_INTERVAL,
             commit_threshold,
+            None,
         )
     }
 

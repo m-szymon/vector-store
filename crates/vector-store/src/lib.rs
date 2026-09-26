@@ -1197,7 +1197,7 @@ pub async fn run(
     let fts_index_factory =
         fts_index::new_fts_index_factory_tantivy(worker.clone(), memory.clone());
     let substring_index_factory =
-        substring_index::new_substring_index_factory_tantivy(worker, memory);
+        substring_index::new_substring_index_factory_tantivy(worker, memory, Arc::clone(&metrics));
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {
