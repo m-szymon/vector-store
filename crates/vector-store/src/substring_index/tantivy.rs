@@ -280,20 +280,44 @@ fn spread_segments(
         .collect()
 }
 
-/// `count` ranges `[low, high)` with about as many of the sampled keys in each, covering the
-/// whole key space; fewer when the sample has ties at a boundary.
-fn quantile_ranges(mut sample: Vec<u64>, count: usize) -> Vec<(u64, u64)> {
+/// About `count` ranges covering `low..=high` with about as many of the sampled keys in each,
+/// none wider than `max_width` in key space: a quantile range over sparse rows -- the remains of
+/// a drained band -- can span half the key space, and the pieces its rows land in are as wide as
+/// the range, wide enough to be planned again and again. Such a range is cut into equal parts
+/// of at most `max_width`, so a rewritten range always lands narrow. Fewer quantile cuts when
+/// the sample has ties at a boundary.
+fn quantile_ranges(
+    mut sample: Vec<u64>,
+    count: usize,
+    low: u64,
+    high: u64,
+    max_width: u64,
+) -> Vec<(u64, u64)> {
     sample.sort_unstable();
     let count = count.max(1);
-    let mut bounds = vec![0u64];
+    let max_width = max_width.max(1);
+    let end = high.saturating_add(1);
+    let mut bounds = vec![low];
     for k in 1..count {
         let key = sample[k * sample.len() / count];
-        if key > *bounds.last().unwrap() {
+        if key > *bounds.last().unwrap() && key < end {
             bounds.push(key);
         }
     }
-    bounds.push(u64::MAX);
-    bounds.windows(2).map(|w| (w[0], w[1])).collect()
+    bounds.push(end);
+    let mut ranges = Vec::new();
+    for w in bounds.windows(2) {
+        let (from, to) = (w[0], w[1]);
+        let parts = (to - from).div_ceil(max_width).max(1);
+        let step = (to - from).div_ceil(parts);
+        let mut at = from;
+        while at < to {
+            let next = at.saturating_add(step).min(to);
+            ranges.push((at, next));
+            at = next;
+        }
+    }
+    ranges
 }
 
 type SharedBounds = Arc<RwLock<HashMap<SegmentId, (u64, u64)>>>;
@@ -799,7 +823,17 @@ impl SubstringBackend {
             return;
         }
         let count = l0_docs.div_ceil(u64::from(cap)) as usize;
-        let ranges = quantile_ranges(sample, count);
+        // Everything a step may take rows from: the spread segments, wide ones included.
+        let spread = spread_segments(segments, searcher.num_docs(), cap);
+        let (low, high) = segments
+            .iter()
+            .filter(|(_, _, _, id)| spread.contains(id))
+            .fold((u64::MAX, 0u64), |(lo, hi), &(_, min, max, _)| {
+                (lo.min(min), hi.max(max))
+            });
+        let cap_width =
+            narrow_span(segments, searcher.num_docs(), cap) / WIDE_SEGMENT_FACTOR as u64;
+        let ranges = quantile_ranges(sample, count, low, high, cap_width);
         info!(
             "substring: rewriting {l0_docs} rows of {} wide segments into {} ranges",
             wide.len(),
@@ -2581,20 +2615,28 @@ mod tests {
         assert_eq!(wide_segments(&[(10, 7, 7, id(1))], 10, 1, 5), vec![id(1)]);
     }
 
-    /// Ranges follow the sample's quantiles, cover the whole key space, and collapse on ties.
+    /// Ranges follow the sample's quantiles, cover the bounds given, collapse on ties, and a
+    /// range wider than the limit is cut into equal parts.
     #[test]
     fn quantile_ranges_cover_the_key_space_in_order() {
         let sample: Vec<u64> = (0..100).map(|n| n * 10).collect();
-        let ranges = quantile_ranges(sample, 4);
+        let ranges = quantile_ranges(sample, 4, 0, 990, u64::MAX);
+        assert_eq!(ranges, vec![(0, 250), (250, 500), (500, 750), (750, 991)]);
         assert_eq!(
-            ranges,
-            vec![(0, 250), (250, 500), (500, 750), (750, u64::MAX)]
+            quantile_ranges(vec![5, 5, 5, 5], 3, 0, 5, u64::MAX),
+            vec![(0, 5), (5, 6)]
         );
+        assert_eq!(quantile_ranges(vec![1, 2], 1, 0, 2, u64::MAX), vec![(0, 3)]);
+        // Sparse rows: one range over 0..1000 would land as wide as it is; cut to 300 apiece.
         assert_eq!(
-            quantile_ranges(vec![5, 5, 5, 5], 3),
-            vec![(0, 5), (5, u64::MAX)]
+            quantile_ranges(vec![0, 1000], 1, 0, 1000, 300),
+            vec![(0, 251), (251, 502), (502, 753), (753, 1001)]
         );
-        assert_eq!(quantile_ranges(vec![1, 2], 1), vec![(0, u64::MAX)]);
+        // The cut applies per quantile range: 10..500 and 500..901 are both over 400.
+        assert_eq!(
+            quantile_ranges(vec![10, 20, 500, 900], 2, 10, 900, 400),
+            vec![(10, 255), (255, 500), (500, 701), (701, 901)]
+        );
     }
 
     /// The whole of P3b: rows arriving in shuffled sort order make wide segments; with the
