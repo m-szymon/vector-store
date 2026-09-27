@@ -358,6 +358,51 @@ re-indexed once. Unmeasured at 10M; the plan for that is the `names_10M_backfill
 `aws_variants_config.yaml`, an index created after the load with the rewrite on against one
 without.
 
+### Measured at 10M names (AWS, 2026-09-27, one run, six index variants)
+
+i4i.xlarge Scylla, c8g.xlarge vector-store (4 cores), 20 rows per page, 10k queries/s offered
+with 64 in flight; the walk figures are the node's own counters per query. Four indexes ingested
+the same load through CDC (all caught up 15 s after it); two were created on the loaded table
+and built by full scan (136 s and 166 s).
+
+| variant | segments / mean span | char2 page 1 | deep page (window 0.5) | char1 | char4 |
+|---|---|---|---|---|---|
+| default policy | 16 / 10.9%, widest 35.8% | 10.0k/s, 57 us | **8.5k/s, 402 us** | 10.0k/s, 76 us | 10.0k/s, 118 us, 40 reads |
+| P3a cap 100k | 100 / 1.0% | 10.0k/s, 91 us | 9.5k/s, 92 us | 9.9k/s, 113 us | 10.0k/s, 134 us, 40 reads |
+| P3a cap 250k | 41 / 3.1%, widest 5.0% | 10.0k/s, 44 us | 9.5k/s, 162 us | 10.0k/s, 51 us | 10.0k/s, 116 us, 40 reads |
+| cap 100k, single-pass verification | 100 / 1.0% | 9.8k/s, 95 us | 9.7k/s, 78 us | 10.0k/s, 117 us | **5.5k/s, 667 us, 223 reads** |
+| backfill, left wide | 23 / 100% | **1.5k/s, 2.6 ms** | **0.9k/s, 4.2 ms** | **1.1k/s, 3.6 ms** | not run |
+| backfill, cap 100k + rewrite | 136 / 2.2% (see below) | 9.9k/s, 75 us | 9.3k/s, 136 us | 10.0k/s, 94 us | not run |
+
+What it settles:
+
+- **Segment balancing (P3a) is what makes deep pages cheap**: 402 us on the default layout
+  against 92 us at the 100k cap, the one phase where the default falls under target. The 250k
+  cap halves the short-keyword walk (44 vs 91 us: fewer segments to consider) at the price of a
+  deep page that scans a bigger segment (162 us). Both meet the target; 100k is the safer choice
+  for paging, 250k for page-1 throughput.
+- **Two-pass verification is worth 4x on long keywords**: same layout, same 207 postings,
+  40 store reads instead of 223, 134 us instead of 667, and 10.0k/s instead of 5.5k/s.
+- **An index built after the load is unusable for ordered queries without the rewrite**: every
+  segment spans the whole range, page 1 scans 300k postings per query and runs at 1.5k/s. With
+  the cap and the rewrite the same build answers at 9.9k/s.
+- **The rewrite's cost at 10M**: the plan of 100 ranges took 5 minutes, one range every 3 s,
+  moving all 10M rows once (a store read and a re-index per row) while the queries were not yet
+  running, and left 126 segments of one cap each. The build itself was no slower for the cap.
+- **The rewrite did not converge on its own on this run.** The drained band's remains were
+  sparse, and a plan over them cut ranges by row count that spanned half the key space; the
+  pieces those rows landed in were as wide as the range, so the index kept planning 5 ranges of
+  ~450k rows and moving ~48k. The queried layout had four such 21k-row pieces at 52.5% (mean
+  span 2.2% all the same) and the loop's CPU under the queries; the numbers above are with it.
+  Fixed after the run by bounding a range to one cap's worth of the key space (commit
+  `a6cfcf7`), not yet measured at 10M.
+- **Index size**: 34.7 bytes per name at the default policy, 35.8 at the 100k cap, 43.0 for
+  the rewritten backfill while its loop kept deleted rows around.
+- **p99 under a fixed offered rate**: the phases that reach exactly 10k/s show p99 of 12 to
+  104 ms; any phase that falls short of the offered rate queues without bound in latte and its
+  p99 runs to seconds. Read capacity from the throughput column, not p99, wherever throughput is
+  under 10k.
+
 ## Open questions and risks
 
 - **The sort-key encoding is written twice**, in `cql_types.rs` and in `index/substring_index.cc`,
