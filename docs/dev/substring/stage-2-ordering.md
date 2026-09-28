@@ -446,12 +446,12 @@ fixed in-process, unmeasured at 10M".
 
 ## Open questions and risks
 
-- **The sort-key encoding is written twice**, in `cql_types.rs` and in `index/substring_index.cc`,
-  and the two must agree bit for bit: the node stores the key that ScyllaDB produces a bound for, so
-  a disagreement would filter on one ordering and sort by another, dropping rows from the middle of
-  a result rather than raising an error. The list of orderable types is duplicated the same way.
-  Both couplings go away if the request carries typed values and the node converts them, which needs
-  a JSON encoding for typed CQL values.
+- ~~**The sort-key encoding is written twice**~~ Closed (stage 4): a range bound travels as a
+  value of the sort column (`min_sort_value` / `max_sort_value`, each a JSON value plus an
+  `inclusive` flag), and the node maps it with the same `to_sort_key` it applies at ingestion.
+  ScyllaDB no longer holds a copy of the encoding. What remains duplicated is the list of
+  orderable types, checked at index creation on both sides; a disagreement there refuses an
+  index rather than misordering one.
 - **Ties are ordered by internal id, not by a CQL order.** The cursor resumes among tied rows
   exactly (stage 4), but the order among them is the node's and can change across a rebuild of
   the index; ordering ties by primary key would need the key per candidate in the walk.

@@ -1329,13 +1329,14 @@ async fn post_index_contains(
                 entry.index().clone(),
                 entry.primary_key_columns().clone(),
                 Arc::clone(entry.table_columns()),
+                entry.options().order_by.as_ref().clone(),
             ))
         } else {
             Err(entry.progress())
         }
     };
 
-    let (substring_sender, primary_key_columns, table_columns) = match check_fts_serving(
+    let (substring_sender, primary_key_columns, table_columns, order_by) = match check_fts_serving(
         serving_or_progress,
         &state.node_state,
         &keyspace,
@@ -1365,6 +1366,20 @@ async fn post_index_contains(
             return (StatusCode::BAD_REQUEST, msg).into_response();
         }
     };
+    let (min_sort_key, max_sort_key) = match sort_bound_keys(
+        request.min_sort_value,
+        request.max_sort_value,
+        order_by.as_ref(),
+        &table_columns,
+    ) {
+        Ok(keys) => keys,
+        Err(err) => {
+            timer.observe_duration();
+            let msg = format!("index.contains request error: invalid sort bound: {err}");
+            debug!("post_index_contains: {msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
     let search_result = substring_sender
         .search(
             index_key,
@@ -1382,8 +1397,8 @@ async fn post_index_contains(
                     httpapi::SortOrder::Asc => SortOrder::Asc,
                 },
                 cursor,
-                min_sort_key: request.min_sort_key,
-                max_sort_key: request.max_sort_key,
+                min_sort_key,
+                max_sort_key,
             },
         )
         .await;
@@ -1430,6 +1445,50 @@ async fn post_index_contains(
             }
         }
     }
+}
+
+/// The sort keys a request's typed bounds stand for, `(min, max)`, in the index's own key space.
+///
+/// A bound is a value of the sort column, so it is read with that column's type and mapped the
+/// way the index maps the column when it ingests a row; there is no second encoding to agree
+/// with. An exclusive bound becomes the inclusive one next to it: sort keys are integers, so the
+/// neighbour is exact, and at the ends of the key space it stays put (no real value reaches
+/// them). An index without a sort column ignores the bounds, as it ignores `order` and `cursor`.
+fn sort_bound_keys(
+    min: Option<httpapi::SortBound>,
+    max: Option<httpapi::SortBound>,
+    order_by: Option<&crate::ColumnName>,
+    table_columns: &HashMap<crate::ColumnName, NativeType>,
+) -> anyhow::Result<(Option<u64>, Option<u64>)> {
+    let Some(order_by) = order_by else {
+        return Ok((None, None));
+    };
+    let native_type = table_columns
+        .get(order_by)
+        .ok_or_else(|| anyhow::anyhow!("unknown sort column '{order_by}'"))?;
+    let key_of = |bound: httpapi::SortBound| -> anyhow::Result<(u64, bool)> {
+        let value = cql_types::from_json(bound.value, native_type).map_err(|err| {
+            anyhow::anyhow!("a bound on '{order_by}' is not a {native_type:?}: {err}")
+        })?;
+        let key = cql_types::to_sort_key(&value)
+            .ok_or_else(|| anyhow::anyhow!("column '{order_by}' cannot be ranged over"))?;
+        Ok((key, bound.inclusive))
+    };
+    let min = min.map(key_of).transpose()?.map(|(key, inclusive)| {
+        if inclusive {
+            key
+        } else {
+            key.saturating_add(1)
+        }
+    });
+    let max = max.map(key_of).transpose()?.map(|(key, inclusive)| {
+        if inclusive {
+            key
+        } else {
+            key.saturating_sub(1)
+        }
+    });
+    Ok((min, max))
 }
 
 /// The wire form of a paging cursor: JSON, carried by the caller as an opaque string. The primary
@@ -1949,6 +2008,90 @@ mod tests {
 
     use super::*;
     use crate::Analyzer;
+
+    fn sort_columns() -> HashMap<crate::ColumnName, NativeType> {
+        [
+            ("registered".into(), NativeType::Timestamp),
+            ("score".into(), NativeType::BigInt),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn bound(value: Value, inclusive: bool) -> httpapi::SortBound {
+        httpapi::SortBound { value, inclusive }
+    }
+
+    /// The bound arrives as the column's own value and leaves as the key the index stores for
+    /// that value: the same mapping ingestion applies, from the same function.
+    #[test]
+    fn a_typed_bound_becomes_the_key_the_index_stores() {
+        let score: crate::ColumnName = "score".into();
+        let (min, max) = sort_bound_keys(
+            Some(bound(Value::from(-5), true)),
+            Some(bound(Value::from(7), true)),
+            Some(&score),
+            &sort_columns(),
+        )
+        .unwrap();
+        assert_eq!(min, cql_types::to_sort_key(&CqlValue::BigInt(-5)));
+        assert_eq!(max, cql_types::to_sort_key(&CqlValue::BigInt(7)));
+    }
+
+    #[test]
+    fn a_timestamp_bound_is_read_as_a_timestamp() {
+        let registered: crate::ColumnName = "registered".into();
+        let (min, _) = sort_bound_keys(
+            Some(bound(Value::from("1970-01-01T00:00:01.000Z"), true)),
+            None,
+            Some(&registered),
+            &sort_columns(),
+        )
+        .unwrap();
+        let second =
+            cql_types::to_sort_key(&CqlValue::Timestamp(scylla::value::CqlTimestamp(1000)));
+        assert_eq!(min, second);
+    }
+
+    /// `> 7` is `>= 8` and `< 7` is `<= 6` in key space, which is exact for integer keys.
+    #[test]
+    fn an_exclusive_bound_moves_to_its_inclusive_neighbour() {
+        let score: crate::ColumnName = "score".into();
+        let (min, max) = sort_bound_keys(
+            Some(bound(Value::from(7), false)),
+            Some(bound(Value::from(7), false)),
+            Some(&score),
+            &sort_columns(),
+        )
+        .unwrap();
+        assert_eq!(min, cql_types::to_sort_key(&CqlValue::BigInt(8)));
+        assert_eq!(max, cql_types::to_sort_key(&CqlValue::BigInt(6)));
+    }
+
+    #[test]
+    fn an_index_without_a_sort_column_ignores_the_bounds() {
+        let (min, max) = sort_bound_keys(
+            Some(bound(Value::from(7), true)),
+            None,
+            None,
+            &sort_columns(),
+        )
+        .unwrap();
+        assert_eq!((min, max), (None, None));
+    }
+
+    #[test]
+    fn a_bound_of_the_wrong_type_is_refused() {
+        let score: crate::ColumnName = "score".into();
+        let err = sort_bound_keys(
+            Some(bound(Value::from("seven"), true)),
+            None,
+            Some(&score),
+            &sort_columns(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("score"), "{err}");
+    }
 
     #[test]
     fn try_from_post_index_ann_filter_conversion_ok() {

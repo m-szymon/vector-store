@@ -1334,7 +1334,7 @@
       },
       "PostIndexContainsRequest": {
         "type": "object",
-        "description": "Request body for substring (infix containment) search.\n\n`min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in the sort\ncolumn's own values: signed types are biased so that negative values sort below positive\nones, and dates and timestamps are their integer representations. A caller turning a CQL value\ninto a bound has to apply the same mapping, which means the two sides have to agree about it\n-- a coupling worth removing by sending typed values instead.",
+        "description": "Request body for substring (infix containment) search.",
         "required": [
           "query"
         ],
@@ -1361,23 +1361,27 @@
             "$ref": "#/components/schemas/Limit",
             "description": "The maximum number of primary keys to return."
           },
-          "max_sort_key": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Restrict the search to rows whose sort key is at most this. Only meaningful for an index created with an `order_by` column; ignored otherwise.",
-            "minimum": 0
+          "max_sort_value": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SortBound",
+                "description": "Restrict the search to rows whose sort value is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+              }
+            ]
           },
-          "min_sort_key": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Restrict the search to rows whose sort key is at least this. Only meaningful for an index created with an `order_by` column; ignored otherwise.",
-            "minimum": 0
+          "min_sort_value": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SortBound",
+                "description": "Restrict the search to rows whose sort value is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+              }
+            ]
           },
           "offset": {
             "type": "integer",
@@ -1483,6 +1487,22 @@
         "type": "number",
         "format": "float",
         "description": "Similarity score between vectors derived from the distance. Higher score means more similar."
+      },
+      "SortBound": {
+        "type": "object",
+        "description": "One end of a range on an ordered index's sort column: a value of that column, in the same\nJSON encoding the response's `primary_keys` use for a value of its type (a number for the\ninteger types, an ISO 8601 string for a date, time or timestamp), and whether the bound\nincludes the value itself. The index turns the value into its own sort key, so a caller\nnever has to know how the index orders.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "inclusive": {
+            "type": "boolean",
+            "description": "Whether rows whose sort value equals `value` are inside the range. Inclusive when absent."
+          },
+          "value": {
+            "description": "The bounding value, encoded as a value of the sort column's CQL type."
+          }
+        }
       },
       "SortOrder": {
         "type": "string",

@@ -559,13 +559,25 @@ pub enum MatchKind {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// One end of a range on an ordered index's sort column: a value of that column, in the same
+/// JSON encoding the response's `primary_keys` use for a value of its type (a number for the
+/// integer types, an ISO 8601 string for a date, time or timestamp), and whether the bound
+/// includes the value itself. The index turns the value into its own sort key, so a caller
+/// never has to know how the index orders.
+pub struct SortBound {
+    /// The bounding value, encoded as a value of the sort column's CQL type.
+    pub value: Value,
+    /// Whether rows whose sort value equals `value` are inside the range. Inclusive when absent.
+    #[serde(default = "sort_bound_inclusive_default")]
+    pub inclusive: bool,
+}
+
+fn sort_bound_inclusive_default() -> bool {
+    true
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Request body for substring (infix containment) search.
-///
-/// `min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in the sort
-/// column's own values: signed types are biased so that negative values sort below positive
-/// ones, and dates and timestamps are their integer representations. A caller turning a CQL value
-/// into a bound has to apply the same mapping, which means the two sides have to agree about it
-/// -- a coupling worth removing by sending typed values instead.
 pub struct PostIndexContainsRequest {
     /// The text every returned row's indexed value must contain.
     pub query: String,
@@ -584,12 +596,12 @@ pub struct PostIndexContainsRequest {
     /// The direction along the sort column; descending when absent. Only meaningful for an index created with an `order_by` column; ignored otherwise.
     #[serde(default)]
     pub order: Option<SortOrder>,
-    /// Restrict the search to rows whose sort key is at least this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    /// Restrict the search to rows whose sort value is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
     #[serde(default)]
-    pub min_sort_key: Option<u64>,
-    /// Restrict the search to rows whose sort key is at most this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    pub min_sort_value: Option<SortBound>,
+    /// Restrict the search to rows whose sort value is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
     #[serde(default)]
-    pub max_sort_key: Option<u64>,
+    pub max_sort_value: Option<SortBound>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
