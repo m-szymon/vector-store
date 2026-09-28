@@ -220,14 +220,20 @@ compaction work.
 
 ## CQL surface
 
-- `ORDER BY <order_by column> DESC` accepted on a routed substring query, rejected otherwise. The
-  existing `verify_ordering_is_allowed` guard, which rejects `ORDER BY` with secondary indexing,
-  needs an exemption for this case.
+- `ORDER BY <order_by column> DESC` or `ASC` accepted on a routed substring query, rejected
+  otherwise. The existing `verify_ordering_is_allowed` guard, which rejects `ORDER BY` with
+  secondary indexing, has an exemption for this case; the direction travels to the node as
+  `order`, and the node walks the complement of every key for `ASC`. (Stage 2 shipped `DESC`
+  only; stage 4 added `ASC`.)
 - A range restriction on the sort column (`AND register_time < ?`) is the primitive; paging is a
   cursor expressed through it. Worth having in its own right, not only as a paging mechanism.
-- The paging state carries the last sort value. It does not carry a primary key, so two rows
-  sharing a sort value are not separated across a page boundary; see the tie gap below. Offset
-  paging is not extended.
+- The paging state carries the node's cursor as an opaque string: the last row's sort key and
+  primary key. Rows sharing a sort key are ordered by internal id and resumed exactly; a cursor
+  whose row is gone resumes at its sort key inclusive. (Stage 2 carried the sort key alone and
+  skipped ties; stage 4 fixed it.) Offset paging is not extended.
+- `LIKE 'keyword%'` and `LIKE '%keyword'` are routed like `'%keyword%'` (stage 4): the node
+  frames every value with a start and an end mark, and an anchored query is containment of the
+  keyword with the mark. The request carries `kind`.
 - `substring_index::check_target` stays as it is; the sort column is an option, not a target.
 
 ## Implementation order
@@ -446,8 +452,9 @@ fixed in-process, unmeasured at 10M".
   a result rather than raising an error. The list of orderable types is duplicated the same way.
   Both couplings go away if the request carries typed values and the node converts them, which needs
   a JSON encoding for typed CQL values.
-- **Ties are not separated across a page boundary.** The cursor is a sort value alone, so rows
-  sharing one are taken or skipped together. A tie-break key in the cursor fixes it.
+- **Ties are ordered by internal id, not by a CQL order.** The cursor resumes among tied rows
+  exactly (stage 4), but the order among them is the node's and can change across a rebuild of
+  the index; ordering ties by primary key would need the key per candidate in the walk.
 
 - **Write amplification under sustained historic rewrites** is unmeasured. One distribution pass is
   characterised; steady state is not, and it is what sizes `max_l0_fraction` on a rewrite-heavy
