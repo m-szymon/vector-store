@@ -14,6 +14,18 @@ use crate::vs_index::CountR;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+/// Where in the value the keyword has to occur.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MatchKind {
+    /// Anywhere: `LIKE '%keyword%'`.
+    #[default]
+    Contains,
+    /// At the start: `LIKE 'keyword%'`.
+    Prefix,
+    /// At the end: `LIKE '%keyword'`.
+    Suffix,
+}
+
 /// Which way an ordered search walks the sort column.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SortOrder {
@@ -77,6 +89,7 @@ pub(crate) enum SubstringIndex {
     Search {
         index_key: IndexKey,
         query: String,
+        kind: MatchKind,
         limit: Limit,
         /// Number of matching rows to skip before collecting `limit` of them. Ignored by an
         /// ordered search, which pages by cursor instead.
@@ -110,6 +123,7 @@ pub(crate) trait SubstringIndexExt {
         &self,
         index_key: IndexKey,
         query: String,
+        kind: MatchKind,
         limit: Limit,
         offset: usize,
         window: SearchWindow,
@@ -158,6 +172,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         &self,
         index_key: IndexKey,
         query: String,
+        kind: MatchKind,
         limit: Limit,
         offset: usize,
         window: SearchWindow,
@@ -166,6 +181,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         self.send(SubstringIndex::Search {
             index_key,
             query,
+            kind,
             limit,
             offset,
             window,

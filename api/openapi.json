@@ -876,6 +876,15 @@
         "type": "integer",
         "format": "int32"
       },
+      "MatchKind": {
+        "type": "string",
+        "description": "Where in the indexed value the query has to occur.",
+        "enum": [
+          "contains",
+          "prefix",
+          "suffix"
+        ]
+      },
       "NodeStatus": {
         "type": "string",
         "description": "Operational status of the Vector Store indexing service.",
@@ -1336,6 +1345,17 @@
               "null"
             ],
             "description": "Resume an ordered search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's sort key and primary key). Only meaningful for an index created with an `order_by` column; ignored otherwise."
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MatchKind",
+                "description": "Where the text has to occur; anywhere when absent."
+              }
+            ]
           },
           "limit": {
             "$ref": "#/components/schemas/Limit",

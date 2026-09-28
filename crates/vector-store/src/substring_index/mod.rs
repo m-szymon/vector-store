@@ -13,6 +13,7 @@ use crate::memory::Memory;
 use crate::metrics::Metrics;
 use crate::worker::Worker;
 pub(crate) use actor::Cursor;
+pub(crate) use actor::MatchKind;
 pub(crate) use actor::SearchWindow;
 pub(crate) use actor::SortOrder;
 pub(crate) use actor::SubstringIndex;

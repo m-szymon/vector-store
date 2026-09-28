@@ -32,6 +32,7 @@ use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
 use crate::perf;
 use crate::substring_index::Cursor;
+use crate::substring_index::MatchKind;
 use crate::substring_index::SearchWindow;
 use crate::substring_index::SortOrder;
 use crate::substring_index::SubstringIndex;
@@ -1368,6 +1369,11 @@ async fn post_index_contains(
         .search(
             index_key,
             request.query,
+            match request.kind.unwrap_or_default() {
+                httpapi::MatchKind::Contains => MatchKind::Contains,
+                httpapi::MatchKind::Prefix => MatchKind::Prefix,
+                httpapi::MatchKind::Suffix => MatchKind::Suffix,
+            },
             request.limit.into(),
             request.offset,
             SearchWindow {

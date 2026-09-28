@@ -118,6 +118,7 @@ use crate::worker::Worker;
 use crate::worker::WorkerExt;
 
 use super::actor::Cursor;
+use super::actor::MatchKind;
 use super::actor::SearchWindow;
 use super::actor::SortOrder;
 use super::actor::SubstringIndex;
@@ -167,6 +168,37 @@ impl SubstringIndexFactory for TantivySubstringIndexFactory {
 const TEXT_FIELD: &str = "text";
 const SORT_FIELD: &str = "sort_key";
 const TOKENIZER_NAME: &str = "substring_ngram";
+/// Every value is indexed and stored between these two marks, so that a prefix query is the
+/// containment of `START + keyword`, a suffix query of `keyword + END`, and both take the very
+/// same walk as a containment query: the marks are ordinary characters to the tokenizer and to
+/// the verification. Two grams per value, a few percent of the index. A value holding one of the
+/// marks itself would match a prefix or suffix query wrongly; they are C0 control characters,
+/// which nicknames do not carry.
+const VALUE_START: char = '\u{2}';
+const VALUE_END: char = '\u{3}';
+
+/// The form a value is indexed and stored in.
+fn framed(normalized: &str) -> String {
+    format!("{VALUE_START}{normalized}{VALUE_END}")
+}
+
+/// A stored value without its frame: what a re-indexed row is built from.
+fn unframed(stored: &str) -> &str {
+    stored
+        .strip_prefix(VALUE_START)
+        .unwrap_or(stored)
+        .strip_suffix(VALUE_END)
+        .unwrap_or(stored)
+}
+
+/// The text a query of `kind` for `normalized` has to find in a framed value.
+fn pattern_of(kind: MatchKind, normalized: &str) -> String {
+    match kind {
+        MatchKind::Contains => normalized.to_string(),
+        MatchKind::Prefix => format!("{VALUE_START}{normalized}"),
+        MatchKind::Suffix => format!("{normalized}{VALUE_END}"),
+    }
+}
 /// Values are short, so a single cached store block per segment covers consecutive lookups.
 const STORE_CACHE_BLOCKS: usize = 1;
 
@@ -705,7 +737,7 @@ impl TantivyBackend for SubstringBackend {
         let normalized = normalize(row.text, self.options.case_sensitive);
         let mut doc = TantivyDocument::new();
         doc.add_u64(primary_id_field, u64::from(primary_id));
-        doc.add_text(text_field, normalized.as_ref());
+        doc.add_text(text_field, framed(normalized.as_ref()));
         if self.orders_results() {
             // A row whose sort column is null still belongs in the index; it just sorts lowest,
             // which for "newest first" puts it last. Dropping it would make the index disagree
@@ -921,6 +953,7 @@ fn rewrite_next_range(state: &SubstringIndexState, key: &IndexKey) -> anyhow::Re
             let text = doc
                 .get_first(text_field)
                 .and_then(|value| value.as_str())
+                .map(unframed)
                 .unwrap_or_default();
             let new_doc = backend.create_doc(
                 &state.schema,
@@ -1520,16 +1553,24 @@ fn handle_substring_stats(state: &SubstringIndexState) -> SubstringStatsR {
     })
 }
 
+// One argument per thing the request says; bundling them would only move the count elsewhere.
+#[allow(clippy::too_many_arguments)]
 fn handle_search(
     state: &SubstringIndexState,
     table: &RwLock<impl TableSearch>,
     index_key: &IndexKey,
     query: &str,
+    kind: MatchKind,
     limit: Limit,
     offset: usize,
     window: SearchWindow,
 ) -> SubstringSearchR {
-    let normalized = normalize(query, state.backend.options.case_sensitive);
+    // A prefix or suffix query is a containment query for the keyword with the value's frame
+    // mark on the anchored side, so from here on nothing knows the kind.
+    let normalized = pattern_of(
+        kind,
+        &normalize(query, state.backend.options.case_sensitive),
+    );
     let limit: usize = (*limit.as_ref()).into();
     let (primary_ids, resume_at) = if state.backend.orders_results() {
         // The cursor names its row by primary key; the walk breaks ties by primary id, so the
@@ -1699,6 +1740,7 @@ pub(crate) fn new(
                         SubstringIndex::Search {
                             index_key,
                             query,
+                            kind,
                             limit,
                             offset,
                             window,
@@ -1719,6 +1761,7 @@ pub(crate) fn new(
                                         table.as_ref(),
                                         &index_key,
                                         &query,
+                                        kind,
                                         limit,
                                         offset,
                                         window,
@@ -1970,7 +2013,14 @@ mod tests {
         window: SearchWindow,
     ) -> (Vec<i64>, Option<Cursor>) {
         let page = sender
-            .search(make_index_key(), query.into(), limit(limit_n), 0, window)
+            .search(
+                make_index_key(),
+                query.into(),
+                MatchKind::Contains,
+                limit(limit_n),
+                0,
+                window,
+            )
             .await
             .unwrap();
         let ids = page
@@ -2030,6 +2080,7 @@ mod tests {
             .search(
                 make_index_key(),
                 query.into(),
+                MatchKind::Contains,
                 limit(limit_n),
                 offset,
                 SearchWindow::default(),
@@ -2216,6 +2267,7 @@ mod tests {
             .search(
                 make_index_key(),
                 "".into(),
+                MatchKind::Contains,
                 limit(10),
                 0,
                 SearchWindow::default(),
@@ -2237,6 +2289,7 @@ mod tests {
             .search(
                 make_index_key(),
                 "宫".into(),
+                MatchKind::Contains,
                 limit(10),
                 0,
                 SearchWindow::default(),
@@ -2879,8 +2932,11 @@ mod tests {
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
     async fn verifying_in_order_reads_every_candidate_that_beats_the_page() {
+        // The cap folds the pieces a commit's writer threads leave into one segment, which is
+        // what the count below assumes: over several segments the walk prunes most of them.
         let sender = make_sender_with_options(IndexOptionsSubstring {
             verify_in_order: VerifyInOrder::from(true),
+            segment_max_docs: "1000".parse().unwrap(),
             ..ordered_options()
         });
         let mut acks = Vec::new();
@@ -2899,6 +2955,18 @@ mod tests {
         }
         for mut ack in acks {
             ack.recv().await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sender
+            .stats(make_index_key())
+            .await
+            .unwrap()
+            .tantivy
+            .segment_count
+            > 1
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         let (ids, _) = search_ordered(&sender, "abcd", 5, SearchWindow::default()).await;
@@ -3301,5 +3369,163 @@ mod tests {
         // Past max_gram too: the verified path orders the same way.
         let (ids, _) = search_ordered(&sender, "将军来了", 10, ascending()).await;
         assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    }
+
+    async fn search_kind(
+        sender: &mpsc::Sender<SubstringIndex>,
+        query: &str,
+        kind: MatchKind,
+    ) -> Vec<i64> {
+        let mut ids: Vec<i64> = sender
+            .search(
+                make_index_key(),
+                query.into(),
+                kind,
+                limit(100),
+                0,
+                SearchWindow::default(),
+            )
+            .await
+            .unwrap()
+            .primary_keys
+            .into_iter()
+            .map(|pk| match pk.get(0).unwrap() {
+                CqlValue::BigInt(id) => id,
+                other => panic!("unexpected primary key value {other:?}"),
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A prefix or a suffix query is answered by the same index: the keyword anchored by the
+    /// value's frame. Containment is unchanged, one-character anchors work, and a keyword that is
+    /// the whole value matches on both sides.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn prefix_and_suffix_queries_anchor_the_keyword() {
+        let sender = make_sender();
+        add_docs(&sender, NICKNAMES).await;
+
+        assert_eq!(
+            search_kind(&sender, "将军", MatchKind::Contains).await,
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            search_kind(&sender, "将军", MatchKind::Prefix).await,
+            vec![3]
+        );
+        assert_eq!(
+            search_kind(&sender, "将军", MatchKind::Suffix).await,
+            vec![1, 2]
+        );
+        // Single characters, which the index answers from a two-character gram with the mark.
+        assert_eq!(search_kind(&sender, "南", MatchKind::Prefix).await, vec![6]);
+        assert_eq!(search_kind(&sender, "南", MatchKind::Suffix).await, vec![8]);
+        assert_eq!(
+            search_kind(&sender, "军", MatchKind::Prefix).await,
+            Vec::<i64>::new()
+        );
+        // The whole value is both its prefix and its suffix.
+        assert_eq!(
+            search_kind(&sender, "元帅", MatchKind::Prefix).await,
+            vec![5]
+        );
+        assert_eq!(
+            search_kind(&sender, "元帅", MatchKind::Suffix).await,
+            vec![5]
+        );
+        // Past max_gram the verification anchors as well.
+        assert_eq!(
+            search_kind(&sender, "将军来了", MatchKind::Prefix).await,
+            vec![3]
+        );
+        assert_eq!(
+            search_kind(&sender, "军来了", MatchKind::Prefix).await,
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            search_kind(&sender, "南宫粉丝团", MatchKind::Suffix).await,
+            vec![7]
+        );
+    }
+
+    /// An ordered index anchors the same way, and pages through the anchored matches.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn anchored_queries_are_ordered_and_paged_too() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let page = sender
+            .search(
+                make_index_key(),
+                "将军".into(),
+                MatchKind::Suffix,
+                limit(1),
+                0,
+                SearchWindow::default(),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<i64> = page
+            .primary_keys
+            .iter()
+            .map(|pk| match pk.get(0).unwrap() {
+                CqlValue::BigInt(id) => id,
+                other => panic!("unexpected primary key value {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![2]);
+        let cursor = page.next_cursor.expect("a full page leaves a cursor");
+        let page = sender
+            .search(
+                make_index_key(),
+                "将军".into(),
+                MatchKind::Suffix,
+                limit(1),
+                0,
+                resume(SortOrder::Desc, cursor),
+            )
+            .await
+            .unwrap();
+        let ids: Vec<i64> = page
+            .primary_keys
+            .iter()
+            .map(|pk| match pk.get(0).unwrap() {
+                CqlValue::BigInt(id) => id,
+                other => panic!("unexpected primary key value {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1]);
+        // A filled page always leaves a cursor; the page after it is empty and leaves none.
+        let cursor = page.next_cursor.expect("a full page leaves a cursor");
+        let page = sender
+            .search(
+                make_index_key(),
+                "将军".into(),
+                MatchKind::Suffix,
+                limit(1),
+                0,
+                resume(SortOrder::Desc, cursor),
+            )
+            .await
+            .unwrap();
+        assert!(page.primary_keys.is_empty());
+        assert_eq!(page.next_cursor, None);
+    }
+
+    /// The frame is stripped before a row is re-indexed by the rewrite; otherwise every pass
+    /// would add another pair of marks.
+    #[test]
+    fn a_stored_value_is_unframed_once() {
+        assert_eq!(framed("abc"), "\u{2}abc\u{3}");
+        assert_eq!(unframed("\u{2}abc\u{3}"), "abc");
+        assert_eq!(unframed("abc"), "abc");
+        assert_eq!(pattern_of(MatchKind::Prefix, "ab"), "\u{2}ab");
+        assert_eq!(pattern_of(MatchKind::Suffix, "ab"), "ab\u{3}");
+        assert_eq!(pattern_of(MatchKind::Contains, "ab"), "ab");
     }
 }

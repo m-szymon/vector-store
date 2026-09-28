@@ -535,6 +535,29 @@ pub enum SortOrder {
     Asc,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Deserialize,
+    serde::Serialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+/// Where in the indexed value the query has to occur.
+pub enum MatchKind {
+    /// Anywhere in the value: `LIKE '%keyword%'`.
+    #[default]
+    Contains,
+    /// At the start of the value: `LIKE 'keyword%'`.
+    Prefix,
+    /// At the end of the value: `LIKE '%keyword'`.
+    Suffix,
+}
+
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Request body for substring (infix containment) search.
 ///
@@ -546,6 +569,9 @@ pub enum SortOrder {
 pub struct PostIndexContainsRequest {
     /// The text every returned row's indexed value must contain.
     pub query: String,
+    /// Where the text has to occur; anywhere when absent.
+    #[serde(default)]
+    pub kind: Option<MatchKind>,
     /// The maximum number of primary keys to return.
     #[serde(default)]
     pub limit: Limit,

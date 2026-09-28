@@ -193,6 +193,7 @@ impl HttpClient {
     ) -> reqwest::Response {
         let request = PostIndexContainsRequest {
             query,
+            kind: None,
             limit,
             offset,
             cursor,
