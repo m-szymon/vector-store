@@ -403,6 +403,41 @@ What it settles:
   p99 runs to seconds. Read capacity from the throughput column, not p99, wherever throughput is
   under 10k.
 
+### Measured at 10M names with names up to 32 characters (AWS, 2026-09-28)
+
+The same cluster shape and the 100k cap, on a corpus a tenth of whose names are 11 to 32
+characters (`generate_local_dataset.py --long-names`), with keyword sets of 8, 16 and 32
+characters each cut from a different long name, so each matches that name and rarely another.
+Ingestion caught up 15 s after the load as before; 49.8 bytes per name against 35.8.
+
+| keyword | queries/s | walk us | segments opened | postings | store reads |
+|---|---|---|---|---|---|
+| 2 chars, page 1 | 10.0k | 92 | 1 | 4849 | 20 |
+| 2 chars, deep page | 10.0k | 112 | 1 | 4841 | 20 |
+| 1 char | 10.0k | 119 | 1 | 8017 | 20 |
+| 4 chars | 9.8k | 158 | 1 | 469 | 40 |
+| 8 chars | **5.0k** | **750** | 100 | 3 | 6 |
+| 16 chars | **2.3k** | **1688** | 100 | 1 | 2 |
+| 32 chars | **1.1k** | **3641** | 100 | 1 | 2 |
+| 8 chars, deep page | 9.2k | 370 | 50 | 2 | 4 |
+
+The design's argument that long keywords get cheaper (fewer candidates to verify) holds for the
+candidates and misses the segments: a keyword matching fewer names than a page never fills the
+page, so the walk opens every segment the bounds allow, and in each one looks up all of the
+keyword's grams and builds the intersection before finding nothing. The cost is opened segments
+times grams, about 120 us per gram over 100 segments, linear in keyword length, and it is the
+price of the cap: the same keyword on the 16-segment default layout would cost a sixth.
+
+The fix, not yet built: a per-index map from each gram to the set of segments containing it,
+rebuilt on every reload from the segments' term dictionaries (about a million grams times 100
+bits, a few megabytes, milliseconds to build). A query past `max_gram` intersects its grams'
+sets first and opens only the segments that survive: at most as many as the keyword has
+matches. The short-keyword path, which fills a page from the first segment, is untouched.
+
+The same run was to re-measure the rewrite with ranges bounded to a cap's width; it was lost to a
+network outage on the runner's side during the second load, so that stays at "reproduced and
+fixed in-process, unmeasured at 10M".
+
 ## Open questions and risks
 
 - **The sort-key encoding is written twice**, in `cql_types.rs` and in `index/substring_index.cc`,
@@ -427,5 +462,8 @@ What it settles:
 - **Nothing is measured above 2M rows.** The 10M figures here are extrapolations, and the verified
   path is known to degrade with corpus size (the same 100,000 matches cost 54 ms at 500k names and
   94 ms at 2M, as the document store outgrows cache).
+- **A rare keyword opens every segment the cap made.** Measured above: 5.0k/s at 8 characters,
+  1.1k/s at 32, against the 10k target. The gram-to-segments map above is the answer; without
+  it the cap trades long-keyword throughput for deep-page cost.
 - **Replacing the merge policy is load-bearing.** Getting it wrong does not fail loudly; it silently
   widens segments until pruning stops working.
