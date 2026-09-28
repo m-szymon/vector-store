@@ -234,6 +234,10 @@ compaction work.
 - `LIKE 'keyword%'` and `LIKE '%keyword'` are routed like `'%keyword%'` (stage 4): the node
   frames every value with a start and an end mark, and an anchored query is containment of the
   keyword with the mark. The request carries `kind`.
+- A keyword past `max_gram` on a case-sensitive index is checked by ScyllaDB, not the node
+  (stage 5): the request says `verify: false`, the node answers with the candidates in sort
+  order and `verified: false`, and the coordinator applies the pattern to the value it reads
+  with the row. See "Stage 5" below.
 - `substring_index::check_target` stays as it is; the sort column is an option, not a target.
 
 ## Implementation order
@@ -443,6 +447,49 @@ matches. The short-keyword path, which fills a page from the first segment, is u
 The same run was to re-measure the rewrite with ranges bounded to a cap's width; it was lost to a
 network outage on the runner's side during the second load, so that stays at "reproduced and
 fixed in-process, unmeasured at 10M".
+
+## Stage 5: verification on the coordinator (branch `substring-index-stage5`)
+
+Past `max_gram` the grams nominate candidates and the stored text decides, at a document-store
+read per candidate that beats the page; two-pass verification (stage 2) keeps those reads to
+the page's worth plus the false positives above it. ScyllaDB reads every returned row from the
+base table anyway, so the check can happen there at no extra read.
+
+How it works:
+
+- ScyllaDB sends `verify: false` when the pattern's framed length (characters, plus one for the
+  anchor mark of a prefix or suffix) is past the index's `max_gram` and the index is
+  case-sensitive. The walk then takes the candidates as exact matches -- the cheap branch that a
+  keyword within `max_gram` already uses -- and the page says `verified: false`.
+- The coordinator fetches the target column with the row (a non-serialized selection column, so
+  it does not reach the client) and drops the rows that do not hold the pattern, byte for byte,
+  anchored as the kind says. That is the node's own test for a case-sensitive index.
+- A page that comes back short is topped up from the node's cursor up to three times, then
+  handed over short with a cursor; the LIMIT counts rows returned. A short page is a correct
+  page to a paging client.
+- The node's word is final: a page it reports verified (or an older node that never heard of
+  the flag) is taken as it is.
+
+Why only case-sensitive indexes: a case-insensitive index lowercases values and keywords with
+Rust's Unicode tables, which ScyllaDB does not share. Folding on the coordinator with different
+tables would be the sort-key coupling all over again, silent on the exotic code points where
+the two disagree. A case-insensitive index therefore keeps verifying on the node. A search box
+over CJK names has nothing to fold, so such an index can be created case-sensitive at no cost
+to it; a Latin search box that wants case folding keeps today's cost.
+
+What it changes and what it does not:
+
+- The document-store reads leave the query path for long keywords on case-sensitive indexes;
+  the page is resolved from the store (or the FAST id column) as before.
+- The index size does not change: the stored text is still there for the rewrite and for
+  case-insensitive indexes. Dropping it is the second step, once this one is measured.
+- False candidates cost a base-table read each on the coordinator instead of a store read on
+  the node, and a page with many of them costs extra node round trips, bounded as above.
+
+Not measured yet. The benchmark's indexes are created `case_sensitive: false` (what a search
+box wants), so a run that measures this sets `case_sensitive: 'true'` in the test case's
+`latte_schema_parameters`; the 8, 16 and 32-character keyword sets of `aws_followup_config.yaml`
+are the ones that exercise it.
 
 ## Open questions and risks
 
