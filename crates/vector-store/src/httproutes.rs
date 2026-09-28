@@ -1400,6 +1400,7 @@ async fn post_index_contains(
                 min_sort_key,
                 max_sort_key,
             },
+            request.verify.unwrap_or(true),
         )
         .await;
 
@@ -1439,6 +1440,7 @@ async fn post_index_contains(
                     response::Json(httpapi::PostIndexContainsResponse {
                         primary_keys,
                         next_cursor,
+                        verified: page.verified,
                     }),
                 )
                     .into_response(),

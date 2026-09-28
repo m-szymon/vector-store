@@ -1402,6 +1402,13 @@
           "query": {
             "type": "string",
             "description": "The text every returned row's indexed value must contain."
+          },
+          "verify": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the index checks each candidate for a keyword longer than `max_gram` against the stored value before returning it. `true` (the default) returns only rows that match. `false` returns the rows whose value holds every gram of the keyword, which is a superset of the matches, and the response says so in `verified`; a caller that reads the rows anyway can apply the pattern itself and spare the index its document-store reads. A keyword within `max_gram` is exact either way."
           }
         }
       },
@@ -1430,6 +1437,10 @@
               "type": "string",
               "description": "Name of the column in a db table."
             }
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Whether every returned row is known to match. `false` only when the request asked for `verify: false` and the keyword was longer than `max_gram`: the rows are then candidates holding every gram, and the caller has to apply the pattern to the value."
           }
         }
       },

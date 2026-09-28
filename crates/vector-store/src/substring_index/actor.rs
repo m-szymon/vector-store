@@ -65,6 +65,9 @@ pub(crate) struct SubstringPage {
     /// Where the next page starts, for an ordered search that filled this one. `None` means there
     /// is nothing more to read, or the index is unordered and does not page this way.
     pub(crate) next_cursor: Option<Cursor>,
+    /// Whether every row is known to match. `false` when the search asked not to verify and the
+    /// keyword was past `max_gram`: the rows then hold every gram of it, and the caller checks.
+    pub(crate) verified: bool,
 }
 
 pub(crate) type SubstringSearchR = anyhow::Result<SubstringPage>;
@@ -97,6 +100,9 @@ pub(crate) enum SubstringIndex {
         /// The direction, the previous page's cursor and the range restriction. Ignored by an
         /// unordered index.
         window: SearchWindow,
+        /// Whether candidates for a keyword past `max_gram` are checked against the stored
+        /// value here. `false` hands them back as they are, flagged, for the caller to check.
+        verify: bool,
         tx: oneshot::Sender<SubstringSearchR>,
     },
     Stats {
@@ -119,6 +125,7 @@ pub(crate) trait SubstringIndexExt {
         in_progress: AsyncInProgress,
     ) -> anyhow::Result<()>;
     async fn count(&self, index_key: IndexKey) -> CountR;
+    #[allow(clippy::too_many_arguments)]
     async fn search(
         &self,
         index_key: IndexKey,
@@ -127,6 +134,7 @@ pub(crate) trait SubstringIndexExt {
         limit: Limit,
         offset: usize,
         window: SearchWindow,
+        verify: bool,
     ) -> SubstringSearchR;
     async fn stats(&self, index_key: IndexKey) -> SubstringStatsR;
 }
@@ -168,6 +176,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         rx.await?
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn search(
         &self,
         index_key: IndexKey,
@@ -176,6 +185,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         limit: Limit,
         offset: usize,
         window: SearchWindow,
+        verify: bool,
     ) -> SubstringSearchR {
         let (tx, rx) = oneshot::channel();
         self.send(SubstringIndex::Search {
@@ -185,6 +195,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
             limit,
             offset,
             window,
+            verify,
             tx,
         })
         .await?;

@@ -1196,21 +1196,28 @@ impl SortWindow {
 /// of its last row for the caller to turn into a cursor.
 /// The page's primary ids and, when the page filled, the real `(sort key, primary id)` of its
 /// last row.
-type OrderedPage = (Vec<PrimaryId>, Option<(u64, PrimaryId)>);
+/// The rows of one ordered page, where the next page resumes, and whether the rows are verified
+/// matches rather than candidates.
+type OrderedPage = (Vec<PrimaryId>, Option<(u64, PrimaryId)>, bool);
 
 fn collect_matches_ordered(
     state: &SubstringIndexState,
     normalized: &str,
     limit: usize,
     window: SortWindow,
+    verify: bool,
 ) -> anyhow::Result<OrderedPage> {
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
 
-    let (query, needs_verification) = match build_query(state, normalized)? {
+    let (query, has_candidates) = match build_query(state, normalized)? {
         SubstringQuery::Exact(query) => (query, false),
         SubstringQuery::Candidates(query) => (query, true),
     };
+    // A caller that declines verification takes the candidates as they are: the walk then
+    // treats them as exact matches, which is the cheap branch below, and the page says so.
+    let needs_verification = has_candidates && verify;
+    let verified = !has_candidates || verify;
 
     let searcher = state.reader.searcher();
     let weight = query
@@ -1442,7 +1449,7 @@ fn collect_matches_ordered(
             page_resolve,
         },
     );
-    Ok((ids, resume_at))
+    Ok((ids, resume_at, verified))
 }
 
 fn collect_matches(
@@ -1450,14 +1457,19 @@ fn collect_matches(
     normalized: &str,
     limit: usize,
     offset: usize,
-) -> anyhow::Result<Vec<PrimaryId>> {
+    verify: bool,
+) -> anyhow::Result<(Vec<PrimaryId>, bool)> {
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
 
-    let (query, needs_verification) = match build_query(state, normalized)? {
+    let (query, has_candidates) = match build_query(state, normalized)? {
         SubstringQuery::Exact(query) => (query, false),
         SubstringQuery::Candidates(query) => (query, true),
     };
+    // The store is read here anyway, for the primary id, so declining verification saves the
+    // text comparison only; it exists so that both walks answer the request the same way.
+    let needs_verification = has_candidates && verify;
+    let verified = !has_candidates || verify;
 
     let searcher = state.reader.searcher();
     let weight = query
@@ -1520,7 +1532,7 @@ fn collect_matches(
             ..WalkTimes::default()
         },
     );
-    Ok(matches)
+    Ok((matches, verified))
 }
 
 fn handle_substring_stats(state: &SubstringIndexState) -> SubstringStatsR {
@@ -1564,6 +1576,7 @@ fn handle_search(
     limit: Limit,
     offset: usize,
     window: SearchWindow,
+    verify: bool,
 ) -> SubstringSearchR {
     // A prefix or suffix query is a containment query for the keyword with the value's frame
     // mark on the anchored side, so from here on nothing knows the kind.
@@ -1572,7 +1585,7 @@ fn handle_search(
         &normalize(query, state.backend.options.case_sensitive),
     );
     let limit: usize = (*limit.as_ref()).into();
-    let (primary_ids, resume_at) = if state.backend.orders_results() {
+    let (primary_ids, resume_at, verified) = if state.backend.orders_results() {
         // The cursor names its row by primary key; the walk breaks ties by primary id, so the
         // key is looked up first. A key the table no longer knows (the row was deleted since)
         // resumes at TIE_UNKNOWN, which takes the rows tied with it again rather than skip any.
@@ -1598,9 +1611,10 @@ fn handle_search(
             window.min_sort_key,
             window.max_sort_key,
         );
-        collect_matches_ordered(state, &normalized, limit, sort_window)?
+        collect_matches_ordered(state, &normalized, limit, sort_window, verify)?
     } else {
-        (collect_matches(state, &normalized, limit, offset)?, None)
+        let (ids, verified) = collect_matches(state, &normalized, limit, offset, verify)?;
+        (ids, None, verified)
     };
 
     let table = table.read().unwrap();
@@ -1618,6 +1632,7 @@ fn handle_search(
             sort_key,
             primary_key: table.primary_key(partition_id, primary_id),
         }),
+        verified,
     })
 }
 
@@ -1744,12 +1759,14 @@ pub(crate) fn new(
                             limit,
                             offset,
                             window,
+                            verify,
                             tx,
                         } => {
                             let Some(state) = get_state(&states, table.as_ref(), &index_key) else {
                                 _ = tx.send(Ok(SubstringPage {
                                     primary_keys: vec![],
                                     next_cursor: None,
+                                    verified: true,
                                 }));
                                 continue;
                             };
@@ -1765,6 +1782,7 @@ pub(crate) fn new(
                                         limit,
                                         offset,
                                         window,
+                                        verify,
                                     );
                                     _ = tx.send(result);
                                 })
@@ -2020,6 +2038,7 @@ mod tests {
                 limit(limit_n),
                 0,
                 window,
+                true,
             )
             .await
             .unwrap();
@@ -2084,6 +2103,7 @@ mod tests {
                 limit(limit_n),
                 offset,
                 SearchWindow::default(),
+                true,
             )
             .await
             .unwrap()
@@ -2271,6 +2291,7 @@ mod tests {
                 limit(10),
                 0,
                 SearchWindow::default(),
+                true,
             )
             .await
             .expect_err("an empty query cannot be answered");
@@ -2293,6 +2314,7 @@ mod tests {
                 limit(10),
                 0,
                 SearchWindow::default(),
+                true,
             )
             .await
             .expect_err("a one-character query cannot be answered by a min_gram=2 index");
@@ -3095,6 +3117,100 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
+    /// A page the caller asked not to verify: the walk hands back every candidate that beats the
+    /// page, flagged as unverified, and reads the store only to resolve the page's ids.
+    async fn search_unverified(
+        sender: &mpsc::Sender<SubstringIndex>,
+        query: &str,
+        limit_n: usize,
+        window: SearchWindow,
+    ) -> SubstringPage {
+        sender
+            .search(
+                make_index_key(),
+                query.into(),
+                MatchKind::Contains,
+                limit(limit_n),
+                0,
+                window,
+                false,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn ids_of(page: &SubstringPage) -> Vec<i64> {
+        page.primary_keys
+            .iter()
+            .map(|key| match key.get(0).unwrap() {
+                CqlValue::BigInt(id) => id,
+                other => panic!("unexpected primary key {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Declining verification on a keyword past `max_gram` returns the candidates: the rows
+    /// holding every gram, decoys included, in sort order, and the page says it is unverified.
+    /// The store is read for the page's ids only, not to check any text.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_unverified_page_returns_the_candidates_in_order_and_says_so() {
+        let sender = make_sender_with_options(IndexOptionsSubstring {
+            order_by: "sort_col".parse().unwrap(),
+            ..options(1, 3, true)
+        });
+        // Decoys hold every gram of "abcde" without containing it; row 21 is the one match.
+        for id in 1..=20u64 {
+            add_doc(&sender, id, &format!("abcd{id}cde")).await;
+        }
+        add_doc(&sender, 21, "xxabcdexx").await;
+
+        let page = search_unverified(&sender, "abcde", 5, SearchWindow::default()).await;
+        assert!(!page.verified);
+        assert_eq!(ids_of(&page), vec![21, 20, 19, 18, 17]);
+        assert!(page.next_cursor.is_some(), "a full page leaves a cursor");
+        let walk = sender.stats(make_index_key()).await.unwrap().walk;
+        assert_eq!(walk.store_reads, 5, "only the page is resolved: {walk:?}");
+
+        // The same request verified returns the one match, and says so.
+        let (ids, _) = search_ordered(&sender, "abcde", 5, SearchWindow::default()).await;
+        assert_eq!(ids, vec![21]);
+    }
+
+    /// A keyword within `max_gram` is exact whatever the caller asked, so the page is verified.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_exact_keyword_is_verified_even_when_not_asked_to() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let page = search_unverified(&sender, "将军", 10, SearchWindow::default()).await;
+        assert!(page.verified);
+        assert_eq!(ids_of(&page), vec![3, 2, 1]);
+    }
+
+    /// The unordered walk answers the flag the same way: candidates, flagged.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_unordered_unverified_page_is_flagged_too() {
+        let sender = make_sender();
+        for id in 1..=3u64 {
+            add_doc(&sender, id, &format!("abcd{id}cde")).await;
+        }
+        add_doc(&sender, 4, "xxabcdexx").await;
+
+        let page = search_unverified(&sender, "abcde", 10, SearchWindow::default()).await;
+        assert!(!page.verified);
+        let mut ids = ids_of(&page);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        let verified = search_unverified(&sender, "abc", 10, SearchWindow::default()).await;
+        assert!(verified.verified);
+    }
+
     /// A keyword longer than `max_gram` takes the verification path, where the sort key is read
     /// before the document store rather than after. The answer must be the same.
     #[rstest]
@@ -3384,6 +3500,7 @@ mod tests {
                 limit(100),
                 0,
                 SearchWindow::default(),
+                true,
             )
             .await
             .unwrap()
@@ -3467,6 +3584,7 @@ mod tests {
                 limit(1),
                 0,
                 SearchWindow::default(),
+                true,
             )
             .await
             .unwrap();
@@ -3488,6 +3606,7 @@ mod tests {
                 limit(1),
                 0,
                 resume(SortOrder::Desc, cursor),
+                true,
             )
             .await
             .unwrap();
@@ -3510,6 +3629,7 @@ mod tests {
                 limit(1),
                 0,
                 resume(SortOrder::Desc, cursor),
+                true,
             )
             .await
             .unwrap();

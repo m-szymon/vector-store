@@ -602,6 +602,9 @@ pub struct PostIndexContainsRequest {
     /// Restrict the search to rows whose sort value is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
     #[serde(default)]
     pub max_sort_value: Option<SortBound>,
+    /// Whether the index checks each candidate for a keyword longer than `max_gram` against the stored value before returning it. `true` (the default) returns only rows that match. `false` returns the rows whose value holds every gram of the keyword, which is a superset of the matches, and the response says so in `verified`; a caller that reads the rows anyway can apply the pattern itself and spare the index its document-store reads. A keyword within `max_gram` is exact either way.
+    #[serde(default)]
+    pub verify: Option<bool>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
@@ -612,6 +615,13 @@ pub struct PostIndexContainsResponse {
     /// Pass as the next request's `cursor`, unchanged, to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Whether every returned row is known to match. `false` only when the request asked for `verify: false` and the keyword was longer than `max_gram`: the rows are then candidates holding every gram, and the caller has to apply the pattern to the value.
+    #[serde(default = "verified_default")]
+    pub verified: bool,
+}
+
+fn verified_default() -> bool {
+    true
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
