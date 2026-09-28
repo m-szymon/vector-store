@@ -173,7 +173,7 @@ impl HttpClient {
         query: String,
         limit: Limit,
         offset: usize,
-        cursor: Option<u64>,
+        cursor: Option<String>,
     ) -> PostIndexContainsResponse {
         self.post_contains(keyspace_name, index_name, query, limit, offset, cursor)
             .await
@@ -189,13 +189,14 @@ impl HttpClient {
         query: String,
         limit: Limit,
         offset: usize,
-        cursor: Option<u64>,
+        cursor: Option<String>,
     ) -> reqwest::Response {
         let request = PostIndexContainsRequest {
             query,
             limit,
             offset,
             cursor,
+            order: None,
             min_sort_key: None,
             max_sort_key: None,
         };

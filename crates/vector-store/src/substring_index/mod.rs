@@ -12,12 +12,14 @@ mod tantivy;
 use crate::memory::Memory;
 use crate::metrics::Metrics;
 use crate::worker::Worker;
+pub(crate) use actor::Cursor;
+pub(crate) use actor::SearchWindow;
+pub(crate) use actor::SortOrder;
 pub(crate) use actor::SubstringIndex;
 pub(crate) use actor::SubstringIndexExt;
 pub(crate) use factory::SubstringIndexConfiguration;
 pub(crate) use factory::SubstringIndexFactory;
 use std::sync::Arc;
-pub(crate) use tantivy::SortWindow;
 use tantivy::TantivySubstringIndexFactory;
 use tokio::sync::mpsc;
 

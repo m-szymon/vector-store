@@ -1133,6 +1133,9 @@ pub(crate) trait TableSearch {
 
     fn primary_key(&self, partition_id: PartitionId, primary_id: PrimaryId) -> Option<PrimaryKey>;
 
+    /// The id the table knows `primary_key` by, if it knows the row at all.
+    fn primary_id(&self, primary_key: &PrimaryKey) -> Option<PrimaryId>;
+
     fn is_valid_for(
         &self,
         partition_id: PartitionId,
@@ -1195,6 +1198,12 @@ impl TableSearch for Table {
             return None;
         }
         self.primary_keys.get(primary_id).cloned().flatten()
+    }
+
+    fn primary_id(&self, primary_key: &PrimaryKey) -> Option<PrimaryId> {
+        self.primary_ids
+            .get(&self.normalize_primary_key(primary_key))
+            .copied()
     }
 
     #[hotpath::measure]

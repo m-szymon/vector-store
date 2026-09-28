@@ -17,12 +17,11 @@
 //! answers newest-first, paging by a cursor rather than an offset. Known gaps, all of them things
 //! a proof of concept can live with and a shipped feature cannot:
 //!
-//! * **Ties are skipped.** The cursor is a sort key and the next page takes rows strictly below
-//!   it, so when several rows share a sort key and the page boundary falls among them, the
-//!   remainder are never returned. The fix is a composite `(sort_key, primary_id)` cursor, which
-//!   needs the tie-break to be part of the comparison rather than of the heap entry only.
-//! * **Only descending.** `ORDER BY ... ASC` would need the segment walk and the heap to invert;
-//!   nothing here is inherently descending, but nothing takes a direction either.
+//! * **Ties are ordered by primary id, which is not a CQL order.** Rows sharing a sort key come
+//!   highest internal id first (the most recently indexed first, in practice), and the cursor
+//!   names the last row's primary key so the next page resumes among them exactly. A rebuild of
+//!   the index assigns new ids, so the order among tied rows can change across one; a cursor
+//!   whose row is gone takes the tied rows again rather than skip any.
 //! * **A short page is ambiguous.** Rows dropped because the table no longer knows them shorten a
 //!   page after the walk has filled it, so a caller cannot infer "no more results" from a page
 //!   shorter than the limit, and must follow the cursor instead. The converse is exact: the walk
@@ -118,6 +117,9 @@ use crate::tantivy_common::reload;
 use crate::worker::Worker;
 use crate::worker::WorkerExt;
 
+use super::actor::Cursor;
+use super::actor::SearchWindow;
+use super::actor::SortOrder;
 use super::actor::SubstringIndex;
 use super::actor::SubstringPage;
 use super::actor::SubstringSearchR;
@@ -437,7 +439,7 @@ struct SegmentColumns {
     sort: Column<u64>,
     sort_min: u64,
     sort_max: u64,
-    /// Present only when the index keeps the primary id as a column (`primary_id_fast`).
+    /// Present on every ordered index (the walk breaks ties on it) and with `primary_id_fast`.
     primary_id: Option<Column<u64>>,
 }
 
@@ -457,7 +459,7 @@ impl SubstringBackend {
             .fast_fields()
             .u64(SORT_FIELD)
             .map_err(|e| anyhow!("substring: failed to open the sort column: {e}"))?;
-        let primary_id = (*self.options.primary_id_fast.as_ref())
+        let primary_id = (self.orders_results() || *self.options.primary_id_fast.as_ref())
             .then(|| segment.fast_fields().u64(PRIMARY_ID_FIELD))
             .transpose()
             .map_err(|e| anyhow!("substring: failed to open the primary id column: {e}"))?;
@@ -659,10 +661,10 @@ impl TantivyBackend for SubstringBackend {
             .set_indexing_options(indexing)
             .set_stored();
         let mut schema_builder = Schema::builder();
-        if *self.options.primary_id_fast.as_ref() {
-            // Also columnar, so a page's primary ids are read in nanoseconds rather than by
-            // decompressing a store block per row. The store keeps its copy for the verified
-            // path, which reads the document anyway.
+        if self.orders_results() || *self.options.primary_id_fast.as_ref() {
+            // Also columnar: an ordered walk reads it per candidate to break ties on the sort
+            // key, and with `primary_id_fast` a page's ids come from it as well. The store keeps
+            // its copy for the verified path, which reads the document anyway.
             schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED | FAST);
         } else {
             schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED);
@@ -1066,8 +1068,89 @@ fn build_query(state: &SubstringIndexState, normalized: &str) -> anyhow::Result<
 /// found, so a hot single-character query does not pay for its whole posting list. The stored
 /// document has to be read anyway for the primary id, so verifying the containment on the way
 /// costs no extra I/O.
-/// One page of an ordered search: the `limit` highest sort keys strictly below `cursor`, newest
-/// first, with the cursor to resume from.
+/// The window of `(sort key, primary id)` pairs a search may return, in *walk orientation*: the
+/// walk always takes the highest pair first, and an ascending search is the same walk over the
+/// bitwise complement of every key, which reverses the order of both members. The range from the
+/// query's `WHERE` and the cursor from the previous page constrain the same value, so they are
+/// resolved into one pair of bounds once rather than checked separately on every candidate.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SortWindow {
+    asc: bool,
+    lower: Option<(u64, u64)>,
+    upper: Option<Bound<(u64, u64)>>,
+}
+
+/// The primary id a cursor resumes below when its row's id is not known (the row was deleted,
+/// or the cursor never named one): the id every tied row's oriented id is below, so all of them
+/// are taken again rather than any skipped.
+const TIE_UNKNOWN: u64 = u64::MAX;
+
+impl SortWindow {
+    /// `cursor` is the previous page's last `(sort key, primary id)` in the sort column's own
+    /// space; the page resumes strictly below it in walk orientation.
+    pub(crate) fn new(
+        order: SortOrder,
+        cursor: Option<(u64, u64)>,
+        min_sort_key: Option<u64>,
+        max_sort_key: Option<u64>,
+    ) -> Self {
+        let asc = order == SortOrder::Asc;
+        let flip = |key: u64| if asc { !key } else { key };
+        // In walk orientation the range's lower bound is the real minimum for a descending walk
+        // and the complemented real maximum for an ascending one, and the upper bound the other
+        // way round; a bound includes the key it names, the cursor excludes it.
+        let lower = if asc { max_sort_key } else { min_sort_key }.map(|key| (flip(key), 0));
+        let range_upper =
+            if asc { min_sort_key } else { max_sort_key }.map(|key| (flip(key), u64::MAX));
+        let cursor = cursor.map(|(sort_key, primary_id)| (flip(sort_key), flip(primary_id)));
+        let upper = match (cursor, range_upper) {
+            (Some(cursor), Some(range)) if range < cursor => Some(Bound::Included(range)),
+            (Some(cursor), _) => Some(Bound::Excluded(cursor)),
+            (None, Some(range)) => Some(Bound::Included(range)),
+            (None, None) => None,
+        };
+        Self { asc, lower, upper }
+    }
+
+    /// A key from the column, in walk orientation.
+    fn orient(&self, key: u64) -> u64 {
+        if self.asc { !key } else { key }
+    }
+
+    /// A segment's real bounds, in walk orientation.
+    fn orient_bounds(&self, min: u64, max: u64) -> (u64, u64) {
+        if self.asc { (!max, !min) } else { (min, max) }
+    }
+
+    fn contains(&self, entry: (u64, u64)) -> bool {
+        let above_lower = self.lower.is_none_or(|lower| entry >= lower);
+        let below_upper = match self.upper {
+            None => true,
+            Some(Bound::Included(upper)) => entry <= upper,
+            Some(Bound::Excluded(upper)) => entry < upper,
+            Some(Bound::Unbounded) => true,
+        };
+        above_lower && below_upper
+    }
+
+    /// Whether a segment spanning `[min, max]` (oriented) can hold anything in the window.
+    /// Answered from the segment's bounds alone, so a segment ruled out here is never opened. A
+    /// segment ending exactly at an excluded upper key may still hold rows below it on the tie,
+    /// so it stays in.
+    fn overlaps(&self, min: u64, max: u64) -> bool {
+        let above = self.lower.is_none_or(|(lower, _)| max >= lower);
+        let below = match self.upper {
+            None => true,
+            Some(Bound::Included((upper, _))) | Some(Bound::Excluded((upper, _))) => min <= upper,
+            Some(Bound::Unbounded) => true,
+        };
+        above && below
+    }
+}
+
+/// One page of an ordered search: the `limit` highest `(sort key, primary id)` pairs in the
+/// window, highest first, with where the next page resumes. (For an ascending search, read
+/// "highest" in walk orientation; see [`SortWindow`].)
 ///
 /// Two things keep this off the O(matches) path the obvious implementation lands on. Segments are
 /// visited by descending upper bound and the walk stops once the next segment's bound cannot beat
@@ -1076,70 +1159,18 @@ fn build_query(state: &SubstringIndexState, normalized: &str) -> anyhow::Result<
 /// cannot make the page costs almost nothing. Measured, the second is worth 4-13x on its own and
 /// does not depend on how the segments are laid out.
 ///
-/// The cursor is a sort key rather than an offset, so a later page does not re-walk the earlier
-/// ones. Rows sharing a sort key are a known gap; see the note in the module docs.
-/// The window of sort keys a search may return: a range restriction, a paging cursor, or both.
-///
-/// The two arrive separately -- the range from the query's `WHERE`, the cursor from the previous
-/// page -- but they constrain the same value, so they are resolved into one pair of bounds once
-/// rather than checked separately on every candidate.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SortWindow {
-    lower: Option<u64>,
-    upper: Option<Bound<u64>>,
-}
-
-impl SortWindow {
-    pub(crate) fn new(
-        cursor: Option<u64>,
-        min_sort_key: Option<u64>,
-        max_sort_key: Option<u64>,
-    ) -> Self {
-        // The cursor excludes the key it names (the previous page ended there); a range bound
-        // includes it. Where both apply, the tighter one wins.
-        let upper = match (cursor, max_sort_key) {
-            (Some(cursor), Some(max)) if max < cursor => Some(Bound::Included(max)),
-            (Some(cursor), _) => Some(Bound::Excluded(cursor)),
-            (None, Some(max)) => Some(Bound::Included(max)),
-            (None, None) => None,
-        };
-        Self {
-            lower: min_sort_key,
-            upper,
-        }
-    }
-
-    fn contains(&self, sort_key: u64) -> bool {
-        let above_lower = self.lower.is_none_or(|lower| sort_key >= lower);
-        let below_upper = match self.upper {
-            None => true,
-            Some(Bound::Included(upper)) => sort_key <= upper,
-            Some(Bound::Excluded(upper)) => sort_key < upper,
-            Some(Bound::Unbounded) => true,
-        };
-        above_lower && below_upper
-    }
-
-    /// Whether a segment spanning `[min, max]` can hold anything in the window. Answered from the
-    /// segment's bounds alone, so a segment ruled out here is never opened.
-    fn overlaps(&self, min: u64, max: u64) -> bool {
-        let above = self.lower.is_none_or(|lower| max >= lower);
-        let below = match self.upper {
-            None => true,
-            Some(Bound::Included(upper)) => min <= upper,
-            Some(Bound::Excluded(upper)) => min < upper,
-            Some(Bound::Unbounded) => true,
-        };
-        above && below
-    }
-}
+/// Returns the page's primary ids and, when the page filled, the real `(sort key, primary id)`
+/// of its last row for the caller to turn into a cursor.
+/// The page's primary ids and, when the page filled, the real `(sort key, primary id)` of its
+/// last row.
+type OrderedPage = (Vec<PrimaryId>, Option<(u64, PrimaryId)>);
 
 fn collect_matches_ordered(
     state: &SubstringIndexState,
     normalized: &str,
     limit: usize,
     window: SortWindow,
-) -> anyhow::Result<(Vec<PrimaryId>, Option<u64>)> {
+) -> anyhow::Result<OrderedPage> {
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
 
@@ -1160,40 +1191,57 @@ fn collect_matches_ordered(
         let columns = state
             .backend
             .columns_for(segment, &mut tally.column_opens)?;
+        let (lower_bound, upper_bound) = window.orient_bounds(columns.sort_min, columns.sort_max);
         // Ruled out from the bounds alone, so the segment is never opened.
-        if window.overlaps(columns.sort_min, columns.sort_max) {
-            let upper_bound = columns.sort_max;
-            segments.push((segment_ord as u32, segment, columns.sort, upper_bound));
+        if window.overlaps(lower_bound, upper_bound) {
+            let primary_id = columns.primary_id.clone().ok_or_else(|| {
+                anyhow!("substring: an ordered index without a primary id column")
+            })?;
+            segments.push((
+                segment_ord as u32,
+                segment,
+                columns.sort,
+                primary_id,
+                upper_bound,
+            ));
         }
     }
     state.backend.prune_columns(searcher.segment_readers());
-    segments.sort_by_key(|(_, _, _, upper_bound)| Reverse(*upper_bound));
+    segments.sort_by_key(|(_, _, _, _, upper_bound)| Reverse(*upper_bound));
     tally.segments_considered = segments.len() as u64;
     let prepare = started.elapsed();
 
-    // Min-heap of the best `limit` so far, so the root is the entry to beat. It holds document
-    // addresses, not primary ids: an entrant is often pushed out again by a later, higher one, and
-    // reading the document store to learn the id of every entrant is what dominated the walk --
-    // 9-27x the cost of the walk itself (benches/substring_order.rs, `as_shipped`). The ids are
-    // read once, for the page that survives.
-    let mut best: BinaryHeap<Reverse<(u64, DocAddress)>> = BinaryHeap::with_capacity(limit + 1);
-    // Whether a sort key can still enter the page: always while it is not full, and above the
+    // Min-heap of the best `limit` so far, so the root is the entry to beat. An entry is the
+    // oriented (sort key, primary id) pair -- the id breaks ties on the sort key -- and the
+    // document's address; the address is what the page is resolved from at the end, once, since
+    // reading the store for every entrant is what dominated the first walk (9-27x the walk
+    // itself, benches/substring_order.rs).
+    type Entry = (u64, u64, DocAddress);
+    let mut best: BinaryHeap<Reverse<Entry>> = BinaryHeap::with_capacity(limit + 1);
+    // Whether a pair can still enter the page: always while it is not full, and above the
     // weakest entry once it is.
-    let beats_page = |best: &BinaryHeap<Reverse<(u64, DocAddress)>>, sort_key: u64| {
+    let beats_page = |best: &BinaryHeap<Reverse<Entry>>, pair: (u64, u64)| {
         best.len() < limit
             || best
                 .peek()
-                .is_none_or(|Reverse((weakest, _))| sort_key > *weakest)
+                .is_none_or(|Reverse((sort_key, primary_id, _))| pair > (*sort_key, *primary_id))
     };
-    let mut candidates: Vec<(u64, u32)> = Vec::new();
-    for (segment_ord, segment, sort_column, upper_bound) in segments {
+    let mut candidates: Vec<(u64, u64, u32)> = Vec::new();
+    for (segment_ord, segment, sort_column, id_column, upper_bound) in segments {
         if best.len() == limit
-            && let Some(Reverse((weakest, _))) = best.peek()
-            && upper_bound <= *weakest
+            && let Some(Reverse((weakest, _, _))) = best.peek()
+            && upper_bound < *weakest
         {
-            // Nothing in this segment, nor in any later one, can enter the page.
+            // Nothing in this segment, nor in any later one, can enter the page. (A segment
+            // ending exactly at the weakest key may still hold a higher id on the tie.)
             break;
         }
+        let pair_of = |doc_id: u32| {
+            (
+                window.orient(sort_column.first(doc_id).unwrap_or(0)),
+                window.orient(id_column.first(doc_id).unwrap_or(0)),
+            )
+        };
 
         tally.segments_opened += 1;
         let mut scorer = weight
@@ -1207,10 +1255,14 @@ fn collect_matches_ordered(
             while doc_id != TERMINATED {
                 tally.postings_scanned += 1;
                 if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
-                    let sort_key = sort_column.first(doc_id).unwrap_or(0);
-                    if window.contains(sort_key) && beats_page(&best, sort_key) {
+                    let pair = pair_of(doc_id);
+                    if window.contains(pair) && beats_page(&best, pair) {
                         tally.heap_entrants += 1;
-                        best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
+                        best.push(Reverse((
+                            pair.0,
+                            pair.1,
+                            DocAddress::new(segment_ord, doc_id),
+                        )));
                         if best.len() > limit {
                             best.pop();
                         }
@@ -1237,8 +1289,8 @@ fn collect_matches_ordered(
             while doc_id != TERMINATED {
                 tally.postings_scanned += 1;
                 if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
-                    let sort_key = sort_column.first(doc_id).unwrap_or(0);
-                    if window.contains(sort_key) && beats_page(&best, sort_key) {
+                    let pair = pair_of(doc_id);
+                    if window.contains(pair) && beats_page(&best, pair) {
                         tally.store_reads += 1;
                         let verified = store
                             .get::<TantivyDocument>(doc_id)
@@ -1248,7 +1300,11 @@ fn collect_matches_ordered(
                             .is_some_and(|text| text.contains(normalized));
                         if verified {
                             tally.heap_entrants += 1;
-                            best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
+                            best.push(Reverse((
+                                pair.0,
+                                pair.1,
+                                DocAddress::new(segment_ord, doc_id),
+                            )));
                             if best.len() > limit {
                                 best.pop();
                             }
@@ -1264,16 +1320,16 @@ fn collect_matches_ordered(
         while doc_id != TERMINATED {
             tally.postings_scanned += 1;
             if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
-                let sort_key = sort_column.first(doc_id).unwrap_or(0);
-                if window.contains(sort_key) && beats_page(&best, sort_key) {
-                    candidates.push((sort_key, doc_id));
+                let pair = pair_of(doc_id);
+                if window.contains(pair) && beats_page(&best, pair) {
+                    candidates.push((pair.0, pair.1, doc_id));
                 }
             }
             doc_id = scorer.advance();
         }
         candidates.sort_unstable_by(|a, b| b.cmp(a));
-        for &(sort_key, doc_id) in &candidates {
-            if !beats_page(&best, sort_key) {
+        for &(sort_key, primary_id, doc_id) in &candidates {
+            if !beats_page(&best, (sort_key, primary_id)) {
                 break;
             }
             tally.store_reads += 1;
@@ -1285,7 +1341,11 @@ fn collect_matches_ordered(
                 .is_some_and(|text| text.contains(normalized));
             if verified {
                 tally.heap_entrants += 1;
-                best.push(Reverse((sort_key, DocAddress::new(segment_ord, doc_id))));
+                best.push(Reverse((
+                    sort_key,
+                    primary_id,
+                    DocAddress::new(segment_ord, doc_id),
+                )));
                 if best.len() > limit {
                     best.pop();
                 }
@@ -1298,15 +1358,23 @@ fn collect_matches_ordered(
     // so there is nothing left to resume from and a cursor would only cost the caller an empty
     // round trip. (Rows dropped later, in `handle_search`, shorten the page after this point and
     // must not suppress the cursor -- which is why this asks the heap, not the returned page.)
-    let next_cursor = (best.len() == limit)
-        .then(|| best.peek().map(|Reverse((sort_key, _))| *sort_key))
+    let resume_at = (best.len() == limit)
+        .then(|| {
+            best.peek().map(|Reverse((sort_key, primary_id, _))| {
+                // Back from walk orientation to the column's own values.
+                (
+                    window.orient(*sort_key),
+                    PrimaryId::from(window.orient(*primary_id)),
+                )
+            })
+        })
         .flatten();
-    let mut page: Vec<(u64, DocAddress)> = best.into_iter().map(|Reverse(entry)| entry).collect();
-    page.sort_unstable_by_key(|(sort_key, _)| Reverse(*sort_key));
+    let mut page: Vec<Entry> = best.into_iter().map(|Reverse(entry)| entry).collect();
+    page.sort_unstable_by_key(|(sort_key, primary_id, _)| Reverse((*sort_key, *primary_id)));
     let resolving = Instant::now();
     let ids = if *state.backend.options.primary_id_fast.as_ref() {
         page.into_iter()
-            .map(|(_, address)| {
+            .map(|(_, _, address)| {
                 let segment = &searcher.segment_readers()[address.segment_ord as usize];
                 state
                     .backend
@@ -1321,7 +1389,7 @@ fn collect_matches_ordered(
     } else {
         tally.store_reads += page.len() as u64;
         page.into_iter()
-            .map(|(_, address)| {
+            .map(|(_, _, address)| {
                 let doc: TantivyDocument = searcher
                     .doc(address)
                     .map_err(|e| anyhow!("substring: failed to retrieve doc: {e}"))?;
@@ -1341,7 +1409,7 @@ fn collect_matches_ordered(
             page_resolve,
         },
     );
-    Ok((ids, next_cursor))
+    Ok((ids, resume_at))
 }
 
 fn collect_matches(
@@ -1459,12 +1527,37 @@ fn handle_search(
     query: &str,
     limit: Limit,
     offset: usize,
-    window: SortWindow,
+    window: SearchWindow,
 ) -> SubstringSearchR {
     let normalized = normalize(query, state.backend.options.case_sensitive);
     let limit: usize = (*limit.as_ref()).into();
-    let (primary_ids, next_cursor) = if state.backend.orders_results() {
-        collect_matches_ordered(state, &normalized, limit, window)?
+    let (primary_ids, resume_at) = if state.backend.orders_results() {
+        // The cursor names its row by primary key; the walk breaks ties by primary id, so the
+        // key is looked up first. A key the table no longer knows (the row was deleted since)
+        // resumes at TIE_UNKNOWN, which takes the rows tied with it again rather than skip any.
+        let cursor = window.cursor.as_ref().map(|cursor| {
+            let table = table.read().unwrap();
+            let primary_id = cursor
+                .primary_key
+                .as_ref()
+                .and_then(|key| table.primary_id(key))
+                .map_or(TIE_UNKNOWN, u64::from);
+            // TIE_UNKNOWN is "above every id" in walk orientation; in the column's own space
+            // that is the complement for an ascending walk.
+            let primary_id = if primary_id == TIE_UNKNOWN && window.order == SortOrder::Asc {
+                !TIE_UNKNOWN
+            } else {
+                primary_id
+            };
+            (cursor.sort_key, primary_id)
+        });
+        let sort_window = SortWindow::new(
+            window.order,
+            cursor,
+            window.min_sort_key,
+            window.max_sort_key,
+        );
+        collect_matches_ordered(state, &normalized, limit, sort_window)?
     } else {
         (collect_matches(state, &normalized, limit, offset)?, None)
     };
@@ -1480,7 +1573,10 @@ fn handle_search(
             .into_iter()
             .filter_map(|primary_id| table.primary_key(partition_id, primary_id))
             .collect(),
-        next_cursor,
+        next_cursor: resume_at.map(|(sort_key, primary_id)| Cursor {
+            sort_key,
+            primary_key: table.primary_key(partition_id, primary_id),
+        }),
     })
 }
 
@@ -1725,6 +1821,11 @@ mod tests {
                 let id_val = u64::from(primary_id);
                 Some(PrimaryKey::from(vec![CqlValue::BigInt(id_val as i64)]))
             });
+        mock.expect_primary_id()
+            .returning(|primary_key| match primary_key.get(0) {
+                Some(CqlValue::BigInt(id)) => Some(PrimaryId::from(id as u64)),
+                _ => None,
+            });
         // The sort column mirrors the primary id, so "newest first" is "highest id first" and a
         // test can assert on plain integers.
         mock.expect_column_value_for()
@@ -1866,8 +1967,8 @@ mod tests {
         sender: &mpsc::Sender<SubstringIndex>,
         query: &str,
         limit_n: usize,
-        window: SortWindow,
-    ) -> (Vec<i64>, Option<u64>) {
+        window: SearchWindow,
+    ) -> (Vec<i64>, Option<Cursor>) {
         let page = sender
             .search(make_index_key(), query.into(), limit(limit_n), 0, window)
             .await
@@ -1883,6 +1984,42 @@ mod tests {
         (ids, page.next_cursor)
     }
 
+    /// A window whose cursor is the row that sorts at `cursor`: in these fixtures the sort column
+    /// mirrors the primary id, so the row is named from the key's value.
+    fn window(
+        cursor: Option<u64>,
+        min_sort_key: Option<u64>,
+        max_sort_key: Option<u64>,
+    ) -> SearchWindow {
+        SearchWindow {
+            order: SortOrder::Desc,
+            cursor: cursor.map(|sort_key| Cursor {
+                sort_key,
+                primary_key: Some(PrimaryKey::from(vec![CqlValue::BigInt(
+                    (sort_key ^ (1 << 63)) as i64,
+                )])),
+            }),
+            min_sort_key,
+            max_sort_key,
+        }
+    }
+
+    /// The window that resumes after a page, in the given direction.
+    fn resume(order: SortOrder, cursor: Cursor) -> SearchWindow {
+        SearchWindow {
+            order,
+            cursor: Some(cursor),
+            ..SearchWindow::default()
+        }
+    }
+
+    fn ascending() -> SearchWindow {
+        SearchWindow {
+            order: SortOrder::Asc,
+            ..SearchWindow::default()
+        }
+    }
+
     async fn search_page(
         sender: &mpsc::Sender<SubstringIndex>,
         query: &str,
@@ -1895,7 +2032,7 @@ mod tests {
                 query.into(),
                 limit(limit_n),
                 offset,
-                SortWindow::default(),
+                SearchWindow::default(),
             )
             .await
             .unwrap()
@@ -2081,7 +2218,7 @@ mod tests {
                 "".into(),
                 limit(10),
                 0,
-                SortWindow::default(),
+                SearchWindow::default(),
             )
             .await
             .expect_err("an empty query cannot be answered");
@@ -2102,7 +2239,7 @@ mod tests {
                 "宫".into(),
                 limit(10),
                 0,
-                SortWindow::default(),
+                SearchWindow::default(),
             )
             .await
             .expect_err("a one-character query cannot be answered by a min_gram=2 index");
@@ -2214,7 +2351,7 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, _) = search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        let (ids, _) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         let mut descending = ids.clone();
         descending.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(ids, descending, "not ordered by the sort column");
@@ -2240,7 +2377,7 @@ mod tests {
             assert!(min <= max, "segment bounds inverted: {segment:?}");
         }
 
-        search_ordered(&sender, "将军", 2, SortWindow::default()).await;
+        search_ordered(&sender, "将军", 2, SearchWindow::default()).await;
 
         let after = sender.stats(make_index_key()).await.unwrap();
         let walk = after.walk;
@@ -2266,10 +2403,16 @@ mod tests {
         });
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, cursor) = search_ordered(&sender, "将军", 2, SortWindow::default()).await;
+        let (ids, cursor) = search_ordered(&sender, "将军", 2, SearchWindow::default()).await;
         assert_eq!(ids, vec![3, 2]);
-        // The cursor is the sort key, which carries the sign bias, not the value.
-        assert_eq!(cursor, Some(2 ^ (1 << 63)));
+        // The cursor's sort key carries the sign bias, not the value; its primary key is the
+        // last row's.
+        let cursor = cursor.expect("a full page leaves a cursor");
+        assert_eq!(cursor.sort_key, 2 ^ (1 << 63));
+        assert_eq!(
+            cursor.primary_key,
+            Some(PrimaryKey::from(vec![CqlValue::BigInt(2)]))
+        );
 
         let walk = sender.stats(make_index_key()).await.unwrap().walk;
         assert_eq!(walk.searches, 1);
@@ -2390,7 +2533,7 @@ mod tests {
             assert!(pair[0].1 < pair[1].0, "segments overlap: {spans:?}");
         }
 
-        let (ids, _) = search_ordered(&sender, "将军", 5, SortWindow::default()).await;
+        let (ids, _) = search_ordered(&sender, "将军", 5, SearchWindow::default()).await;
         assert_eq!(ids, vec![400, 399, 398, 397, 396]);
     }
 
@@ -2538,7 +2681,7 @@ mod tests {
             layout.len(),
             stats.rewrite
         );
-        let (ids, _) = search_ordered(&sender, "将军", 3, SortWindow::default()).await;
+        let (ids, _) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
         assert_eq!(ids, vec![3000, 2999, 2998]);
     }
 
@@ -2576,7 +2719,7 @@ mod tests {
             "expected the rows to share segments, got {segments}"
         );
 
-        let (ids, _) = search_ordered(&sender, "abcd", 5, SortWindow::default()).await;
+        let (ids, _) = search_ordered(&sender, "abcd", 5, SearchWindow::default()).await;
         assert_eq!(ids, vec![30, 29, 28, 27, 26]);
 
         // The candidates the walk scanned (the top segment's, at least; a lower segment may be
@@ -2726,7 +2869,7 @@ mod tests {
             "a segment is still wide: {spans:?}"
         );
 
-        let (ids, _) = search_ordered(&sender, "将军", 3, SortWindow::default()).await;
+        let (ids, _) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
         assert_eq!(ids, vec![2000, 1999, 1998]);
     }
 
@@ -2758,7 +2901,7 @@ mod tests {
             ack.recv().await;
         }
 
-        let (ids, _) = search_ordered(&sender, "abcd", 5, SortWindow::default()).await;
+        let (ids, _) = search_ordered(&sender, "abcd", 5, SearchWindow::default()).await;
         assert_eq!(ids, vec![30, 29, 28, 27, 26]);
         let walk = sender.stats(make_index_key()).await.unwrap().walk;
         // Every candidate that beat the page at its moment was read, plus the page itself; with
@@ -2775,12 +2918,12 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         let first = sender.stats(make_index_key()).await.unwrap();
         assert_eq!(first.walk.column_opens, 0, "{:?}", first.walk);
         assert!(first.walk.prepare_nanos <= first.walk.walk_nanos);
 
-        search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         let second = sender.stats(make_index_key()).await.unwrap();
         assert_eq!(second.walk.column_opens, 0, "{:?}", second.walk);
         assert_eq!(second.walk.searches, 2);
@@ -2793,7 +2936,7 @@ mod tests {
     async fn an_unordered_index_reports_segments_without_bounds() {
         let sender = make_sender();
         add_docs(&sender, NICKNAMES).await;
-        search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
 
         let stats = sender.stats(make_index_key()).await.unwrap();
         assert!(!stats.segments.is_empty());
@@ -2817,7 +2960,7 @@ mod tests {
         let sender = make_sender();
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, cursor) = search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        let (ids, cursor) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         assert_eq!(cursor, None);
         assert_eq!(ids.len(), 3);
     }
@@ -2830,17 +2973,12 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (first, cursor) = search_ordered(&sender, "将军", 2, SortWindow::default()).await;
+        let (first, cursor) = search_ordered(&sender, "将军", 2, SearchWindow::default()).await;
         assert_eq!(first, vec![3, 2]);
         let cursor = cursor.expect("a full page leaves a cursor");
 
-        let (second, cursor) = search_ordered(
-            &sender,
-            "将军",
-            2,
-            SortWindow::new(Some(cursor), None, None),
-        )
-        .await;
+        let (second, cursor) =
+            search_ordered(&sender, "将军", 2, resume(SortOrder::Desc, cursor)).await;
         assert_eq!(second, vec![1]);
         assert_eq!(
             cursor, None,
@@ -2862,7 +3000,7 @@ mod tests {
         add_docs(&sender, NICKNAMES).await;
 
         // Three matches, asked for ten.
-        let (ids, cursor) = search_ordered(&sender, "将军", 10, SortWindow::default()).await;
+        let (ids, cursor) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         assert_eq!(ids, vec![3, 2, 1]);
         assert_eq!(
             cursor, None,
@@ -2871,7 +3009,7 @@ mod tests {
 
         // Exactly as many as there are: the walk stopped because the page was full, not because it
         // ran out, so it cannot tell that the next page would be empty and says so with a cursor.
-        let (ids, cursor) = search_ordered(&sender, "将军", 3, SortWindow::default()).await;
+        let (ids, cursor) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
         assert_eq!(ids, vec![3, 2, 1]);
         assert!(cursor.is_some(), "a filled page leaves a cursor");
     }
@@ -2884,7 +3022,7 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, cursor) = search_ordered(&sender, "没有人", 10, SortWindow::default()).await;
+        let (ids, cursor) = search_ordered(&sender, "没有人", 10, SearchWindow::default()).await;
         assert!(ids.is_empty(), "got {ids:?}");
         assert_eq!(cursor, None);
     }
@@ -2901,7 +3039,7 @@ mod tests {
         });
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, _) = search_ordered(&sender, "将军来了", 10, SortWindow::default()).await;
+        let (ids, _) = search_ordered(&sender, "将军来了", 10, SearchWindow::default()).await;
         assert_eq!(ids, vec![3]);
     }
 
@@ -2913,13 +3051,8 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, _) = search_ordered(
-            &sender,
-            "将军",
-            10,
-            SortWindow::new(Some(sort_key(1)), None, None),
-        )
-        .await;
+        let (ids, _) =
+            search_ordered(&sender, "将军", 10, window(Some(sort_key(1)), None, None)).await;
         assert!(ids.is_empty(), "got {ids:?}");
     }
 
@@ -2932,7 +3065,7 @@ mod tests {
         add_docs(&sender, NICKNAMES).await;
 
         // The mock table answers with the primary id as the sort key, so this is ids 2..=3.
-        let window = SortWindow::new(None, Some(sort_key(2)), Some(sort_key(3)));
+        let window = window(None, Some(sort_key(2)), Some(sort_key(3)));
         let (ids, _) = search_ordered(&sender, "将军", 10, window).await;
         assert_eq!(ids, vec![3, 2]);
     }
@@ -2949,7 +3082,7 @@ mod tests {
             &sender,
             "将军",
             10,
-            SortWindow::new(None, Some(sort_key(3)), Some(sort_key(3))),
+            window(None, Some(sort_key(3)), Some(sort_key(3))),
         )
         .await;
         assert_eq!(inclusive, vec![3]);
@@ -2958,7 +3091,7 @@ mod tests {
             &sender,
             "将军",
             10,
-            SortWindow::new(Some(sort_key(3)), Some(sort_key(3)), None),
+            window(Some(sort_key(3)), Some(sort_key(3)), None),
         )
         .await;
         assert!(exclusive.is_empty(), "got {exclusive:?}");
@@ -2974,7 +3107,7 @@ mod tests {
         add_docs(&sender, NICKNAMES).await;
 
         // The range allows 1..=3, the cursor excludes 3 and above: 2 and 1 remain.
-        let window = SortWindow::new(Some(sort_key(3)), Some(sort_key(1)), Some(sort_key(3)));
+        let window = window(Some(sort_key(3)), Some(sort_key(1)), Some(sort_key(3)));
         let (ids, _) = search_ordered(&sender, "将军", 10, window).await;
         assert_eq!(ids, vec![2, 1]);
     }
@@ -2991,10 +3124,182 @@ mod tests {
             &sender,
             "将军",
             10,
-            SortWindow::new(None, Some(sort_key(900)), Some(sort_key(999))),
+            window(None, Some(sort_key(900)), Some(sort_key(999))),
         )
         .await;
         assert!(ids.is_empty(), "got {ids:?}");
         assert_eq!(cursor, None);
+    }
+
+    /// A table whose sort column has ties: rows 1..=n share a sort key in pairs (1 and 2 sort
+    /// as 1, 3 and 4 as 2, ...), so a page boundary can fall between two rows with one key.
+    fn make_table_with_ties() -> Arc<RwLock<MockTableSearch>> {
+        let index_id = IndexIdGenerator::new().next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+        let mut mock = MockTableSearch::new();
+        mock.expect_index_id()
+            .returning(move |_index_key| Some(index_id));
+        mock.expect_partition_id()
+            .returning(move |_index_key, _restrictions| Some((partition_id, None)));
+        mock.expect_primary_key()
+            .returning(|_partition_id, primary_id| {
+                Some(PrimaryKey::from(vec![CqlValue::BigInt(
+                    u64::from(primary_id) as i64,
+                )]))
+            });
+        mock.expect_primary_id()
+            .returning(|primary_key| match primary_key.get(0) {
+                Some(CqlValue::BigInt(id)) => Some(PrimaryId::from(id as u64)),
+                _ => None,
+            });
+        mock.expect_column_value_for()
+            .returning(|_partition_id, primary_id, _column| {
+                Some(CqlValue::BigInt((u64::from(primary_id) as i64 + 1) / 2))
+            });
+        mock.expect_is_valid_for().returning(|_, _, _| true);
+        mock.expect_target_column().returning(|_| None);
+        Arc::new(RwLock::new(mock))
+    }
+
+    fn make_sender_with_ties(options: IndexOptionsSubstring) -> mpsc::Sender<SubstringIndex> {
+        new(
+            SubstringIndexConfiguration {
+                key: make_index_key(),
+                options,
+            },
+            make_table_with_ties(),
+            worker::new(),
+            make_memory_actor(),
+            TEST_COMMIT_INTERVAL,
+            TEST_COMMIT_THRESHOLD,
+            None,
+        )
+    }
+
+    /// Every page is followed from its cursor until none is offered; the pages concatenated.
+    async fn all_pages(
+        sender: &mpsc::Sender<SubstringIndex>,
+        query: &str,
+        page: usize,
+        order: SortOrder,
+    ) -> (Vec<i64>, usize) {
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        let mut window = SearchWindow {
+            order,
+            ..SearchWindow::default()
+        };
+        loop {
+            let (ids, cursor) = search_ordered(sender, query, page, window).await;
+            pages += 1;
+            seen.extend(ids);
+            match cursor {
+                Some(cursor) => window = resume(order, cursor),
+                None => return (seen, pages),
+            }
+        }
+    }
+
+    /// Rows sharing a sort key are neither skipped nor repeated across a page boundary, whatever
+    /// the page size: the cursor names the last row, and the tie is broken on it.
+    #[rstest]
+    #[case::pages_split_every_tie(3)]
+    #[case::pages_of_one(1)]
+    #[case::pages_align_with_the_ties(2)]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn ties_are_paged_without_gaps_or_repeats(#[case] page: usize) {
+        let sender = make_sender_with_ties(ordered_options());
+        let docs: Vec<(u64, String)> = (1..=7).map(|i| (i, format!("user{i}将军"))).collect();
+        let docs: Vec<(u64, &str)> = docs.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        add_docs(&sender, &docs).await;
+
+        let (seen, _) = all_pages(&sender, "将军", page, SortOrder::Desc).await;
+        // Sort keys 4,4,3,3,2,2,1 for ids 7,8.. -- highest key first, and within a key the
+        // higher id first.
+        assert_eq!(seen, vec![7, 6, 5, 4, 3, 2, 1]);
+
+        let (seen, _) = all_pages(&sender, "将军", page, SortOrder::Asc).await;
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// A cursor that names no row (or a row the table has forgotten) resumes at its sort key
+    /// inclusive: the rows tied there come again, which a client can dedupe, rather than being
+    /// lost, which it cannot repair.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_cursor_without_a_row_takes_the_tied_rows_again() {
+        let sender = make_sender_with_ties(ordered_options());
+        let docs: Vec<(u64, String)> = (1..=6).map(|i| (i, format!("user{i}将军"))).collect();
+        let docs: Vec<(u64, &str)> = docs.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        add_docs(&sender, &docs).await;
+
+        let (first, cursor) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
+        assert_eq!(first, vec![6, 5, 4]);
+        let cursor = cursor.unwrap();
+        assert_eq!(
+            cursor.primary_key,
+            Some(PrimaryKey::from(vec![CqlValue::BigInt(4)]))
+        );
+
+        // With the row: strictly after it.
+        let (second, _) =
+            search_ordered(&sender, "将军", 3, resume(SortOrder::Desc, cursor.clone())).await;
+        assert_eq!(second, vec![3, 2, 1]);
+        // Without it: the row tied with 4 (id 3 shares its sort key) comes again, nothing is lost.
+        let unknown = Cursor {
+            sort_key: cursor.sort_key,
+            primary_key: None,
+        };
+        let (second, _) =
+            search_ordered(&sender, "将军", 3, resume(SortOrder::Desc, unknown)).await;
+        assert_eq!(second, vec![4, 3, 2]);
+        let forgotten = Cursor {
+            sort_key: cursor.sort_key,
+            primary_key: Some(PrimaryKey::from(vec![CqlValue::Text("gone".into())])),
+        };
+        let (second, _) =
+            search_ordered(&sender, "将军", 3, resume(SortOrder::Desc, forgotten)).await;
+        assert_eq!(second, vec![4, 3, 2]);
+    }
+
+    /// Ascending is the same walk the other way: lowest sort key first, a range honoured, the
+    /// cursor resuming above the last row, and no cursor once the walk ran out.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn ascending_order_walks_the_other_way() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, cursor) = search_ordered(&sender, "将军", 2, ascending()).await;
+        assert_eq!(ids, vec![1, 2]);
+        let cursor = cursor.expect("a full page leaves a cursor");
+        assert_eq!(cursor.sort_key, sort_key(2));
+
+        let (ids, cursor) =
+            search_ordered(&sender, "将军", 2, resume(SortOrder::Asc, cursor)).await;
+        assert_eq!(ids, vec![3]);
+        assert_eq!(cursor, None);
+
+        // A range applies the same way round: keys 2..=3, lowest first.
+        let (ids, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            SearchWindow {
+                order: SortOrder::Asc,
+                cursor: None,
+                min_sort_key: Some(sort_key(2)),
+                max_sort_key: Some(sort_key(3)),
+            },
+        )
+        .await;
+        assert_eq!(ids, vec![2, 3]);
+
+        // Past max_gram too: the verified path orders the same way.
+        let (ids, _) = search_ordered(&sender, "将军来了", 10, ascending()).await;
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
     }
 }

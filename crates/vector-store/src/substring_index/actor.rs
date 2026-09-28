@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-use super::tantivy::SortWindow;
 use super::tantivy::SubstringStatsR;
 use crate::AsyncInProgress;
 use crate::IndexKey;
@@ -15,6 +14,36 @@ use crate::vs_index::CountR;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+/// Which way an ordered search walks the sort column.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SortOrder {
+    /// Highest sort key first: newest first for a timestamp.
+    #[default]
+    Desc,
+    Asc,
+}
+
+/// Where a page ended: the sort key of its last row and that row's primary key, so that the next
+/// page resumes among the rows sharing that sort key instead of skipping them. The primary key is
+/// what makes the cursor survive a rebuild of the index, whose internal ids are not stable; it is
+/// `None` when the row was gone by the time the page was assembled, and a resume from such a
+/// cursor takes every row sharing the sort key again rather than risk skipping one.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Cursor {
+    pub(crate) sort_key: u64,
+    pub(crate) primary_key: Option<PrimaryKey>,
+}
+
+/// What an ordered search may return: a direction, the cursor of the previous page, and a range
+/// on the sort column. Ignored by an unordered index.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SearchWindow {
+    pub(crate) order: SortOrder,
+    pub(crate) cursor: Option<Cursor>,
+    pub(crate) min_sort_key: Option<u64>,
+    pub(crate) max_sort_key: Option<u64>,
+}
+
 /// One page of a substring search.
 #[derive(Debug)]
 pub(crate) struct SubstringPage {
@@ -23,7 +52,7 @@ pub(crate) struct SubstringPage {
     pub(crate) primary_keys: Vec<PrimaryKey>,
     /// Where the next page starts, for an ordered search that filled this one. `None` means there
     /// is nothing more to read, or the index is unordered and does not page this way.
-    pub(crate) next_cursor: Option<u64>,
+    pub(crate) next_cursor: Option<Cursor>,
 }
 
 pub(crate) type SubstringSearchR = anyhow::Result<SubstringPage>;
@@ -52,9 +81,9 @@ pub(crate) enum SubstringIndex {
         /// Number of matching rows to skip before collecting `limit` of them. Ignored by an
         /// ordered search, which pages by cursor instead.
         offset: usize,
-        /// Which sort keys the answer may come from: a range restriction, a paging cursor, or
-        /// both. Ignored by an unordered index.
-        window: SortWindow,
+        /// The direction, the previous page's cursor and the range restriction. Ignored by an
+        /// unordered index.
+        window: SearchWindow,
         tx: oneshot::Sender<SubstringSearchR>,
     },
     Stats {
@@ -83,7 +112,7 @@ pub(crate) trait SubstringIndexExt {
         query: String,
         limit: Limit,
         offset: usize,
-        window: SortWindow,
+        window: SearchWindow,
     ) -> SubstringSearchR;
     async fn stats(&self, index_key: IndexKey) -> SubstringStatsR;
 }
@@ -131,7 +160,7 @@ impl SubstringIndexExt for mpsc::Sender<SubstringIndex> {
         query: String,
         limit: Limit,
         offset: usize,
-        window: SortWindow,
+        window: SearchWindow,
     ) -> SubstringSearchR {
         let (tx, rx) = oneshot::channel();
         self.send(SubstringIndex::Search {

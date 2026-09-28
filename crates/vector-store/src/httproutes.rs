@@ -31,7 +31,9 @@ use crate::metrics::Metrics;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
 use crate::perf;
-use crate::substring_index::SortWindow;
+use crate::substring_index::Cursor;
+use crate::substring_index::SearchWindow;
+use crate::substring_index::SortOrder;
 use crate::substring_index::SubstringIndex;
 use crate::substring_index::SubstringIndexExt;
 use crate::vector;
@@ -1322,13 +1324,17 @@ async fn post_index_contains(
             return (StatusCode::NOT_FOUND, msg).into_response();
         };
         if entry.status() == crate::node_state::IndexStatus::Serving {
-            Ok((entry.index().clone(), entry.primary_key_columns().clone()))
+            Ok((
+                entry.index().clone(),
+                entry.primary_key_columns().clone(),
+                Arc::clone(entry.table_columns()),
+            ))
         } else {
             Err(entry.progress())
         }
     };
 
-    let (substring_sender, primary_key_columns) = match check_fts_serving(
+    let (substring_sender, primary_key_columns, table_columns) = match check_fts_serving(
         serving_or_progress,
         &state.node_state,
         &keyspace,
@@ -1344,13 +1350,35 @@ async fn post_index_contains(
         }
     };
 
+    let cursor = match request
+        .cursor
+        .as_deref()
+        .map(|text| decode_cursor(text, primary_key_columns.as_slice(), &table_columns))
+        .transpose()
+    {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            timer.observe_duration();
+            let msg = format!("index.contains request error: invalid cursor: {err}");
+            debug!("post_index_contains: {msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
     let search_result = substring_sender
         .search(
             index_key,
             request.query,
             request.limit.into(),
             request.offset,
-            SortWindow::new(request.cursor, request.min_sort_key, request.max_sort_key),
+            SearchWindow {
+                order: match request.order.unwrap_or_default() {
+                    httpapi::SortOrder::Desc => SortOrder::Desc,
+                    httpapi::SortOrder::Asc => SortOrder::Asc,
+                },
+                cursor,
+                min_sort_key: request.min_sort_key,
+                max_sort_key: request.max_sort_key,
+            },
         )
         .await;
 
@@ -1373,22 +1401,97 @@ async fn post_index_contains(
             (status, msg).into_response()
         }
         Ok(page) => {
-            match try_collect_primary_keys(primary_key_columns.as_slice(), &page.primary_keys) {
+            let next_cursor = page
+                .next_cursor
+                .as_ref()
+                .map(|cursor| encode_cursor(cursor, primary_key_columns.as_slice()))
+                .transpose();
+            match try_collect_primary_keys(primary_key_columns.as_slice(), &page.primary_keys)
+                .and_then(|primary_keys| Ok((primary_keys, next_cursor?)))
+            {
                 Err(err) => {
                     debug!("post_index_contains: {err}");
                     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
                 }
-                Ok(primary_keys) => (
+                Ok((primary_keys, next_cursor)) => (
                     StatusCode::OK,
                     response::Json(httpapi::PostIndexContainsResponse {
                         primary_keys,
-                        next_cursor: page.next_cursor,
+                        next_cursor,
                     }),
                 )
                     .into_response(),
             }
         }
     }
+}
+
+/// The wire form of a paging cursor: JSON, carried by the caller as an opaque string. The primary
+/// key is the same per-column encoding the page's `primary_keys` use, so a cursor is readable
+/// but never meant to be built by hand.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CursorJson {
+    sort_key: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    primary_key: Option<HashMap<httpapi::ColumnName, Value>>,
+}
+
+fn encode_cursor(
+    cursor: &Cursor,
+    primary_key_columns: &[crate::ColumnName],
+) -> anyhow::Result<String> {
+    let primary_key = cursor
+        .primary_key
+        .as_ref()
+        .map(|key| {
+            try_collect_primary_keys(primary_key_columns, std::slice::from_ref(key)).map(
+                |columns| {
+                    columns
+                        .into_iter()
+                        .filter_map(|(column, mut values)| {
+                            values.pop().map(|value| (column, value))
+                        })
+                        .collect()
+                },
+            )
+        })
+        .transpose()?;
+    Ok(serde_json::to_string(&CursorJson {
+        sort_key: cursor.sort_key,
+        primary_key,
+    })?)
+}
+
+fn decode_cursor(
+    text: &str,
+    primary_key_columns: &[crate::ColumnName],
+    table_columns: &HashMap<crate::ColumnName, NativeType>,
+) -> anyhow::Result<Cursor> {
+    let json: CursorJson = serde_json::from_str(text)?;
+    let primary_key = json
+        .primary_key
+        .map(|mut values| {
+            primary_key_columns
+                .iter()
+                .map(|column| {
+                    let value = values
+                        .remove(&httpapi::ColumnName::from(column.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("the cursor's primary key lacks column '{column}'")
+                        })?;
+                    let native_type = table_columns
+                        .get(column)
+                        .ok_or_else(|| anyhow::anyhow!("unknown primary key column '{column}'"))?;
+                    cql_types::from_json(value, native_type)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map(crate::PrimaryKey::from)
+        })
+        .transpose()?;
+    Ok(Cursor {
+        sort_key: json.sort_key,
+        primary_key,
+    })
 }
 
 #[utoipa::path(

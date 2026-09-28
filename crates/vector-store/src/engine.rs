@@ -260,7 +260,7 @@ async fn add_index(
     };
 
     let table_columns = db_index.get_table_columns().await;
-    let table = match build_table(&key, &metadata, table_columns) {
+    let table = match build_table(&key, &metadata, Arc::clone(&table_columns)) {
         Ok(table) => Arc::new(RwLock::new(table)),
         Err(err) => {
             debug!("unable to create a table cache for an index {key}: {err}");
@@ -273,6 +273,7 @@ async fn add_index(
     let ctx = AddIndexContext {
         key,
         table,
+        table_columns,
         embeddings_stream,
         metrics,
         db_index,
@@ -302,6 +303,7 @@ async fn add_index(
 struct AddIndexContext<'a> {
     key: IndexKey,
     table: Arc<RwLock<Table>>,
+    table_columns: Arc<HashMap<ColumnName, NativeType>>,
     embeddings_stream: mpsc::Receiver<(crate::DbIndexedRow, crate::AsyncInProgress)>,
     metrics: Arc<Metrics>,
     db_index: mpsc::Sender<DbIndex>,
@@ -400,6 +402,7 @@ async fn add_index_substring(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
         substring_sender,
         monitor_actor,
         ctx.db_index,
+        ctx.table_columns,
     )
     .await?;
     ctx.indexes

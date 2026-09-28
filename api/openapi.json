@@ -1325,19 +1325,17 @@
       },
       "PostIndexContainsRequest": {
         "type": "object",
-        "description": "Request body for substring (infix containment) search.\n\n`cursor`, `min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in\nthe sort column's own values: signed types are biased so that negative values sort below\npositive ones, and dates and timestamps are their integer representations. A caller turning a\nCQL value into a bound has to apply the same mapping, which means the two sides have to agree\nabout it -- a coupling worth removing by sending typed values instead.",
+        "description": "Request body for substring (infix containment) search.\n\n`min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in the sort\ncolumn's own values: signed types are biased so that negative values sort below positive\nones, and dates and timestamps are their integer representations. A caller turning a CQL value\ninto a bound has to apply the same mapping, which means the two sides have to agree about it\n-- a coupling worth removing by sending typed values instead.",
         "required": [
           "query"
         ],
         "properties": {
           "cursor": {
             "type": [
-              "integer",
+              "string",
               "null"
             ],
-            "format": "int64",
-            "description": "Resume an ordered search below this sort key, as returned by the previous page's `next_cursor`. Only meaningful for an index created with an `order_by` column; ignored otherwise.",
-            "minimum": 0
+            "description": "Resume an ordered search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's sort key and primary key). Only meaningful for an index created with an `order_by` column; ignored otherwise."
           },
           "limit": {
             "$ref": "#/components/schemas/Limit",
@@ -1366,6 +1364,17 @@
             "description": "The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.",
             "minimum": 0
           },
+          "order": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SortOrder",
+                "description": "The direction along the sort column; descending when absent. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+              }
+            ]
+          },
           "query": {
             "type": "string",
             "description": "The text every returned row's indexed value must contain."
@@ -1381,12 +1390,10 @@
         "properties": {
           "next_cursor": {
             "type": [
-              "integer",
+              "string",
               "null"
             ],
-            "format": "int64",
-            "description": "Pass as the next request's `cursor` to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.",
-            "minimum": 0
+            "description": "Pass as the next request's `cursor`, unchanged, to read the following page. Absent when the index has no sort column, or when this page exhausted the matches."
           },
           "primary_keys": {
             "type": "object",
@@ -1456,6 +1463,14 @@
         "type": "number",
         "format": "float",
         "description": "Similarity score between vectors derived from the distance. Higher score means more similar."
+      },
+      "SortOrder": {
+        "type": "string",
+        "description": "The direction of an ordered substring search along its sort column.",
+        "enum": [
+          "desc",
+          "asc"
+        ]
       },
       "SubstringIndexOptions": {
         "type": "object",

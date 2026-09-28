@@ -120,6 +120,9 @@ pub(crate) struct FtsIndexData {
 #[derive(Debug)]
 pub(crate) struct SubstringIndexData {
     options: crate::IndexOptionsSubstring,
+    /// The types of the table's columns: a paging cursor names a row by primary key in JSON,
+    /// which is read back with them.
+    table_columns: Arc<HashMap<ColumnName, NativeType>>,
 }
 
 impl<I, D> IndexEntry<I, D> {
@@ -278,6 +281,7 @@ impl SubstringIndexEntry {
         index: mpsc::Sender<SubstringIndex>,
         monitor: mpsc::Sender<MonitorItems>,
         db_index: mpsc::Sender<DbIndex>,
+        table_columns: Arc<HashMap<ColumnName, NativeType>>,
     ) -> anyhow::Result<Self> {
         let options = metadata.substring().cloned().ok_or_else(|| {
             anyhow::anyhow!("add_index_substring must be called with a substring-search index")
@@ -290,12 +294,19 @@ impl SubstringIndexEntry {
             status: IndexStatus::Initializing,
             progress,
             primary_key_columns: metadata.primary_key_columns,
-            data: SubstringIndexData { options },
+            data: SubstringIndexData {
+                options,
+                table_columns,
+            },
         })
     }
 
     pub(crate) fn options(&self) -> &crate::IndexOptionsSubstring {
         &self.data.options
+    }
+
+    pub(crate) fn table_columns(&self) -> &Arc<HashMap<ColumnName, NativeType>> {
+        &self.data.table_columns
     }
 }
 

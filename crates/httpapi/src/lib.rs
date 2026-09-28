@@ -514,14 +514,35 @@ pub struct PostIndexBm25Response {
     pub scores: Vec<f32>,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Deserialize,
+    serde::Serialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+/// The direction of an ordered substring search along its sort column.
+pub enum SortOrder {
+    /// Highest sort key first; for a timestamp, newest first.
+    #[default]
+    Desc,
+    /// Lowest sort key first.
+    Asc,
+}
+
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Request body for substring (infix containment) search.
 ///
-/// `cursor`, `min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in
-/// the sort column's own values: signed types are biased so that negative values sort below
-/// positive ones, and dates and timestamps are their integer representations. A caller turning a
-/// CQL value into a bound has to apply the same mapping, which means the two sides have to agree
-/// about it -- a coupling worth removing by sending typed values instead.
+/// `min_sort_key` and `max_sort_key` are in the index's internal sort-key space, not in the sort
+/// column's own values: signed types are biased so that negative values sort below positive
+/// ones, and dates and timestamps are their integer representations. A caller turning a CQL value
+/// into a bound has to apply the same mapping, which means the two sides have to agree about it
+/// -- a coupling worth removing by sending typed values instead.
 pub struct PostIndexContainsRequest {
     /// The text every returned row's indexed value must contain.
     pub query: String,
@@ -531,9 +552,12 @@ pub struct PostIndexContainsRequest {
     /// The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.
     #[serde(default)]
     pub offset: usize,
-    /// Resume an ordered search below this sort key, as returned by the previous page's `next_cursor`. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    /// Resume an ordered search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's sort key and primary key). Only meaningful for an index created with an `order_by` column; ignored otherwise.
     #[serde(default)]
-    pub cursor: Option<u64>,
+    pub cursor: Option<String>,
+    /// The direction along the sort column; descending when absent. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub order: Option<SortOrder>,
     /// Restrict the search to rows whose sort key is at least this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
     #[serde(default)]
     pub min_sort_key: Option<u64>,
@@ -547,9 +571,9 @@ pub struct PostIndexContainsRequest {
 pub struct PostIndexContainsResponse {
     /// Primary keys of the matching rows, one array of values per primary key column. Ordered by the index's sort column when it has one.
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
-    /// Pass as the next request's `cursor` to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.
+    /// Pass as the next request's `cursor`, unchanged, to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<u64>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
