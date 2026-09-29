@@ -486,10 +486,33 @@ What it changes and what it does not:
 - False candidates cost a base-table read each on the coordinator instead of a store read on
   the node, and a page with many of them costs extra node round trips, bounded as above.
 
-Not measured yet. The benchmark's indexes are created `case_sensitive: false` (what a search
-box wants), so a run that measures this sets `case_sensitive: 'true'` in the test case's
-`latte_schema_parameters`; the 8, 16 and 32-character keyword sets of `aws_followup_config.yaml`
-are the ones that exercise it.
+### Measured at 10M names with names up to 32 characters (AWS, 2026-09-29, run `697ea24b`)
+
+Same corpus, plan (`aws_followup_config.yaml`) and machines as 2026-09-28, capped index
+(100k rows a segment, 100 segments), `case_sensitive: 'true'` so that stage 5 takes the long
+keywords. Queries per second at 20 rows a page, ordered:
+
+| keyword | 2026-09-28 (node verifies) | 2026-09-29 (ScyllaDB verifies) | store reads per query |
+|---|---|---|---|
+| 8 characters | 5.0k | 6.2k | 2.4 |
+| 16 characters | 2.3k | 2.8k | 1.0 |
+| 32 characters | 1.1k | 1.7k | 1.0 |
+
+- The store reads left the query path: one per query is the page being resolved.
+- The walk itself did not change: a rare keyword still opens all 100 segments, 0.6 ms of walk
+  at 8 characters and 2.4 ms at 32. That is the next thing to fix (rarest gram first, then a
+  per-segment gram filter), and stage 5 only took verification off it.
+- Short keywords are unchanged at 9.1k-9.9k per second; the deep 8-character page (window 0.5)
+  reaches the 10k the loader asks for.
+- The index is 57.6 bytes per name against 49.8: a case-sensitive index keeps more distinct
+  grams. That is the index option, not stage 5.
+
+The second dataset, the backfill with the rewrite, did not complete: at the end of the full scan
+(9.85M of 10M ingested) a status request to the index node and an SSH session to the ScyllaDB
+node both timed out within the same minute, and the test stopped. Two nodes failing together
+over different protocols points at the path from the laptop rather than at either node, but the
+node's own logs were not collected, so the cause is not established. The rewrite at 10M remains
+unmeasured.
 
 ## Open questions and risks
 
