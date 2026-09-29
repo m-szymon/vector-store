@@ -490,9 +490,10 @@ What it changes and what it does not:
 
 Same corpus, plan (`aws_followup_config.yaml`) and machines as 2026-09-28, capped index
 (100k rows a segment, 100 segments), `case_sensitive: 'true'` so that stage 5 takes the long
-keywords. Queries per second at 20 rows a page, ordered:
+keywords -- which also makes this a different index from the 2026-09-28 one (see below).
+Queries per second at 20 rows a page, ordered:
 
-| keyword | 2026-09-28 (node verifies) | 2026-09-29 (ScyllaDB verifies) | store reads per query |
+| keyword | 2026-09-28 (node verifies, case-insensitive) | 2026-09-29 (ScyllaDB verifies, case-sensitive) | store reads per query |
 |---|---|---|---|
 | 8 characters | 5.0k | 6.2k | 2.4 |
 | 16 characters | 2.3k | 2.8k | 1.0 |
@@ -502,10 +503,22 @@ keywords. Queries per second at 20 rows a page, ordered:
 - The walk itself did not change: a rare keyword still opens all 100 segments, 0.6 ms of walk
   at 8 characters and 2.4 ms at 32. That is the next thing to fix (rarest gram first, then a
   per-segment gram filter), and stage 5 only took verification off it.
-- Short keywords are unchanged at 9.1k-9.9k per second; the deep 8-character page (window 0.5)
-  reaches the 10k the loader asks for.
-- The index is 57.6 bytes per name against 49.8: a case-sensitive index keeps more distinct
-  grams. That is the index option, not stage 5.
+- Short keywords got slower, not faster: 1 to 4 characters went from 9.8k-10k to 9.1k-9.9k per
+  second, and the index node's walk for 1 and 2 characters from 92-119 us to 128-170 us. Just
+  under the loader's fixed 10k rate is where queueing starts, so p99 went from 0.2-2.2 s to
+  1.2-10.7 s on those rows. The cause is not established. The two runs differ in more than
+  stage 5: this one's index is case-sensitive, and about 5.5% of the corpus's names carry
+  uppercase Latin letters, so the index has more distinct grams (57.6 bytes per name against
+  49.8) and the lowercase keywords match slightly fewer rows. The coordinator also builds its
+  result differently for every query now. Telling the two apart needs either the stage-4 code
+  on a case-sensitive index, or a latency phase at a rate below saturation.
+- The deep 8-character page (window 0.5) went from 9.2k to the full 10k, with p99 from 9.4 s
+  to 5 ms, because it moved from just above saturation to below it.
+
+Latency caveat for every row above: the loader drives a fixed 10k queries per second with 64
+in flight, and latte measures from the intended start time. Where a run cannot sustain 10k, the
+queue grows for the whole 120 s and p50/p99 measure the queue, not a query. Only the rows at
+the full 10k have latencies that describe the service time.
 
 The second dataset, the backfill with the rewrite, did not complete: at the end of the full scan
 (9.85M of 10M ingested) a status request to the index node and an SSH session to the ScyllaDB
