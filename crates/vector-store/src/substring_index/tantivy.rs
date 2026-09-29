@@ -1052,7 +1052,45 @@ enum SubstringQuery {
     Exact(Box<dyn Query>),
     /// The query is longer than any indexed term: candidates come from intersecting the
     /// postings of its `max_gram`-long substrings and must be verified against the stored value.
-    Candidates(Box<dyn Query>),
+    /// The grams come along so that a segment lacking one of them can be ruled out without
+    /// opening any posting list (`GramProbe`).
+    Candidates(Box<dyn Query>, Vec<Term>),
+}
+
+/// Rules segments out for a query answered from several grams: a segment whose term dictionary
+/// lacks any one of them holds no candidate, so it is skipped before the intersection opens a
+/// posting list per gram -- which, for a keyword that occurs in a handful of names, is nearly
+/// every segment, and what made a rare long keyword cost a full walk of every segment.
+///
+/// The gram last found missing is asked first (move to front): a rare keyword usually has one
+/// rare gram, which is absent from nearly every segment, so after the first miss a segment costs
+/// one dictionary lookup rather than one per gram plus opening their postings.
+struct GramProbe {
+    terms: Vec<Term>,
+    field: tantivy::schema::Field,
+}
+
+impl GramProbe {
+    fn new(terms: Vec<Term>, field: tantivy::schema::Field) -> Self {
+        Self { terms, field }
+    }
+
+    /// Whether `segment` certainly holds no candidate.
+    fn rules_out(&mut self, segment: &SegmentReader) -> anyhow::Result<bool> {
+        let inverted = segment
+            .inverted_index(self.field)
+            .map_err(|e| anyhow!("substring: failed to open the term dictionary: {e}"))?;
+        for i in 0..self.terms.len() {
+            let info = inverted
+                .get_term_info(&self.terms[i])
+                .map_err(|e| anyhow!("substring: failed to look a gram up: {e}"))?;
+            if info.is_none() {
+                self.terms[..=i].rotate_right(1);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 fn build_query(state: &SubstringIndexState, normalized: &str) -> anyhow::Result<SubstringQuery> {
@@ -1085,13 +1123,16 @@ fn build_query(state: &SubstringIndexState, normalized: &str) -> anyhow::Result<
 
     // Only the longest grams take part: every shorter substring of the query is contained in
     // one of them, so it would add a posting list to intersect without narrowing the result.
-    let clauses = grams_of_length(normalized, max_gram)
+    let grams = grams_of_length(normalized, max_gram);
+    let clauses = grams.iter().map(|gram| term_query(gram)).collect();
+    let terms = grams
         .iter()
-        .map(|gram| term_query(gram))
+        .map(|gram| Term::from_field_text(text_field, gram))
         .collect();
-    Ok(SubstringQuery::Candidates(Box::new(
-        BooleanQuery::intersection(clauses),
-    )))
+    Ok(SubstringQuery::Candidates(
+        Box::new(BooleanQuery::intersection(clauses)),
+        terms,
+    ))
 }
 
 /// Walks the matching documents in index order and returns the primary ids of the first
@@ -1210,9 +1251,11 @@ fn collect_matches_ordered(
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
 
-    let (query, has_candidates) = match build_query(state, normalized)? {
-        SubstringQuery::Exact(query) => (query, false),
-        SubstringQuery::Candidates(query) => (query, true),
+    let (query, has_candidates, mut probe) = match build_query(state, normalized)? {
+        SubstringQuery::Exact(query) => (query, false, None),
+        SubstringQuery::Candidates(query, terms) => {
+            (query, true, Some(GramProbe::new(terms, text_field)))
+        }
     };
     // A caller that declines verification takes the candidates as they are: the walk then
     // treats them as exact matches, which is the cheap branch below, and the page says so.
@@ -1283,6 +1326,11 @@ fn collect_matches_ordered(
             )
         };
 
+        if let Some(probe) = probe.as_mut()
+            && probe.rules_out(segment)?
+        {
+            continue;
+        }
         tally.segments_opened += 1;
         let mut scorer = weight
             .scorer(segment, 1.0)
@@ -1462,9 +1510,11 @@ fn collect_matches(
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
 
-    let (query, has_candidates) = match build_query(state, normalized)? {
-        SubstringQuery::Exact(query) => (query, false),
-        SubstringQuery::Candidates(query) => (query, true),
+    let (query, has_candidates, mut probe) = match build_query(state, normalized)? {
+        SubstringQuery::Exact(query) => (query, false, None),
+        SubstringQuery::Candidates(query, terms) => {
+            (query, true, Some(GramProbe::new(terms, text_field)))
+        }
     };
     // The store is read here anyway, for the primary id, so declining verification saves the
     // text comparison only; it exists so that both walks answer the request the same way.
@@ -1484,6 +1534,11 @@ fn collect_matches(
     let mut to_skip = offset;
     let mut matches = Vec::with_capacity(limit);
     'segments: for segment in searcher.segment_readers() {
+        if let Some(probe) = probe.as_mut()
+            && probe.rules_out(segment)?
+        {
+            continue;
+        }
         tally.segments_opened += 1;
         let mut scorer = weight
             .scorer(segment, 1.0)
@@ -3209,6 +3264,84 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3, 4]);
         let verified = search_unverified(&sender, "abc", 10, SearchWindow::default()).await;
         assert!(verified.verified);
+    }
+
+    /// A long keyword that occurs in one name opens only the segment holding it: every other
+    /// segment lacks one of its grams, which one term-dictionary lookup shows, and is skipped
+    /// before any posting list is opened. The answer is what the full walk gave.
+    #[rstest]
+    #[timeout(Duration::from_secs(30))]
+    #[tokio::test]
+    async fn a_rare_long_keyword_opens_only_the_segments_that_hold_its_grams() {
+        let cap = 120u32;
+        let sender = make_sender_with_options(IndexOptionsSubstring {
+            segment_max_docs: cap.to_string().parse().unwrap(),
+            ..ordered_options()
+        });
+        let mut acks = Vec::with_capacity(400);
+        for primary in 1..=400u64 {
+            let name = if primary == 250 {
+                "zqxwvkj将军".to_string()
+            } else {
+                format!("user{primary}将军")
+            };
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    name,
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let segments = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            if stats.tantivy.segment_count <= 6 || Instant::now() > deadline {
+                break stats.tantivy.segment_count;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            segments >= 3,
+            "the test needs several segments, got {segments}"
+        );
+
+        let before = sender.stats(make_index_key()).await.unwrap().walk;
+        let (ids, _) = search_ordered(&sender, "qxwvkj将", 20, SearchWindow::default()).await;
+        let after = sender.stats(make_index_key()).await.unwrap().walk;
+        assert_eq!(ids, vec![250]);
+        assert_eq!(
+            after.segments_opened - before.segments_opened,
+            1,
+            "{segments} segments considered, only the one holding the name should open"
+        );
+
+        // A keyword every segment holds the grams of still opens them all and answers in full.
+        let before = sender.stats(make_index_key()).await.unwrap().walk;
+        let (ids, _) = search_ordered(&sender, "er1将军", 400, SearchWindow::default()).await;
+        let after = sender.stats(make_index_key()).await.unwrap().walk;
+        assert_eq!(ids, vec![1]);
+        assert!(after.segments_opened - before.segments_opened >= 1);
+    }
+
+    /// The unordered walk skips the same way and answers the same.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn the_unordered_walk_skips_segments_without_the_grams_too() {
+        let sender = make_sender();
+        add_docs(&sender, NICKNAMES).await;
+        add_doc(&sender, 9, "zqxwvkj").await;
+        assert_eq!(search(&sender, "qxwvkj").await, vec![9]);
+        assert_eq!(search(&sender, "将军来了").await, vec![3]);
+        assert!(search(&sender, "qxwvkz").await.is_empty());
     }
 
     /// A keyword longer than `max_gram` takes the verification path, where the sort key is read
