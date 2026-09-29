@@ -516,8 +516,8 @@ Queries per second at 20 rows a page, ordered:
 
 - The store reads left the query path: one per query is the page being resolved.
 - The walk itself did not change: a rare keyword still opens all 100 segments, 0.6 ms of walk
-  at 8 characters and 2.4 ms at 32. That is the next thing to fix (rarest gram first, then a
-  per-segment gram filter), and stage 5 only took verification off it.
+  at 8 characters and 2.4 ms at 32. That was the next thing to fix, and stage 5 only took verification off it. The segment
+  skip below does it for 16 and 32 characters.
 - Short keywords got slower, not faster: 1 to 4 characters went from 9.8k-10k to 9.1k-9.9k per
   second, and the index node's walk for 1 and 2 characters from 92-119 us to 128-170 us. Just
   under the loader's fixed 10k rate is where queueing starts, so p99 went from 0.2-2.2 s to
@@ -541,6 +541,100 @@ node both timed out within the same minute, and the test stopped. Two nodes fail
 over different protocols points at the path from the laptop rather than at either node, but the
 node's own logs were not collected, so the cause is not established. The rewrite at 10M remains
 unmeasured.
+
+### The segment skip (vector-store `d7c5901`)
+
+A keyword past `max_gram` is an intersection of its `max_gram`-long grams. Before the walk opens
+a segment it looks each of those grams up in the segment's term dictionary, and a missing gram
+rules the segment out without opening its postings or its sort column. The gram that ruled out
+the last segment moves to the front of the list, so a rare gram found once is tried first in the
+segments after it. Nothing new is stored: the term dictionary is already there. Both walks, the
+ordered and the unordered, do it.
+
+### Measured at 10M names: the A/B run and the segment skip (AWS, 2026-09-29, run `4ce3f8b8`)
+
+Plan `aws_stage5_ab_config.yaml`, same corpus (`names_10M_long`, 10 shards of 1M) and machines
+(i4i.xlarge ScyllaDB, 4-core c8g.xlarge index node), 20 rows a page, ordered newest-first. Two
+case-sensitive indexes on the same table, both capped at 100k rows a segment and both built while
+the table loaded: `node_checks` (`verify_candidates: 'index'`) and `scylla_checks` (the default,
+so ScyllaDB verifies past `max_gram`). Both caught up 407 s after the load. `node_checks` settled at
+130 segments and 58.6 bytes a name, and `scylla_checks` at 152 segments and 59.0 bytes a name.
+Each segment spans about 2% of the sort range.
+
+Every query set was measured twice. The capacity run had no rate limit and 64 in flight, and its
+p99 includes queueing inside the loader. The latency run had a fixed rate below capacity and 16 in
+flight, so its p99 describes a query. Each run lasted 60 s. The walk column is the index node's
+walk per query, and the store column is document-store reads per query (the page being resolved
+counts too).
+
+Capacity:
+
+| keyword | scylla_checks q/s | node_checks q/s | walk us (S / N) | segments opened (S / N) | store reads (S / N) |
+|---|---|---|---|---|---|
+| 1 char | 9,578 | 10,100 | 206 / 179 | 2 of 152 / 2 of 130 | 20 / 20 |
+| 2 chars | 9,381 | 9,406 | 158 / 137 | 2 / 2 | 20 / 20 |
+| 2 chars, window 0.5 | 9,441 | 9,797 | 194 / 225 | 3 of 65 / 3 of 57 | 20 / 20 |
+| 4 chars | 8,597 | 8,783 | 98 / 236 | 2 / 2 | 18.3 / 52.4 |
+| 8 chars | 5,457 | 5,615 | 683 / 661 | 87 / 76 | 2.4 / 4.8 |
+| 8 chars, window 0.5 | 10,275 | 10,436 | 331 / 325 | 39 of 65 / 35 of 57 | 1.6 / 3.2 |
+| 16 chars | 5,874 | 5,850 | 616 / 622 | 28 / 28 | 1.0 / 2.0 |
+| 32 chars | 11,913 | 11,484 | 268 / 280 | 2.3 / 3.0 | 1.0 / 2.0 |
+
+In the capacity runs p99 was 7.6-19 ms and p50 5.3-11.7 ms.
+
+Latency (p50 / p99 in ms):
+
+| keyword | rate | scylla_checks | node_checks |
+|---|---|---|---|
+| 2 chars | 2,000/s | 1.20 / 1.81 | 1.12 / 1.66 |
+| 4 chars | 2,000/s | 1.18 / 4.65 | 1.28 / 1.91 |
+| 8 chars | 2,000/s | 1.67 / 3.48 | 1.61 / 3.38 |
+| 16 chars | 1,000/s | 1.58 / 4.25 | 1.56 / 3.96 |
+| 32 chars | 500/s | 1.49 / 2.42 | 1.55 / 2.84 |
+
+Where verification runs does not change capacity: every row is within 4% between the two
+indexes, and the indexes differ in segment count, so part of that is layout.
+
+- **4 characters** is the only case where the choice matters. ScyllaDB verifying takes the node's
+  walk from 236 to 98 us and its store reads from 52 to 18. But the pages come back short and are
+  topped up, and p99 goes from 1.9 to 4.7 ms. Capacity stays the same, because at 4 characters the
+  index node is not the limit: 1 to 4 characters all stop near 9-10k.
+- **8 to 32 characters**: the candidates are the matches (2.4 postings for 2.4 rows at 8
+  characters), so there is almost nothing to verify either way. The node only pays one extra
+  store read per match.
+
+For the dynamic choice this suggests the node should verify unless candidates are many and mostly
+false, since that is where shipping them costs round trips. The static default (ScyllaDB verifies
+on a case-sensitive index with `order_by`) saves node CPU but costs latency at 4 characters. It
+is kept for now, and the per-query choice stays future work.
+
+The segment skip, against run `697ea24b` the same morning (100 segments, no skip, ScyllaDB
+verifying):
+
+| keyword | 697ea24b q/s | 4ce3f8b8 q/s (scylla_checks) | walk us | segments opened |
+|---|---|---|---|---|
+| 8 chars | 6,190 | 5,457 | 598 -> 683 | 100 of 100 -> 87 of 152 |
+| 16 chars | 2,829 | 5,874 | 1,373 -> 616 | 100 of 100 -> 28 of 152 |
+| 32 chars | 1,668 | 11,913 | 2,353 -> 268 | 100 of 100 -> 2.3 of 152 |
+
+- 32 characters went up 7x and 16 characters 2x: one of their grams is missing from almost
+  every segment.
+- 8 characters did not gain. Its grams are common enough that 87 of 152 segments hold all of
+  them. It lost 12%, most likely because the index now has 152 segments instead of 100 (the load
+  was 10 shards of 1M instead of 100 of 100k). This is not established.
+- 8 and 16 characters over the whole range are now bounded by the index node's CPU: 620-680 us
+  a query on 4 cores is about 6k/s, which is what was measured. The budget is 400 us. The
+  remaining cost is the segments that do hold every gram but no match. Fewer, value-tight
+  segments (the rewrite, still unmeasured at 10M) or a per-segment filter on gram pairs are the
+  candidates.
+
+Against the requirement (10k q/s, p99 under 100 ms), the requirement is met at 1-2 characters,
+32 characters, and 8 characters over half the range. It is close at 4 characters (8.6-8.8k). It
+is not met at 8 and 16 characters over the whole range (5.5-5.9k). The latency part holds
+everywhere.
+
+Raw results: `~/sct-results/20260929-151353-071783/` on the laptop that drove the run. The index
+node's logs were collected this time (`collected_logs/`).
 
 ## Open questions and risks
 
