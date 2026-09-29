@@ -470,6 +470,21 @@ How it works:
 - The node's word is final: a page it reports verified (or an older node that never heard of
   the flag) is taken as it is.
 
+The choice is an index option read by ScyllaDB only, `verify_candidates`: absent, ScyllaDB
+checks whenever it can (a case-sensitive index with `order_by`) and the node otherwise;
+`'index'` keeps the check on the node, which is what lets one run compare the two on one index
+and one load (`aws_stage5_ab_config.yaml`); `'scylla'` insists on ScyllaDB and is refused at
+`CREATE INDEX` where it cannot check. An index without `order_by` always leaves the check on the
+node: it reports no cursor, so a page ScyllaDB left short could not resume.
+
+The static rule is a first step. Where the check belongs depends on the candidates: many false
+candidates, especially concentrated in one segment, are cheaper to reject on the node, which
+reads each from a block it has open, than to ship to ScyllaDB as base-table reads and extra
+round trips; a handful of candidates spread over many segments is cheaper to ship. A later
+value of the option can let the node decide per query from what the walk saw (candidates per
+segment, the share that failed on the pages it did verify) and report the decision in
+`verified`, which ScyllaDB already obeys.
+
 Why only case-sensitive indexes: a case-insensitive index lowercases values and keywords with
 Rust's Unicode tables, which ScyllaDB does not share. Folding on the coordinator with different
 tables would be the sort-key coupling all over again, silent on the exotic code points where
