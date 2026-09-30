@@ -568,7 +568,7 @@ the query files of the AWS runs:
 That is a third off the walk for 8 to 32 characters. At 4 characters the posting lists themselves
 dominate. What is left scales with the segment count: at 152 segments the check alone would be
 about 75-150 us, and the segments that hold every gram of an 8-character keyword without holding
-it are opened all the same. Not yet measured on AWS.
+it are opened all the same. Measured on AWS in run `7212926d` below.
 
 ### Measured at 10M names: the A/B run and the segment skip (AWS, 2026-09-29, run `4ce3f8b8`)
 
@@ -654,6 +654,62 @@ everywhere.
 
 Raw results: `~/sct-results/20260929-151353-071783/` on the laptop that drove the run. The index
 node's logs were collected this time (`collected_logs/`).
+
+### Measured at 10M names: segment size (AWS, 2026-09-30, run `7212926d`)
+
+Plan `aws_segment_size_config.yaml`, with the same corpus, machines and page of 20 as run
+`4ce3f8b8`. It runs vector-store `a7fefd2`, so a segment that passes the gram check has its
+postings built from the entries the check found. There are three case-sensitive indexes on one
+table, all built while it loaded and all verifying on the node (`verify_candidates: 'index'`).
+They differ only in the cap, 100k, 200k or 400k rows a segment, and settled at 107, 51 and 26
+segments, at 58.2, 56.3 and 54.9 bytes a name. The three caught up 756 s after the load.
+
+Capacity (unthrottled, 64 in flight), queries per second, with the index node's walk in us:
+
+| keyword | cap 100k | cap 200k | cap 400k |
+|---|---|---|---|
+| 1 char | 9,900 (166) | 9,973 (308) | 7,522 (476) |
+| 2 chars | 9,680 (125) | 9,731 (208) | 9,597 (309) |
+| 2 chars, window 0.5 | 9,850 (197) | 9,628 (319) | 9,562 (322) |
+| 4 chars | 9,258 (222) | 9,737 (186) | 9,717 (218) |
+| 8 chars | 7,864 (454) | 12,094 (275) | 18,732 (169) |
+| 8 chars, window 0.5 | 13,648 (241) | 23,401 (137) | 32,870 (89) |
+| 16 chars | 7,538 (474) | 8,661 (404) | 11,520 (290) |
+| 32 chars | 13,357 (244) | 10,282 (330) | 9,083 (380) |
+| no match | 41,376 (78) | 64,669 (35) | 70,061 (15) |
+| weakest | 7,538 | 8,661 | 7,522 |
+
+At a fixed rate below capacity (16 in flight), p99 was 1.6 to 3.4 ms for every keyword length on
+every index.
+
+Reading the table:
+
+- **The ~9.7k ceiling is ScyllaDB's row reads,** not the index. A 1- to 4-character keyword fills
+  its page, so each query reads 20 base rows, which comes to about 195k rows a second on one
+  i4i.xlarge. That is stage 1's ceiling, and it does not move with the cap. The query types above
+  it return fewer rows because the table holds no more: about 2.4 at 8 characters, 1.6 on the
+  deep 8-character page, 1 at 16 and 32 characters, and 0 for no match (the store reads per query
+  are twice the rows, one to verify and one to resolve). Their pages are complete, not cut short,
+  and for them the index node is the limit.
+- **Larger segments help the rare long keywords.** 8 characters goes from 7.9k to 18.7k and 16
+  characters from 7.5k to 11.5k, because fewer segments are checked and opened.
+- **Larger segments cost the commonest keyword.** At 400k a 1-character keyword's page comes from
+  two segments of 400k rows, whose postings are four times as long, and its walk reaches 476 us.
+- **32 characters gets worse as segments grow** (13.4k, 10.3k, 9.1k). A larger segment is more
+  likely to hold all ~30 of its grams, so more segments pass the check: 3.8 of 107 at 100k and
+  12.4 of 26 at 400k.
+- **200k is the flattest of the three.** Every shape is at 8.7k or above, and the weakest is 16
+  characters. A cap between 200k and 400k may balance 16 characters against 1 character better.
+  That is not measured.
+
+The gain from `a7fefd2`, at the same 100k cap as run `4ce3f8b8` (`node_checks`, the same code
+without the reuse): 8 characters went from 5,615 to 7,864 per second (walk 661 to 454 us), 16
+characters from 5,850 to 7,538 (622 to 474 us) and 32 characters from 11,484 to 13,357 (280 to
+244 us). Part of this is layout, since that index had 130 segments and this one 107. Per opened
+segment an 8-character keyword went from 8.7 to 6.9 us, -21%, which is the reuse itself.
+
+Raw results: `~/sct-results/20260930-075658-530733/` on the laptop that drove the run, with one
+row per phase in `summary.csv`.
 
 ## Open questions and risks
 
