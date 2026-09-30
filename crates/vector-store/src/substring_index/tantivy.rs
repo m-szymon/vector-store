@@ -63,10 +63,14 @@ use tantivy::index::SegmentId;
 use tantivy::index::SegmentMeta;
 use tantivy::indexer::MergeCandidate;
 use tantivy::indexer::MergePolicy;
-use tantivy::query::BooleanQuery;
+use tantivy::postings::TermInfo;
+use tantivy::query::ConstScorer;
 use tantivy::query::EnableScoring;
 use tantivy::query::Query;
+use tantivy::query::Scorer;
 use tantivy::query::TermQuery;
+use tantivy::query::Weight;
+use tantivy::query::intersect_scorers;
 use tantivy::schema::FAST;
 use tantivy::schema::INDEXED;
 use tantivy::schema::IndexRecordOption;
@@ -1052,44 +1056,107 @@ enum SubstringQuery {
     Exact(Box<dyn Query>),
     /// The query is longer than any indexed term: candidates come from intersecting the
     /// postings of its `max_gram`-long substrings and must be verified against the stored value.
-    /// The grams come along so that a segment lacking one of them can be ruled out without
-    /// opening any posting list (`GramProbe`).
-    Candidates(Box<dyn Query>, Vec<Term>),
+    Candidates(Vec<Term>),
 }
 
-/// Rules segments out for a query answered from several grams: a segment whose term dictionary
-/// lacks any one of them holds no candidate, so it is skipped before the intersection opens a
-/// posting list per gram -- which, for a keyword that occurs in a handful of names, is nearly
-/// every segment, and what made a rare long keyword cost a full walk of every segment.
+/// Opens the candidates of a query answered from several grams, one segment at a time.
 ///
-/// The gram last found missing is asked first (move to front): a rare keyword usually has one
-/// rare gram, which is absent from nearly every segment, so after the first miss a segment costs
-/// one dictionary lookup rather than one per gram plus opening their postings.
+/// A segment whose term dictionary lacks any one of the grams holds no candidate, so it is
+/// skipped before a single posting list is opened -- which, for a keyword that occurs in a
+/// handful of names, is nearly every segment, and what made a rare long keyword cost a full walk
+/// of every segment. The gram last found missing is asked first (move to front): a rare keyword
+/// usually has one rare gram, which is absent from nearly every segment, so after the first miss
+/// a segment costs one dictionary lookup.
+///
+/// A segment that holds every gram has its postings built from the entries the check just
+/// found, rather than through a `TermQuery` weight per gram, which would look each gram up again
+/// and open a field-norm reader an unscored walk never reads. Measured on the 10M-name corpus
+/// (`benches/substring_probe.rs`), that second pass was a third of the walk for 8 to 32
+/// characters.
 struct GramProbe {
     terms: Vec<Term>,
     field: tantivy::schema::Field,
+    found: Vec<TermInfo>,
 }
 
 impl GramProbe {
     fn new(terms: Vec<Term>, field: tantivy::schema::Field) -> Self {
-        Self { terms, field }
+        let found = Vec::with_capacity(terms.len());
+        Self {
+            terms,
+            field,
+            found,
+        }
     }
 
-    /// Whether `segment` certainly holds no candidate.
-    fn rules_out(&mut self, segment: &SegmentReader) -> anyhow::Result<bool> {
+    /// The segment's candidates, or `None` when it certainly holds none.
+    fn open(&mut self, segment: &SegmentReader) -> anyhow::Result<Option<Box<dyn Scorer>>> {
         let inverted = segment
             .inverted_index(self.field)
             .map_err(|e| anyhow!("substring: failed to open the term dictionary: {e}"))?;
+        self.found.clear();
         for i in 0..self.terms.len() {
             let info = inverted
                 .get_term_info(&self.terms[i])
                 .map_err(|e| anyhow!("substring: failed to look a gram up: {e}"))?;
-            if info.is_none() {
+            let Some(info) = info else {
                 self.terms[..=i].rotate_right(1);
-                return Ok(true);
-            }
+                return Ok(None);
+            };
+            self.found.push(info);
         }
-        Ok(false)
+        let postings = self
+            .found
+            .iter()
+            .map(|info| {
+                let postings = inverted
+                    .read_postings_from_terminfo(info, IndexRecordOption::Basic)
+                    .map_err(|e| anyhow!("substring: failed to open a gram's postings: {e}"))?;
+                Ok(Box::new(ConstScorer::new(postings, 1.0)) as Box<dyn Scorer>)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Some(intersect_scorers(postings, segment.max_doc())))
+    }
+}
+
+/// A query's matches, opened one segment at a time.
+enum QueryPostings {
+    /// One indexed term: every posting is an exact hit.
+    Term(Box<dyn Weight>),
+    /// Several grams: every posting is a candidate.
+    Grams(GramProbe),
+}
+
+impl QueryPostings {
+    /// The postings for `normalized`, and whether they are candidates rather than exact hits.
+    fn new(
+        state: &SubstringIndexState,
+        searcher: &tantivy::Searcher,
+        normalized: &str,
+    ) -> anyhow::Result<(Self, bool)> {
+        let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
+        Ok(match build_query(state, normalized)? {
+            SubstringQuery::Exact(query) => {
+                let weight = query
+                    .weight(EnableScoring::disabled_from_searcher(searcher))
+                    .map_err(|e| anyhow!("substring: failed to build the query: {e}"))?;
+                (Self::Term(weight), false)
+            }
+            SubstringQuery::Candidates(terms) => {
+                (Self::Grams(GramProbe::new(terms, text_field)), true)
+            }
+        })
+    }
+
+    /// The segment's matches, or `None` when it certainly holds none.
+    fn open(&mut self, segment: &SegmentReader) -> anyhow::Result<Option<Box<dyn Scorer>>> {
+        match self {
+            Self::Term(weight) => weight
+                .scorer(segment, 1.0)
+                .map(Some)
+                .map_err(|e| anyhow!("substring: failed to run the query: {e}")),
+            Self::Grams(probe) => probe.open(segment),
+        }
     }
 }
 
@@ -1110,28 +1177,20 @@ fn build_query(state: &SubstringIndexState, normalized: &str) -> anyhow::Result<
         .into());
     }
 
-    let term_query = |gram: &str| -> Box<dyn Query> {
-        Box::new(TermQuery::new(
-            Term::from_field_text(text_field, gram),
-            IndexRecordOption::Basic,
-        ))
-    };
-
     if query_len <= max_gram {
-        return Ok(SubstringQuery::Exact(term_query(normalized)));
+        return Ok(SubstringQuery::Exact(Box::new(TermQuery::new(
+            Term::from_field_text(text_field, normalized),
+            IndexRecordOption::Basic,
+        ))));
     }
 
     // Only the longest grams take part: every shorter substring of the query is contained in
     // one of them, so it would add a posting list to intersect without narrowing the result.
-    let grams = grams_of_length(normalized, max_gram);
-    let clauses = grams.iter().map(|gram| term_query(gram)).collect();
-    let terms = grams
-        .iter()
-        .map(|gram| Term::from_field_text(text_field, gram))
-        .collect();
     Ok(SubstringQuery::Candidates(
-        Box::new(BooleanQuery::intersection(clauses)),
-        terms,
+        grams_of_length(normalized, max_gram)
+            .iter()
+            .map(|gram| Term::from_field_text(text_field, gram))
+            .collect(),
     ))
 }
 
@@ -1251,21 +1310,12 @@ fn collect_matches_ordered(
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
 
-    let (query, has_candidates, mut probe) = match build_query(state, normalized)? {
-        SubstringQuery::Exact(query) => (query, false, None),
-        SubstringQuery::Candidates(query, terms) => {
-            (query, true, Some(GramProbe::new(terms, text_field)))
-        }
-    };
+    let searcher = state.reader.searcher();
+    let (mut postings, has_candidates) = QueryPostings::new(state, &searcher, normalized)?;
     // A caller that declines verification takes the candidates as they are: the walk then
     // treats them as exact matches, which is the cheap branch below, and the page says so.
     let needs_verification = has_candidates && verify;
     let verified = !has_candidates || verify;
-
-    let searcher = state.reader.searcher();
-    let weight = query
-        .weight(EnableScoring::disabled_from_searcher(&searcher))
-        .map_err(|e| anyhow!("substring: failed to build the query: {e}"))?;
 
     let started = Instant::now();
     let mut tally = WalkTally::default();
@@ -1326,15 +1376,10 @@ fn collect_matches_ordered(
             )
         };
 
-        if let Some(probe) = probe.as_mut()
-            && probe.rules_out(segment)?
-        {
+        let Some(mut scorer) = postings.open(segment)? else {
             continue;
-        }
+        };
         tally.segments_opened += 1;
-        let mut scorer = weight
-            .scorer(segment, 1.0)
-            .map_err(|e| anyhow!("substring: failed to run the query: {e}"))?;
         let alive = segment.alive_bitset();
 
         if !needs_verification {
@@ -1510,21 +1555,12 @@ fn collect_matches(
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
 
-    let (query, has_candidates, mut probe) = match build_query(state, normalized)? {
-        SubstringQuery::Exact(query) => (query, false, None),
-        SubstringQuery::Candidates(query, terms) => {
-            (query, true, Some(GramProbe::new(terms, text_field)))
-        }
-    };
+    let searcher = state.reader.searcher();
+    let (mut postings, has_candidates) = QueryPostings::new(state, &searcher, normalized)?;
     // The store is read here anyway, for the primary id, so declining verification saves the
     // text comparison only; it exists so that both walks answer the request the same way.
     let needs_verification = has_candidates && verify;
     let verified = !has_candidates || verify;
-
-    let searcher = state.reader.searcher();
-    let weight = query
-        .weight(EnableScoring::disabled_from_searcher(&searcher))
-        .map_err(|e| anyhow!("substring: failed to build the query: {e}"))?;
 
     let started = Instant::now();
     let mut tally = WalkTally {
@@ -1534,15 +1570,10 @@ fn collect_matches(
     let mut to_skip = offset;
     let mut matches = Vec::with_capacity(limit);
     'segments: for segment in searcher.segment_readers() {
-        if let Some(probe) = probe.as_mut()
-            && probe.rules_out(segment)?
-        {
+        let Some(mut scorer) = postings.open(segment)? else {
             continue;
-        }
+        };
         tally.segments_opened += 1;
-        let mut scorer = weight
-            .scorer(segment, 1.0)
-            .map_err(|e| anyhow!("substring: failed to run the query: {e}"))?;
         let alive = segment.alive_bitset();
         let store = segment
             .get_store_reader(STORE_CACHE_BLOCKS)
@@ -2234,6 +2265,21 @@ mod tests {
 
         // Four characters against a max_gram of three takes the intersect-and-verify path.
         assert_eq!(search(&sender, "将军来了").await, vec![3]);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_long_query_with_a_single_distinct_gram_is_exact() {
+        let sender = make_sender();
+        add_docs(
+            &sender,
+            &[(1, "aaa"), (2, "aaaa"), (3, "baaaab"), (4, "aa")],
+        )
+        .await;
+
+        // "aaaa" has one distinct gram, so its intersection has one member.
+        assert_eq!(search(&sender, "aaaa").await, vec![2, 3]);
     }
 
     #[rstest]

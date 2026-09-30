@@ -551,6 +551,25 @@ the last segment moves to the front of the list, so a rare gram found once is tr
 segments after it. Nothing new is stored: the term dictionary is already there. Both walks, the
 ordered and the unordered, do it.
 
+The check finds each gram's term-dictionary entry, and a segment that passes has its postings
+built from those entries. The first version kept only "present or not" and then opened the
+segment through a `BooleanQuery` of `TermQuery`s, whose weight looked every gram up again and
+opened a field-norm reader per gram that an unscored walk never reads. `benches/substring_probe.rs`
+measures the two on 1M names of the 10M corpus in 16 segments of 66k (the AWS segment size), with
+the query files of the AWS runs:
+
+| keyword | segments opened | walk before | walk after | the check alone |
+|---|---|---|---|---|
+| 4 chars | 16 of 16 | 65 us | 62 us | 5 us |
+| 8 chars | 9.2 of 16 | 38 us | 25 us | 8 us |
+| 16 chars | 4.1 of 16 | 50 us | 33 us | 14 us |
+| 32 chars | 1.2 of 16 | 43 us | 27 us | 16 us |
+
+That is a third off the walk for 8 to 32 characters. At 4 characters the posting lists themselves
+dominate. What is left scales with the segment count: at 152 segments the check alone would be
+about 75-150 us, and the segments that hold every gram of an 8-character keyword without holding
+it are opened all the same. Not yet measured on AWS.
+
 ### Measured at 10M names: the A/B run and the segment skip (AWS, 2026-09-29, run `4ce3f8b8`)
 
 Plan `aws_stage5_ab_config.yaml`, same corpus (`names_10M_long`, 10 shards of 1M) and machines
