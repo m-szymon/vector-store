@@ -252,6 +252,42 @@ approximately equal row count.
 
 ---
 
+## Embeddings for hybrid search
+
+`hybrid.rn` reads, next to each TSV, an fbin of the same name with one vector
+per record, in file order. `gen_embeddings.py` writes them for a prepared
+directory: `documents.fbin`, `shards/documents_NNN.fbin` for a sharded dataset,
+and a `queries_<set>.fbin` per query set. It needs numpy.
+
+```bash
+python gen_embeddings.py /tmp/scifact --dimension 768 --seed 0
+```
+
+The documents get one vector stream, so each shard's vectors are the matching
+slice of `documents.fbin`, and loading the shards one at a time builds the same
+index as loading `documents.tsv`. That keeps index-size steps comparable: load
+a shard, search, load the next, with the matching pair passed to the load phase:
+
+```bash
+latte load hybrid.rn <node> -P 'fts_data_dir="/tmp/scifact/"' -P dimension=768 \
+    -P 'documents_file="shards/documents_000.tsv"' \
+    -P 'vectors_file="shards/documents_000.fbin"'
+```
+
+Records are counted the way the workload reads them, so a malformed TSV fails
+here naming the line, and shards that no longer add up to `documents.tsv` are
+rejected. Run it after `prepare_dataset.py`, and again whenever that rewrites
+the dataset.
+
+The vectors are random, unit-length and seeded. They give the vector index a
+realistic size and dimension for latency and throughput, but the vector leg's
+ranking is noise, so accuracy metrics are only meaningful for `hybrid.rn`'s
+`bm25` mode. Random high-dimensional vectors are also a harder case for an ANN
+index than real embeddings, so treat ANN and `rrf` latency from them as
+pessimistic.
+
+---
+
 ## CLI Reference
 
 ```
@@ -327,6 +363,7 @@ Every prepared dataset contains a `manifest.json`:
 | `queries_<set>` | int | Synthetic query count per set |
 | `doc_token_stats` | object | Token stats (see below) |
 | `queries_<set>_token_stats` | object | Per-query-set token statistics |
+| `embeddings` | object | Written by `gen_embeddings.py`: `generator`, `dimension`, `seed`, and the record count of each fbin |
 
 `doc_token_stats` differs by mode:
 - **Non-synthetic:** `{total_token_count, mean_tokens_per_doc, p50_tokens_per_doc, p90_tokens_per_doc, max_tokens_per_doc}`

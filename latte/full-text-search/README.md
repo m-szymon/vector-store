@@ -198,5 +198,6 @@ fts.rn              # Latte workload for schema, load, index build, and search
 tsv_dataset.rn      # Document-corpus loader
 tsv_dataset_test.rn # Smoke test for the loader
 metrics.rn          # IR accuracy metrics
+gen_embeddings.py   # Random embeddings aligned with a prepared dataset, for hybrid search
 testdata/           # Smoke-test fixtures
 ```
