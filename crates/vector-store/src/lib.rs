@@ -85,6 +85,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -223,6 +224,7 @@ pub struct Config {
     pub diskann_backend: Option<DiskannBackendKind>,
     pub alter_index_simulator: bool,
     pub fulltext_indexes: bool,
+    pub pattern_indexes: bool,
     pub cql_connection_timeout: Option<Duration>,
     pub cql_keepalive_interval: Option<Duration>,
     pub cql_keepalive_timeout: Option<Duration>,
@@ -259,6 +261,7 @@ impl Default for Config {
             diskann_backend: None,
             alter_index_simulator: false,
             fulltext_indexes: true,
+            pattern_indexes: true,
             disable_colors: false,
             tls_cert_path: None,
             tls_key_path: None,
@@ -599,6 +602,176 @@ impl FromStr for Positions {
     }
 }
 
+/// Upper bound of `min_gram` and `max_gram` of a pattern index. Every substring of a value up
+/// to `max_gram` characters becomes an indexed term, so the bound keeps the index size sane.
+pub const MAX_GRAM_LIMIT: usize = 8;
+
+fn parse_gram(s: &str, name: &str) -> anyhow::Result<NonZeroUsize> {
+    let value: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Unknown {name} value: {s}"))?;
+    if value == 0 || value > MAX_GRAM_LIMIT {
+        anyhow::bail!("{name} must be in 1..={MAX_GRAM_LIMIT}, got {value}");
+    }
+    Ok(NonZeroUsize::new(value).unwrap())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Length in characters of the shortest term a pattern index stores for a value.
+/// A query shorter than this cannot be answered by the index.
+pub struct MinGram(NonZeroUsize);
+
+impl Default for MinGram {
+    fn default() -> Self {
+        Self(NonZeroUsize::new(1).unwrap())
+    }
+}
+
+impl FromStr for MinGram {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_gram(s, "min_gram").map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Length in characters of the longest term a pattern index stores for a value.
+/// A query up to this length is a single exact term lookup; a longer one is answered by
+/// intersecting its `max_gram`-long substrings and verifying the candidates.
+pub struct MaxGram(NonZeroUsize);
+
+impl Default for MaxGram {
+    fn default() -> Self {
+        Self(NonZeroUsize::new(3).unwrap())
+    }
+}
+
+impl FromStr for MaxGram {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_gram(s, "max_gram").map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Whether a pattern index matches letter case exactly (the CQL `LIKE` semantics) or
+/// lowercases both the indexed values and the queries.
+pub struct CaseSensitive(bool);
+
+impl Default for CaseSensitive {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+impl FromStr for CaseSensitive {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "true" => Ok(Self(true)),
+            "false" => Ok(Self(false)),
+            _ => Err(anyhow::anyhow!("Unknown case_sensitive value: {s}")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// The column a pattern index orders its results by, if it was given one.
+///
+/// Unset means the index answers in unspecified order, which is what lets a search stop at the
+/// limit instead of examining every match. An index with a sort column pays for the ordering, so
+/// this is opt-in rather than always on.
+pub struct OrderBy(Option<ColumnName>);
+
+impl FromStr for OrderBy {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let name = s.trim();
+        if name.is_empty() {
+            return Err(anyhow::anyhow!("order_by must name a column"));
+        }
+        Ok(Self(Some(ColumnName::from(name))))
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// Whether a pattern index keeps the primary id as a `FAST` column as well as in the document
+/// store. Off by default: it costs index size, and exists to measure what the store reads cost.
+///
+/// ScyllaDB knows this only as the placeholder `poc_option_1`, which it validates as non-empty and
+/// hands through; the meaning lives here.
+pub struct PrimaryIdFast(bool);
+
+impl FromStr for PrimaryIdFast {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => Ok(Self(true)),
+            "false" | "0" | "off" | "no" => Ok(Self(false)),
+            _ => Err(anyhow::anyhow!("Unknown primary_id_fast value: {s}")),
+        }
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// Whether a pattern index rewrites wide segments into range-aligned ones (P3b); `poc_option_3`.
+pub struct RewriteWideSegments(bool);
+
+impl FromStr for RewriteWideSegments {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        PrimaryIdFast::from_str(s).map(|flag| Self(*flag.as_ref()))
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// Whether a pattern index verifies a long keyword's candidates in posting order rather than
+/// from the highest sort key down. The slow way, kept for measurement; `poc_option_4`.
+pub struct VerifyInOrder(bool);
+
+impl FromStr for VerifyInOrder {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        PrimaryIdFast::from_str(s).map(|flag| Self(*flag.as_ref()))
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// The cap on a segment's size for a pattern index that merges by sort range (P3a), or none
+/// to keep Tantivy's default merge policy. ScyllaDB knows this only as the placeholder
+/// `poc_option_2`; the meaning lives here.
+pub struct SegmentMaxDocs(Option<NonZeroU32>);
+
+impl FromStr for SegmentMaxDocs {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let docs: u32 = s
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("segment_max_docs must be a positive integer: {e}"))?;
+        NonZeroU32::new(docs)
+            .map(|docs| Self(Some(docs)))
+            .ok_or_else(|| anyhow::anyhow!("segment_max_docs must be positive"))
+    }
+}
+
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
 pub struct Limit(NonZeroUsize);
@@ -712,12 +885,61 @@ pub struct IndexOptionsFts {
     pub positions: Positions,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-/// Pattern-specific index configuration.
-pub struct IndexOptionsPattern {}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// Pattern-search-specific index configuration.
+///
+/// Not `Copy`: `order_by` holds a column name. Clone it rather than reaching for a `*`.
+pub struct IndexOptionsPattern {
+    pub min_gram: MinGram,
+    pub max_gram: MaxGram,
+    pub case_sensitive: CaseSensitive,
+    /// The column results are ordered by, or none for unspecified order.
+    pub order_by: OrderBy,
+    /// Whether the primary id is also kept as a columnar (`FAST`) field, so that resolving a page
+    /// never touches the document store. Read from the `poc_option_1` placeholder.
+    pub primary_id_fast: PrimaryIdFast,
+    /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
+    /// default policy. Read from the `poc_option_2` placeholder.
+    pub segment_max_docs: SegmentMaxDocs,
+    /// Verify a long keyword's candidates in posting order, reading the store for each, as the
+    /// first stage-2 build did -- kept only to measure the two-pass walk against it. Read from
+    /// the `poc_option_4` placeholder.
+    pub verify_in_order: VerifyInOrder,
+    /// Rewrite segments that span far more of the sort range than their share of the rows
+    /// (P3b: an index built by a full scan, or a shuffled load) into range-aligned ones of
+    /// `segment_max_docs` rows. Needs the cap. Read from the `poc_option_3` placeholder.
+    pub rewrite_wide_segments: RewriteWideSegments,
+}
+
+impl IndexOptionsPattern {
+    /// Checks the cross-option invariant `min_gram <= max_gram`. ScyllaDB rejects such an index
+    /// at creation, so a violation here means the options were tampered with; fall back to the
+    /// defaults with a warning, the same way an unparsable single option is handled.
+    pub fn validated(self) -> Self {
+        if self.min_gram.as_ref().get() > self.max_gram.as_ref().get() {
+            tracing::warn!(
+                "pattern index options min_gram={} > max_gram={}, using the defaults",
+                self.min_gram.as_ref(),
+                self.max_gram.as_ref()
+            );
+            // Only the grams are in doubt, so only the grams are reset. Dropping the sort column
+            // here would silently turn an ordered index into an unordered one, and the queries
+            // would come back in the wrong order rather than failing.
+            return Self {
+                order_by: self.order_by,
+                primary_id_fast: self.primary_id_fast,
+                segment_max_docs: self.segment_max_docs,
+                verify_in_order: self.verify_in_order,
+                rewrite_wide_segments: self.rewrite_wide_segments,
+                ..Self::default()
+            };
+        }
+        self
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-/// Discriminates between index types.
+/// Discriminates between vector-search, full-text-search and pattern-search index.
 pub enum IndexKind {
     Vs(IndexOptionsVs),
     Fts(IndexOptionsFts),
@@ -838,6 +1060,23 @@ impl IndexMetadata {
         self.filtering_columns
             .iter()
             .filter(|col| !self.primary_key_columns.contains(col))
+    }
+
+    /// Every column whose value has to be fetched and kept alongside the indexed one: the filtering
+    /// columns, plus a pattern index's sort column.
+    ///
+    /// Three places have to agree on this set -- the full-scan SELECT, the CDC re-SELECT and the
+    /// table's column slots -- and a disagreement shows up as a row count mismatch far from the
+    /// cause, so they all go through here rather than each assembling their own list.
+    pub(crate) fn ingested_value_columns(&self) -> impl Iterator<Item = &ColumnName> {
+        let sort_column = self
+            .kind
+            .as_pattern()
+            .and_then(|options| options.order_by.as_ref().as_ref())
+            .filter(|col| {
+                !self.primary_key_columns.contains(col) && !self.filtering_columns.contains(col)
+            });
+        self.nonpk_filtering_columns().chain(sort_column)
     }
 }
 
@@ -973,7 +1212,8 @@ pub async fn run(
     let indexes = Arc::new(RwLock::new(Indexes::new()));
     let fts_index_factory =
         fts_index::new_fts_index_factory_tantivy(worker.clone(), memory.clone());
-    let pattern_index_factory = pattern_index::new_factory_tantivy(worker, memory);
+    let pattern_index_factory =
+        pattern_index::new_pattern_index_factory_tantivy(worker, memory, Arc::clone(&metrics));
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {
@@ -1174,6 +1414,86 @@ mod tests {
     }
 
     #[test]
+    fn grams_parse_within_bounds_only() {
+        assert_eq!("3".parse::<MinGram>().unwrap().as_ref().get(), 3);
+        assert_eq!(" 8 ".parse::<MaxGram>().unwrap().as_ref().get(), 8);
+        assert!("0".parse::<MinGram>().is_err());
+        assert!("9".parse::<MaxGram>().is_err());
+        assert!("three".parse::<MaxGram>().is_err());
+    }
+
+    #[test]
+    fn grams_default_to_one_and_three() {
+        assert_eq!(MinGram::default().as_ref().get(), 1);
+        assert_eq!(MaxGram::default().as_ref().get(), 3);
+    }
+
+    #[test]
+    fn case_sensitive_parses_booleans_and_defaults_to_true() {
+        assert!(*"true".parse::<CaseSensitive>().unwrap().as_ref());
+        assert!(!*"FALSE".parse::<CaseSensitive>().unwrap().as_ref());
+        assert!("yes".parse::<CaseSensitive>().is_err());
+        assert!(*CaseSensitive::default().as_ref());
+    }
+
+    #[test]
+    fn pattern_options_fall_back_to_defaults_when_min_exceeds_max() {
+        let inverted = IndexOptionsPattern {
+            min_gram: "4".parse().unwrap(),
+            max_gram: "3".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+            order_by: OrderBy::default(),
+            primary_id_fast: PrimaryIdFast::default(),
+            segment_max_docs: SegmentMaxDocs::default(),
+            verify_in_order: VerifyInOrder::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
+        };
+        assert_eq!(inverted.validated(), IndexOptionsPattern::default());
+
+        // The sort column survives a gram fallback: dropping it would answer in the wrong order
+        // rather than failing, which is far harder to notice.
+        let inverted_ordered = IndexOptionsPattern {
+            min_gram: "4".parse().unwrap(),
+            max_gram: "3".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+            order_by: "registered_at".parse().unwrap(),
+            primary_id_fast: PrimaryIdFast::from(true),
+            segment_max_docs: "250000".parse().unwrap(),
+            verify_in_order: VerifyInOrder::from(true),
+            rewrite_wide_segments: RewriteWideSegments::from(true),
+        };
+        assert_eq!(
+            inverted_ordered.validated(),
+            IndexOptionsPattern {
+                order_by: "registered_at".parse().unwrap(),
+                primary_id_fast: PrimaryIdFast::from(true),
+                segment_max_docs: "250000".parse().unwrap(),
+                verify_in_order: VerifyInOrder::from(true),
+                rewrite_wide_segments: RewriteWideSegments::from(true),
+                ..IndexOptionsPattern::default()
+            }
+        );
+
+        let valid = IndexOptionsPattern {
+            min_gram: "2".parse().unwrap(),
+            max_gram: "2".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+            order_by: OrderBy::default(),
+            primary_id_fast: PrimaryIdFast::default(),
+            segment_max_docs: SegmentMaxDocs::default(),
+            verify_in_order: VerifyInOrder::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
+        };
+        assert_eq!(valid.clone().validated(), valid);
+        assert!("0".parse::<SegmentMaxDocs>().is_err());
+        assert!("many".parse::<SegmentMaxDocs>().is_err());
+
+        assert!(*"TRUE".parse::<PrimaryIdFast>().unwrap().as_ref());
+        assert!(!*"off".parse::<PrimaryIdFast>().unwrap().as_ref());
+        assert!("maybe".parse::<PrimaryIdFast>().is_err());
+    }
+
+    #[test]
     fn nonpk_filtering_columns_excludes_primary_key_columns() {
         let metadata = IndexMetadata {
             keyspace_name: "ks".into(),
@@ -1200,5 +1520,72 @@ mod tests {
 
         let filtering_columns: Vec<_> = metadata.nonpk_filtering_columns().cloned().collect();
         assert_eq!(filtering_columns, vec!["f".into()]);
+    }
+
+    fn pattern_metadata(filtering_columns: Arc<[ColumnName]>, order_by: OrderBy) -> IndexMetadata {
+        IndexMetadata {
+            keyspace_name: "ks".into(),
+            index_name: "idx".into(),
+            table_name: "tbl".into(),
+            primary_key_columns: NonemptyArc::new(["pk"]).unwrap(),
+            partition_key_count: NonZeroUsize::new(1).unwrap(),
+            target_columns: NonemptyArc::new(["nickname"]).unwrap(),
+            partitioning: DbIndexPartitioning::Global,
+            filtering_columns,
+            alternator_attribute_types: Arc::new(BTreeMap::new()),
+            version: Uuid::new_v4().into(),
+            kind: IndexKind::Pattern(IndexOptionsPattern {
+                order_by,
+                ..IndexOptionsPattern::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_sort_column_joins_the_columns_whose_value_is_ingested() {
+        let metadata = pattern_metadata(Arc::new([]), "registered_at".parse().unwrap());
+        let columns: Vec<_> = metadata.ingested_value_columns().cloned().collect();
+        assert_eq!(columns, vec!["registered_at".into()]);
+    }
+
+    #[test]
+    fn without_a_sort_column_nothing_is_ingested_beyond_the_filtering_ones() {
+        let metadata = pattern_metadata(Arc::new(["f".into()]), OrderBy::default());
+        let columns: Vec<_> = metadata.ingested_value_columns().cloned().collect();
+        assert_eq!(columns, vec!["f".into()]);
+    }
+
+    /// The three sites that build this list feed `Table::new()`'s column slots and the SELECT that
+    /// fills them. A column listed twice would be fetched twice and throw the row-length check off
+    /// far from the cause.
+    #[test]
+    fn a_sort_column_is_not_ingested_twice() {
+        let already_filtering = pattern_metadata(Arc::new(["f".into()]), "f".parse().unwrap());
+        let columns: Vec<_> = already_filtering
+            .ingested_value_columns()
+            .cloned()
+            .collect();
+        assert_eq!(columns, vec!["f".into()]);
+
+        // A primary-key column is stored as a key offset rather than a value slot, so it must not
+        // be fetched as one either.
+        let primary_key = pattern_metadata(Arc::new([]), "pk".parse().unwrap());
+        assert_eq!(primary_key.ingested_value_columns().count(), 0);
+    }
+
+    #[test]
+    fn order_by_names_a_column_or_nothing() {
+        assert_eq!(
+            *"registered_at".parse::<OrderBy>().unwrap().as_ref(),
+            Some("registered_at".into())
+        );
+        // Trimmed, because CQL options come through as free text.
+        assert_eq!(
+            *"  registered_at  ".parse::<OrderBy>().unwrap().as_ref(),
+            Some("registered_at".into())
+        );
+        assert!("".parse::<OrderBy>().is_err());
+        assert!("   ".parse::<OrderBy>().is_err());
+        assert_eq!(*OrderBy::default().as_ref(), None);
     }
 }

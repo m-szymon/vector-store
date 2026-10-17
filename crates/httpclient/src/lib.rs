@@ -152,6 +152,79 @@ impl HttpClient {
             .unwrap()
     }
 
+    /// The keys of the rows matching a `LIKE` pattern, in one request.
+    pub async fn like(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        pattern: String,
+        limit: Limit,
+    ) -> HashMap<ColumnName, Vec<Value>> {
+        self.like_offset(keyspace_name, index_name, pattern, limit, 0)
+            .await
+    }
+
+    /// Like [`Self::like`], skipping the first `offset` matches of an unordered index.
+    pub async fn like_offset(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        pattern: String,
+        limit: Limit,
+        offset: usize,
+    ) -> HashMap<ColumnName, Vec<Value>> {
+        self.like_page(keyspace_name, index_name, pattern, limit, offset, None)
+            .await
+            .primary_keys
+    }
+
+    /// One page of an ordered pattern search, with the cursor to read the next one.
+    pub async fn like_page(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        pattern: String,
+        limit: Limit,
+        offset: usize,
+        cursor: Option<String>,
+    ) -> PostIndexLikeResponse {
+        self.post_like(keyspace_name, index_name, pattern, limit, offset, cursor)
+            .await
+            .json::<PostIndexLikeResponse>()
+            .await
+            .unwrap()
+    }
+
+    pub async fn post_like(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        pattern: String,
+        limit: Limit,
+        offset: usize,
+        cursor: Option<String>,
+    ) -> reqwest::Response {
+        let request = PostIndexLikeRequest {
+            pattern,
+            limit,
+            offset,
+            cursor,
+            order: None,
+            min_sort_value: None,
+            max_sort_value: None,
+            verify: None,
+        };
+        self.client
+            .post(format!(
+                "{}/indexes/{}/{}/like",
+                self.url_api, keyspace_name, index_name
+            ))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+    }
+
     pub async fn highlight(
         &self,
         keyspace_name: &KeyspaceName,
@@ -178,41 +251,6 @@ impl HttpClient {
         self.client
             .post(format!(
                 "{}/indexes/{}/{}/highlight",
-                self.url_api, keyspace_name, index_name
-            ))
-            .json(&request)
-            .send()
-            .await
-            .unwrap()
-    }
-
-    pub async fn like(
-        &self,
-        keyspace_name: &KeyspaceName,
-        index_name: &IndexName,
-        pattern: String,
-        limit: Limit,
-    ) -> HashMap<ColumnName, Vec<Value>> {
-        let resp = self
-            .post_like(keyspace_name, index_name, pattern, limit)
-            .await
-            .json::<PostIndexLikeResponse>()
-            .await
-            .unwrap();
-        resp.primary_keys
-    }
-
-    pub async fn post_like(
-        &self,
-        keyspace_name: &KeyspaceName,
-        index_name: &IndexName,
-        pattern: String,
-        limit: Limit,
-    ) -> reqwest::Response {
-        let request = PostIndexLikeRequest { pattern, limit };
-        self.client
-            .post(format!(
-                "{}/indexes/{}/{}/like",
                 self.url_api, keyspace_name, index_name
             ))
             .json(&request)

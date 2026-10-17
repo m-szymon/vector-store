@@ -3,19 +3,80 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use super::tantivy::PatternStatsR;
 use crate::AsyncInProgress;
 use crate::IndexKey;
 use crate::Limit;
 use crate::PrimaryKey;
+use crate::table::PartitionId;
 use crate::table::PrimaryId;
 use crate::vs_index::CountR;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-pub(crate) type PatternLikeR = anyhow::Result<Vec<PrimaryKey>>;
+/// Where in the value the keyword has to occur.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MatchKind {
+    /// Anywhere: `LIKE '%keyword%'`.
+    #[default]
+    Contains,
+    /// At the start: `LIKE 'keyword%'`.
+    Prefix,
+    /// At the end: `LIKE '%keyword'`.
+    Suffix,
+}
+
+/// Which way an ordered search walks the sort column.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SortOrder {
+    /// Highest sort key first: newest first for a timestamp.
+    #[default]
+    Desc,
+    Asc,
+}
+
+/// Where a page ended: the sort key of its last row and that row's primary key, so that the next
+/// page resumes among the rows sharing that sort key instead of skipping them. The primary key is
+/// what makes the cursor survive a rebuild of the index, whose internal ids are not stable; it is
+/// `None` when the row was gone by the time the page was assembled, and a resume from such a
+/// cursor takes every row sharing the sort key again rather than risk skipping one.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Cursor {
+    pub(crate) sort_key: u64,
+    pub(crate) primary_key: Option<PrimaryKey>,
+}
+
+/// What an ordered search may return: a direction, the cursor of the previous page, and a range
+/// on the sort column. Ignored by an unordered index.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SearchWindow {
+    pub(crate) order: SortOrder,
+    pub(crate) cursor: Option<Cursor>,
+    pub(crate) min_sort_key: Option<u64>,
+    pub(crate) max_sort_key: Option<u64>,
+}
+
+/// One page of a pattern search.
+#[derive(Debug)]
+pub(crate) struct PatternPage {
+    /// Primary keys of the rows whose indexed value contains the query. Ordered by the index's
+    /// sort column when it has one, otherwise in whatever order the walk found them.
+    pub(crate) primary_keys: Vec<PrimaryKey>,
+    /// Where the next page starts, for an ordered search that filled this one. `None` means there
+    /// is nothing more to read, or the index is unordered and does not page this way.
+    pub(crate) next_cursor: Option<Cursor>,
+    /// Whether every row is known to match. `false` when the search asked not to verify and the
+    /// keyword was past `max_gram`: the rows then hold every gram of it, and the caller checks.
+    pub(crate) verified: bool,
+}
+
+pub(crate) type PatternSearchR = anyhow::Result<PatternPage>;
 
 pub(crate) enum PatternIndex {
     AddDocument {
+        /// Needed to read the sort column back out of the table: a value is keyed by the partition
+        /// it lives in as well as by its primary id.
+        partition_id: PartitionId,
         primary_id: PrimaryId,
         document: String,
         in_progress: AsyncInProgress,
@@ -28,17 +89,32 @@ pub(crate) enum PatternIndex {
         index_key: IndexKey,
         tx: oneshot::Sender<CountR>,
     },
-    Like {
+    Search {
         index_key: IndexKey,
-        pattern: String,
+        query: String,
+        kind: MatchKind,
         limit: Limit,
-        tx: oneshot::Sender<PatternLikeR>,
+        /// Number of matching rows to skip before collecting `limit` of them. Ignored by an
+        /// ordered search, which pages by cursor instead.
+        offset: usize,
+        /// The direction, the previous page's cursor and the range restriction. Ignored by an
+        /// unordered index.
+        window: SearchWindow,
+        /// Whether candidates for a keyword past `max_gram` are checked against the stored
+        /// value here. `false` hands them back as they are, flagged, for the caller to check.
+        verify: bool,
+        tx: oneshot::Sender<PatternSearchR>,
+    },
+    Stats {
+        index_key: IndexKey,
+        tx: oneshot::Sender<PatternStatsR>,
     },
 }
 
 pub(crate) trait PatternIndexExt {
     async fn add_document(
         &self,
+        partition_id: PartitionId,
         primary_id: PrimaryId,
         document: String,
         in_progress: AsyncInProgress,
@@ -49,18 +125,31 @@ pub(crate) trait PatternIndexExt {
         in_progress: AsyncInProgress,
     ) -> anyhow::Result<()>;
     async fn count(&self, index_key: IndexKey) -> CountR;
-    async fn like(&self, index_key: IndexKey, pattern: String, limit: Limit) -> PatternLikeR;
+    #[allow(clippy::too_many_arguments)]
+    async fn search(
+        &self,
+        index_key: IndexKey,
+        query: String,
+        kind: MatchKind,
+        limit: Limit,
+        offset: usize,
+        window: SearchWindow,
+        verify: bool,
+    ) -> PatternSearchR;
+    async fn stats(&self, index_key: IndexKey) -> PatternStatsR;
 }
 
 impl PatternIndexExt for mpsc::Sender<PatternIndex> {
     async fn add_document(
         &self,
+        partition_id: PartitionId,
         primary_id: PrimaryId,
         document: String,
         in_progress: AsyncInProgress,
     ) -> anyhow::Result<()> {
         Ok(self
             .send(PatternIndex::AddDocument {
+                partition_id,
                 primary_id,
                 document,
                 in_progress,
@@ -87,15 +176,35 @@ impl PatternIndexExt for mpsc::Sender<PatternIndex> {
         rx.await?
     }
 
-    async fn like(&self, index_key: IndexKey, pattern: String, limit: Limit) -> PatternLikeR {
+    #[allow(clippy::too_many_arguments)]
+    async fn search(
+        &self,
+        index_key: IndexKey,
+        query: String,
+        kind: MatchKind,
+        limit: Limit,
+        offset: usize,
+        window: SearchWindow,
+        verify: bool,
+    ) -> PatternSearchR {
         let (tx, rx) = oneshot::channel();
-        self.send(PatternIndex::Like {
+        self.send(PatternIndex::Search {
             index_key,
-            pattern,
+            query,
+            kind,
             limit,
+            offset,
+            window,
+            verify,
             tx,
         })
         .await?;
+        rx.await?
+    }
+
+    async fn stats(&self, index_key: IndexKey) -> PatternStatsR {
+        let (tx, rx) = oneshot::channel();
+        self.send(PatternIndex::Stats { index_key, tx }).await?;
         rx.await?
     }
 }

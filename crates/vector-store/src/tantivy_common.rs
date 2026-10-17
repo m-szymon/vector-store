@@ -5,7 +5,7 @@
 
 //! Plumbing shared by every Tantivy-backed index kind.
 //!
-//! The full-text and the substring indexes differ in how they build a schema, tokenize text and
+//! The full-text and the pattern indexes differ in how they build a schema, tokenize text and
 //! answer queries, but they manage the Tantivy writer, reader, commits, deletes, statistics and
 //! memory gating in exactly the same way. That common part lives here, parametrised by a
 //! [`TantivyBackend`] that supplies the kind-specific bits.
@@ -19,7 +19,9 @@ use anyhow::anyhow;
 use tantivy::IndexWriter;
 use tantivy::ReloadPolicy;
 use tantivy::TantivyDocument;
+use tantivy::index::SegmentId;
 use tantivy::indexer::IndexWriterOptions;
+use tantivy::indexer::MergePolicy;
 use tantivy::schema::Schema;
 use tokio::sync::watch;
 use tracing::error;
@@ -43,7 +45,7 @@ pub(crate) const MAX_UNCOMMITTED_THRESHOLD: usize = 10_000;
 
 /// Kind-specific behaviour of a Tantivy-backed index.
 pub(crate) trait TantivyBackend: Send + Sync + 'static {
-    /// Prefix of log and error messages, e.g. `fts` or `substring`.
+    /// Prefix of log and error messages, e.g. `fts` or `pattern`.
     const NAME: &'static str;
 
     /// Builds the schema of the index. It must contain the [`PRIMARY_ID_FIELD`] u64 field
@@ -53,8 +55,34 @@ pub(crate) trait TantivyBackend: Send + Sync + 'static {
     /// Registers the tokenizers the schema refers to.
     fn register_tokenizers(&self, index: &tantivy::Index) -> anyhow::Result<()>;
 
-    /// Turns a row's text into a document for the index.
-    fn create_doc(&self, schema: &Schema, primary_id: PrimaryId, text: &str) -> TantivyDocument;
+    /// What a row contributes to the index besides its primary id.
+    ///
+    /// An associated type rather than a fixed `&str` so that a backend needing more than the text
+    /// -- a pattern index also stores the value it orders by -- can say so without every other
+    /// backend growing a parameter it has no use for.
+    type Row<'a>;
+
+    /// Turns a row into a document for the index.
+    fn create_doc(
+        &self,
+        schema: &Schema,
+        primary_id: PrimaryId,
+        row: Self::Row<'_>,
+    ) -> TantivyDocument;
+
+    /// The merge policy the writer should use instead of Tantivy's default, if the backend has
+    /// one. Asked once, when the index is created.
+    fn merge_policy(&self) -> Option<Box<dyn MergePolicy>> {
+        None
+    }
+
+    /// Called after every reload of the reader, with the state the reader belongs to, for a
+    /// backend that keeps something per segment (a cache, the bounds its merge policy reads).
+    fn after_reload(&self, _state: &IndexState<Self>)
+    where
+        Self: Sized,
+    {
+    }
 }
 
 pub(crate) struct Writer {
@@ -82,7 +110,26 @@ impl Writer {
         self.uncommitted_docs()
     }
 
-    fn commit(&mut self, reload: impl FnOnce() -> tantivy::Result<()>) -> tantivy::Result<()> {
+    /// Re-adds `docs` under fresh opstamps after deleting whatever carried their terms: the delete
+    /// applies to documents added before it, so the new copy survives. Used to move rows between
+    /// segments; nothing in-progress is attached since the rows were already indexed.
+    pub(crate) fn rewrite_documents(
+        &mut self,
+        docs: impl IntoIterator<Item = (tantivy::Term, TantivyDocument)>,
+    ) -> tantivy::Result<usize> {
+        let mut count = 0;
+        for (term, doc) in docs {
+            self.writer.delete_term(term);
+            self.writer.add_document(doc)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn commit(
+        &mut self,
+        reload: impl FnOnce() -> tantivy::Result<()>,
+    ) -> tantivy::Result<()> {
         self.writer.commit()?;
         reload()?;
         self.uncommitted_docs_in_progress_guards.clear();
@@ -95,6 +142,15 @@ impl Writer {
 
     pub(crate) fn has_uncommitted_docs(&self) -> bool {
         !self.uncommitted_docs_in_progress_guards.is_empty()
+    }
+
+    /// Asks the writer to merge `segments`. The merge runs on Tantivy's own thread; the returned
+    /// future only reports its outcome and can be dropped.
+    pub(crate) fn merge(
+        &mut self,
+        segments: &[SegmentId],
+    ) -> tantivy::FutureResult<Option<tantivy::SegmentMeta>> {
+        self.writer.merge(segments)
     }
 }
 
@@ -117,6 +173,9 @@ impl<B: TantivyBackend> IndexState<B> {
         let writer = index
             .writer_with_options(options)
             .map_err(|e| anyhow!("{}: failed to create writer: {e}", B::NAME))?;
+        if let Some(policy) = backend.merge_policy() {
+            writer.set_merge_policy(policy);
+        }
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -150,20 +209,29 @@ pub(crate) fn commit<B: TantivyBackend>(state: &IndexState<B>, key: &IndexKey) {
         .write()
         .unwrap()
         .commit(|| state.reader.reload());
-    if let Err(err) = result {
-        error!("{}: failed to commit for {key}: {err}", B::NAME);
+    match result {
+        Ok(()) => state.backend.after_reload(state),
+        Err(err) => error!("{}: failed to commit for {key}: {err}", B::NAME),
+    }
+}
+
+/// Makes merges that finished since the last commit visible to the reader. A commit reloads on
+/// its own; this is for the quiet time after the writes stop, when merges are still completing
+/// and nothing else would reload.
+pub(crate) fn reload<B: TantivyBackend>(state: &IndexState<B>, key: &IndexKey) {
+    match state.reader.reload() {
+        Ok(()) => state.backend.after_reload(state),
+        Err(err) => error!("{}: failed to reload the reader for {key}: {err}", B::NAME),
     }
 }
 
 pub(crate) fn handle_add_document<B: TantivyBackend>(
     state: &IndexState<B>,
     primary_id: PrimaryId,
-    document: String,
+    row: B::Row<'_>,
     in_progress: AsyncInProgress,
 ) -> usize {
-    let doc = state
-        .backend
-        .create_doc(&state.schema, primary_id, &document);
+    let doc = state.backend.create_doc(&state.schema, primary_id, row);
     let mut writer = state.writer.write().unwrap();
     match writer.add_document(doc, in_progress) {
         Ok(pending) => pending,
