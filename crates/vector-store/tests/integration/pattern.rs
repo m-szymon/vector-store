@@ -9,9 +9,8 @@ use crate::db_basic::DbBasic;
 use crate::db_basic::ScanFn;
 use crate::db_basic::Table;
 use crate::wait_for;
-use httpapi::IndexOptions;
+use httpapi::IndexNotReadyReason;
 use httpapi::IndexStatus;
-use httpapi::PatternIndexOptions;
 use httpclient::HttpClient;
 use reqwest::StatusCode;
 use scylla::cluster::metadata::NativeType;
@@ -30,38 +29,30 @@ use vector_store::IndexKind;
 use vector_store::IndexMetadata;
 use vector_store::IndexOptionsPattern;
 use vector_store::NonemptyArc;
-use vector_store::NonemptyIteratorExt;
+use vector_store::Percentage;
 use vector_store::Timestamp;
 use vector_store::node_state::NodeState;
 
-fn pattern_index_metadata(
-    primary_key_columns: impl IntoIterator<Item = ColumnName>,
-) -> IndexMetadata {
-    let primary_key_columns = primary_key_columns
-        .into_iter()
-        .collect_nonempty_arc()
-        .unwrap();
+fn pattern_index_metadata(options: IndexOptionsPattern) -> IndexMetadata {
     IndexMetadata {
-        keyspace_name: "pattern_ks".into(),
-        table_name: "documents".into(),
-        index_name: "pattern_idx".into(),
-        partition_key_count: primary_key_columns.len(),
-        primary_key_columns,
-        target_columns: NonemptyArc::new(["content"]).unwrap(),
+        keyspace_name: "search_demo".into(),
+        table_name: "users".into(),
+        index_name: "users_nickname_sub".into(),
+        primary_key_columns: NonemptyArc::new(["pk"]).unwrap(),
+        partition_key_count: NonZeroUsize::new(1).unwrap(),
+        target_columns: NonemptyArc::new(["nickname"]).unwrap(),
         partitioning: DbIndexPartitioning::Global,
         filtering_columns: Arc::new([]),
         alternator_attribute_types: Default::default(),
         version: Uuid::new_v4().into(),
-        kind: IndexKind::Pattern(IndexOptionsPattern::default()),
+        kind: IndexKind::Pattern(options),
     }
 }
 
 async fn setup_pattern_store(
-    primary_keys: impl IntoIterator<Item = ColumnName>,
-    partition_key_count: usize,
-    columns: impl IntoIterator<Item = (ColumnName, NativeType)>,
+    options: IndexOptionsPattern,
+    pattern_indexes: bool,
     fullscan_fn: Option<ScanFn>,
-    cdc_fn: Option<ScanFn>,
 ) -> (
     impl std::future::Future<Output = (HttpClient, impl Sized, impl Sized)>,
     IndexMetadata,
@@ -70,28 +61,28 @@ async fn setup_pattern_store(
 ) {
     let config = Config {
         vector_store_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        pattern_indexes,
         ..Default::default()
     };
 
     let node_state = vector_store::new_node_state().await;
     let (db_actor, db) = db_basic::new(node_state.clone());
 
-    let columns: Arc<HashMap<_, _>> = Arc::new(columns.into_iter().collect());
-    let index = pattern_index_metadata(primary_keys);
+    let index = pattern_index_metadata(options);
 
     db.add_table(
         index.keyspace_name.clone(),
         index.table_name.clone(),
         Table {
             primary_keys: index.primary_key_columns.clone(),
-            partition_key_count,
-            columns,
+            partition_key_count: 1,
+            columns: Arc::new(HashMap::from([(ColumnName::from("pk"), NativeType::Int)])),
             dimensions: HashMap::new(),
         },
     )
     .unwrap();
 
-    db.add_index(index.clone(), fullscan_fn, cdc_fn).unwrap();
+    db.add_index(index.clone(), fullscan_fn, None).unwrap();
 
     let (receivers, senders) = create_config_channels(config).await;
 
@@ -110,9 +101,44 @@ async fn setup_pattern_store(
     (run, index, db, node_state)
 }
 
-pub(crate) async fn setup_pattern_and_wait(
-    documents: impl IntoIterator<Item = (Vec<CqlValue>, &str, u64)>,
-    expected_count: usize,
+fn documents(rows: &[(i32, &str)]) -> ScanFn {
+    let rows: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (pk, text))| {
+            (
+                [CqlValue::Int(*pk)].into(),
+                Some(text.to_string()),
+                Timestamp::from_millis(10 * (i as u64 + 1)),
+            )
+        })
+        .collect();
+    db_basic::scan_fn_documents(rows)
+}
+
+const NICKNAMES: &[(i32, &str)] = &[
+    (1, "宇将军"),
+    (2, "李将军"),
+    (3, "将军来了"),
+    (4, "将领"),
+    (5, "元帅"),
+    (6, "南宫月"),
+    (7, "小南宫粉丝团"),
+    (8, "宫南"),
+];
+
+const USERNAMES: &[(i32, &str)] = &[
+    (1, "NGgamer"),
+    (2, "kingNG"),
+    (3, "gn"),
+    (4, "925555"),
+    (5, "9255551"),
+    (6, "925"),
+];
+
+async fn setup_and_wait(
+    options: IndexOptionsPattern,
+    rows: &[(i32, &str)],
 ) -> (
     HttpClient,
     httpapi::KeyspaceName,
@@ -120,25 +146,8 @@ pub(crate) async fn setup_pattern_and_wait(
     DbBasic,
     impl Sized,
 ) {
-    let docs: Vec<_> = documents
-        .into_iter()
-        .map(|(pk, doc, ts)| {
-            (
-                pk.into_iter().collect(),
-                Some(doc.to_string()),
-                Timestamp::from_millis(ts),
-            )
-        })
-        .collect();
-
-    let (run, index, db, node_state) = setup_pattern_store(
-        ["pk".into()],
-        1,
-        [("pk".to_string().into(), NativeType::Int)],
-        Some(db_basic::scan_fn_documents(docs)),
-        None,
-    )
-    .await;
+    let (run, index, db, node_state) =
+        setup_pattern_store(options, true, Some(documents(rows))).await;
 
     let (client, server, config_tx) = run.await;
     let keyspace_name = index.keyspace_name.clone().into();
@@ -150,10 +159,10 @@ pub(crate) async fn setup_pattern_and_wait(
                 .index_status(&keyspace_name, &index_name)
                 .await
                 .is_ok_and(|status| {
-                    status.status == IndexStatus::Serving && status.count == expected_count
+                    status.status == IndexStatus::Serving && status.count == rows.len()
                 })
         },
-        "Waiting for pattern index to be serving",
+        "Waiting for the pattern index to be serving",
     )
     .await;
 
@@ -166,56 +175,167 @@ pub(crate) async fn setup_pattern_and_wait(
     )
 }
 
-#[tokio::test]
-async fn pattern_index_visible_in_indexes() {
-    crate::enable_tracing();
-
-    let (client, keyspace_name, index_name, _db, _hold) = setup_pattern_and_wait(
-        [
-            (vec![CqlValue::Int(1)], "the quick brown fox", 10),
-            (vec![CqlValue::Int(2)], "lazy dog sleeps all day", 20),
-        ],
-        2,
-    )
-    .await;
-
-    let indexes = client.indexes().await;
-    assert_eq!(indexes.len(), 1);
-    assert_eq!(indexes[0].keyspace, keyspace_name);
-    assert_eq!(indexes[0].index, index_name);
-    assert_eq!(
-        indexes[0].options,
-        IndexOptions::Pattern(PatternIndexOptions {})
-    );
+async fn contains(
+    client: &HttpClient,
+    keyspace_name: &httpapi::KeyspaceName,
+    index_name: &httpapi::IndexName,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Vec<i64> {
+    let primary_keys = client
+        .like_offset(
+            keyspace_name,
+            index_name,
+            format!("%{query}%"),
+            NonZeroUsize::new(limit).unwrap().into(),
+            offset,
+        )
+        .await;
+    let mut ids: Vec<i64> = primary_keys
+        .get(&"pk".into())
+        .expect("pk column in the response")
+        .iter()
+        .map(|value| value.as_i64().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 #[tokio::test]
 async fn pattern_index_returns_proper_count() {
     crate::enable_tracing();
 
+    let (client, keyspace_name, index_name, _db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+
+    let status = client
+        .index_status(&keyspace_name, &index_name)
+        .await
+        .unwrap();
+
+    assert_eq!(status.status, IndexStatus::Serving);
+    assert_eq!(status.count, NICKNAMES.len());
+}
+
+#[tokio::test]
+async fn pattern_contains_returns_cjk_infix_matches() {
+    crate::enable_tracing();
+
+    let (client, ks, idx, _db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+
+    assert_eq!(contains(&client, &ks, &idx, "将军", 20, 0).await, [1, 2, 3]);
+    assert_eq!(contains(&client, &ks, &idx, "南宫", 20, 0).await, [6, 7]);
+    assert_eq!(contains(&client, &ks, &idx, "宫", 20, 0).await, [6, 7, 8]);
+    assert_eq!(contains(&client, &ks, &idx, "将军来了", 20, 0).await, [3]);
+}
+
+#[tokio::test]
+async fn pattern_contains_case_insensitive_option() {
+    crate::enable_tracing();
+
+    let options = IndexOptionsPattern {
+        case_sensitive: false.into(),
+        ..Default::default()
+    };
+    let (client, ks, idx, _db, _hold) = setup_and_wait(options, USERNAMES).await;
+
+    assert_eq!(contains(&client, &ks, &idx, "ng", 20, 0).await, [1, 2]);
+    assert_eq!(contains(&client, &ks, &idx, "925555", 20, 0).await, [4, 5]);
+    assert_eq!(contains(&client, &ks, &idx, "925", 20, 0).await, [4, 5, 6]);
+}
+
+#[tokio::test]
+async fn pattern_contains_is_case_sensitive_by_default() {
+    crate::enable_tracing();
+
+    let (client, ks, idx, _db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), USERNAMES).await;
+
+    // Only "kingNG" contains a lowercase "ng" (inside "king").
+    assert_eq!(contains(&client, &ks, &idx, "ng", 20, 0).await, [2]);
+    assert_eq!(contains(&client, &ks, &idx, "NG", 20, 0).await, [1, 2]);
+}
+
+#[tokio::test]
+async fn pattern_contains_returns_empty_for_no_match() {
+    crate::enable_tracing();
+
+    let (client, ks, idx, _db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+
+    assert!(contains(&client, &ks, &idx, "元将", 20, 0).await.is_empty());
+}
+
+#[tokio::test]
+async fn pattern_contains_respects_limit_and_offset() {
+    crate::enable_tracing();
+
+    let (client, ks, idx, _db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+
+    let first = contains(&client, &ks, &idx, "宫", 2, 0).await;
+    let rest = contains(&client, &ks, &idx, "宫", 2, 2).await;
+    assert_eq!(first.len(), 2);
+    assert_eq!(rest.len(), 1);
+    let mut all: Vec<_> = first.into_iter().chain(rest).collect();
+    all.sort_unstable();
+    assert_eq!(all, [6, 7, 8]);
+}
+
+#[tokio::test]
+async fn pattern_contains_not_found_returns_404() {
+    crate::enable_tracing();
+
+    let (client, _ks, _idx, _db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+
+    let response = client
+        .post_like(
+            &"nonexistent_ks".into(),
+            &"nonexistent_idx".into(),
+            "%将军%".into(),
+            NonZeroUsize::new(10).unwrap().into(),
+            0,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn pattern_contains_empty_query_returns_400() {
+    crate::enable_tracing();
+
+    let (client, ks, idx, _db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+
+    let response = client
+        .post_like(
+            &ks,
+            &idx,
+            "".into(),
+            NonZeroUsize::new(10).unwrap().into(),
+            0,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pattern_contains_returns_503_and_node_bootstrapping_reason_while_the_first_index_builds() {
+    crate::enable_tracing();
+
     let (run, index, _db, _node_state) = setup_pattern_store(
-        ["pk".into(), "ck".into()],
-        1,
-        [
-            ("pk".to_string().into(), NativeType::Int),
-            ("ck".to_string().into(), NativeType::Text),
-        ],
-        Some(db_basic::scan_fn_documents([
-            (
-                [CqlValue::Int(1), CqlValue::Text("one".to_string())].into(),
-                Some("hello world".to_string()),
-                Timestamp::from_millis(10),
-            ),
-            (
-                [CqlValue::Int(2), CqlValue::Text("two".to_string())].into(),
-                Some("foo bar".to_string()),
-                Timestamp::from_millis(20),
-            ),
-        ])),
-        None,
+        IndexOptionsPattern::default(),
+        true,
+        Some(db_basic::pending_scan_fn()),
     )
     .await;
-
     let (client, _server, _config_tx) = run.await;
 
     let keyspace_name = index.keyspace_name.clone().into();
@@ -226,23 +346,9 @@ async fn pattern_index_returns_proper_count() {
             client
                 .index_status(&keyspace_name, &index_name)
                 .await
-                .is_ok_and(|status| status.status == IndexStatus::Serving && status.count == 2)
+                .is_ok_and(|status| status.status == IndexStatus::Bootstrapping)
         },
-        "Waiting for pattern index to be serving with count == 2",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn pattern_like_search_returns_error() {
-    crate::enable_tracing();
-
-    let (client, keyspace_name, index_name, _db, _hold) = setup_pattern_and_wait(
-        [
-            (vec![CqlValue::Int(1)], "the quick brown fox", 10),
-            (vec![CqlValue::Int(2)], "lazy dog sleeps all day", 20),
-        ],
-        2,
+        "Waiting for the pattern index to be bootstrapping",
     )
     .await;
 
@@ -250,10 +356,134 @@ async fn pattern_like_search_returns_error() {
         .post_like(
             &keyspace_name,
             &index_name,
-            "%fox%".into(),
+            "%将军%".into(),
             NonZeroUsize::new(10).unwrap().into(),
+            0,
+            None,
         )
         .await;
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let reason: IndexNotReadyReason = response.json().await.unwrap();
+    assert_eq!(reason, IndexNotReadyReason::NodeBootstrapping);
+}
+
+#[tokio::test]
+async fn pattern_contains_returns_503_and_index_building_reason_while_a_later_index_builds() {
+    crate::enable_tracing();
+
+    let (client, _ks, _idx, db, _hold) =
+        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+
+    let index = IndexMetadata {
+        index_name: "users_username_sub".into(),
+        ..pattern_index_metadata(IndexOptionsPattern::default())
+    };
+    db.add_index(index.clone(), Some(db_basic::pending_scan_fn()), None)
+        .unwrap();
+    db.set_next_full_scan_progress(vector_store::Progress::InProgress(
+        Percentage::try_from(75.0).unwrap(),
+    ));
+
+    let keyspace_name = index.keyspace_name.clone().into();
+    let index_name = index.index_name.clone().into();
+
+    wait_for(
+        || async {
+            client
+                .index_status(&keyspace_name, &index_name)
+                .await
+                .is_ok_and(|status| status.status == IndexStatus::Bootstrapping)
+        },
+        "Waiting for the pattern index to be bootstrapping",
+    )
+    .await;
+
+    let response = client
+        .post_like(
+            &keyspace_name,
+            &index_name,
+            "%将军%".into(),
+            NonZeroUsize::new(10).unwrap().into(),
+            0,
+            None,
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let reason: IndexNotReadyReason = response.json().await.unwrap();
+    let IndexNotReadyReason::IndexBuilding { message } = reason else {
+        panic!("expected IndexBuilding, got {reason:?}");
+    };
+    assert!(
+        message.contains("progress: 75.000%"),
+        "unexpected message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn pattern_index_appears_in_indexes_list_with_its_options() {
+    crate::enable_tracing();
+
+    let options = IndexOptionsPattern {
+        min_gram: "2".parse().unwrap(),
+        max_gram: "4".parse().unwrap(),
+        case_sensitive: false.into(),
+        ..Default::default()
+    };
+    let (client, ks, idx, _db, _hold) = setup_and_wait(options, NICKNAMES).await;
+
+    let indexes = client.indexes().await;
+    let listed = indexes
+        .iter()
+        .find(|i| i.keyspace == ks && i.index == idx)
+        .expect("the pattern index is listed");
+
+    assert_eq!(
+        listed.options,
+        httpapi::IndexOptions::Pattern(httpapi::PatternIndexOptions {
+            order_by: None,
+            min_gram: 2,
+            max_gram: 4,
+            case_sensitive: false,
+        })
+    );
+    assert_eq!(
+        client.index_info(&ks, &idx).await.unwrap().options,
+        listed.options
+    );
+}
+
+#[tokio::test]
+async fn pattern_indexes_are_ignored_when_disabled_by_config() {
+    crate::enable_tracing();
+
+    let (run, index, _db, _node_state) = setup_pattern_store(
+        IndexOptionsPattern::default(),
+        false,
+        Some(documents(NICKNAMES)),
+    )
+    .await;
+    let (client, _server, _config_tx) = run.await;
+
+    wait_for(
+        || async {
+            client
+                .status()
+                .await
+                .is_ok_and(|status| status == httpapi::NodeStatus::Serving)
+        },
+        "Waiting for the node to be serving",
+    )
+    .await;
+
+    let keyspace_name: httpapi::KeyspaceName = index.keyspace_name.clone().into();
+    let index_name: httpapi::IndexName = index.index_name.clone().into();
+    assert!(
+        client
+            .indexes()
+            .await
+            .iter()
+            .all(|i| !(i.keyspace == keyspace_name && i.index == index_name))
+    );
 }

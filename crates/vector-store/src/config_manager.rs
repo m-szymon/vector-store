@@ -485,6 +485,18 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
         config.fulltext_indexes = fulltext_indexes;
     }
 
+    if let Some(pattern_indexes) = env("VECTOR_STORE_PATTERN_INDEXES")
+        .ok()
+        .map(|v| {
+            v.trim().parse().map_err(|_| {
+                anyhow!("Unable to parse VECTOR_STORE_PATTERN_INDEXES env (true/false)")
+            })
+        })
+        .transpose()?
+    {
+        config.pattern_indexes = pattern_indexes;
+    }
+
     config.credentials = credentials(&env).await?;
 
     // Load TLS configuration
@@ -955,6 +967,38 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Unable to parse VECTOR_STORE_FULLTEXT_INDEXES")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_config_pattern_indexes_default_true() {
+        let env = mock_env(HashMap::new());
+        let config = load_config(env).await.unwrap();
+        assert!(config.pattern_indexes);
+    }
+
+    #[tokio::test]
+    async fn load_config_pattern_indexes_override_false() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_PATTERN_INDEXES",
+            "false".into(),
+        )]));
+        let config = load_config(env).await.unwrap();
+        assert!(!config.pattern_indexes);
+    }
+
+    #[tokio::test]
+    async fn load_config_pattern_indexes_invalid_value_errors() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_PATTERN_INDEXES",
+            "not-a-bool".into(),
+        )]));
+        let result = load_config(env).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unable to parse VECTOR_STORE_PATTERN_INDEXES")
         );
     }
 

@@ -2,6 +2,7 @@
  * Copyright 2025-present ScyllaDB
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+use dashmap::DashMap;
 use dashmap::DashSet;
 use prometheus::CounterVec;
 use prometheus::GaugeVec;
@@ -32,8 +33,106 @@ pub(crate) struct Metrics {
     pub cdc_last_processed_timestamp_seconds: GaugeVec,
     pub fts_index_size_bytes: GaugeVec,
     pub fts_segment_count: GaugeVec,
+    pub pattern_index_size_bytes: GaugeVec,
+    pub pattern_segment_count: GaugeVec,
+    /// What a pattern index's searches have cost, summed since it was created. Read off the
+    /// index on scrape, so they are gauges that only ever grow; a client diffs two scrapes to
+    /// price the queries in between. One entry per [`PATTERN_SEARCH_TOTALS`].
+    pub pattern_search_totals: Vec<GaugeVec>,
+    /// Progress of a pattern index's rewrite of wide segments. One entry per
+    /// [`PATTERN_REWRITE_GAUGES`].
+    pub pattern_rewrite: Vec<GaugeVec>,
+    /// A pattern index's segments, one label set per segment ordinal: how many rows each holds
+    /// and the span of sort keys its pruning is judged by. See [`PATTERN_SEGMENT_GAUGES`].
+    pub pattern_segment_layout: Vec<GaugeVec>,
     dirty_indexes: Arc<DashSet<(String, String)>>,
+    /// How many segment label sets each pattern index exported last time, so a scrape after a
+    /// merge can drop the ordinals that no longer exist.
+    pattern_segments_exported: Arc<DashMap<(String, String), usize>>,
 }
+
+/// The per-index search totals, in the order `pattern_search_totals` holds them.
+pub(crate) const PATTERN_SEARCH_TOTALS: &[(&str, &str)] = &[
+    (
+        "pattern_search_total",
+        "Pattern searches served by an index since it was created",
+    ),
+    (
+        "pattern_search_segments_considered_total",
+        "Segments a pattern search could not rule out from their bounds, summed over searches",
+    ),
+    (
+        "pattern_search_segments_opened_total",
+        "Segments a pattern search walked, summed over searches",
+    ),
+    (
+        "pattern_search_postings_scanned_total",
+        "Postings a pattern search visited, summed over searches",
+    ),
+    (
+        "pattern_search_heap_entrants_total",
+        "Matches that entered a pattern search's page or top-k heap, summed over searches",
+    ),
+    (
+        "pattern_search_store_reads_total",
+        "Documents a pattern search read from the document store, summed over searches",
+    ),
+    (
+        "pattern_search_walk_seconds_total",
+        "Time pattern searches spent walking the index, summed over searches",
+    ),
+    (
+        "pattern_search_column_opens_total",
+        "Columns a pattern search had to open (misses of the per-segment column cache), summed over searches",
+    ),
+    (
+        "pattern_search_prepare_seconds_total",
+        "Time pattern searches spent reading segment bounds before the first posting (part of the walk time), summed over searches",
+    ),
+    (
+        "pattern_search_page_resolve_seconds_total",
+        "Time pattern searches spent turning the page into primary ids (part of the walk time), summed over searches",
+    ),
+];
+
+/// The rewrite (P3b) gauges, in the order `pattern_rewrite` holds them.
+pub(crate) const PATTERN_REWRITE_GAUGES: &[(&str, &str)] = &[
+    (
+        "pattern_rewrite_ranges_total",
+        "Ranges the current or last rewrite of wide segments was split into",
+    ),
+    (
+        "pattern_rewrite_ranges_done",
+        "Ranges of that rewrite moved so far",
+    ),
+    (
+        "pattern_rewrite_docs_total",
+        "Rows moved by rewrites since the index was created",
+    ),
+    (
+        "pattern_l0_docs",
+        "Rows in wide segments when the current or last rewrite was planned",
+    ),
+];
+
+/// The per-segment gauges, in the order `pattern_segment_layout` holds them. The sort bounds
+/// are exported with the sign bias of `cql_types::to_sort_key` undone, so a timestamp or integer
+/// column reads as its own value. A `date` column carries no bias and so comes out offset by
+/// 2^63; the spans and overlaps these gauges exist to show are unaffected.
+pub(crate) const PATTERN_SEGMENT_GAUGES: &[(&str, &str)] = &[
+    (
+        "pattern_segment_docs",
+        "Live rows in one segment of a pattern index",
+    ),
+    (
+        "pattern_segment_sort_min",
+        "Lowest sort-column value in one segment of an ordered pattern index",
+    ),
+    (
+        "pattern_segment_sort_max",
+        "Highest sort-column value in one segment of an ordered pattern index",
+    ),
+];
 
 impl Metrics {
     pub(crate) fn new() -> Self {
@@ -164,6 +263,55 @@ impl Metrics {
         )
         .unwrap();
 
+        let pattern_index_size_bytes = GaugeVec::new(
+            prometheus::Opts::new(
+                "pattern_index_size_bytes",
+                "Total size of a pattern search index (bytes)",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
+        let pattern_segment_count = GaugeVec::new(
+            prometheus::Opts::new(
+                "pattern_segment_count",
+                "Number of segments in a pattern search index",
+            ),
+            &["keyspace", "index_name"],
+        )
+        .unwrap();
+
+        let pattern_search_totals = PATTERN_SEARCH_TOTALS
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pattern_rewrite = PATTERN_REWRITE_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pattern_segment_layout = PATTERN_SEGMENT_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name", "segment"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
         registry.register(Box::new(latency.clone())).unwrap();
         registry.register(Box::new(size.clone())).unwrap();
         registry.register(Box::new(modified.clone())).unwrap();
@@ -184,6 +332,19 @@ impl Metrics {
         registry
             .register(Box::new(fts_segment_count.clone()))
             .unwrap();
+        registry
+            .register(Box::new(pattern_index_size_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(pattern_segment_count.clone()))
+            .unwrap();
+        for gauge in pattern_search_totals
+            .iter()
+            .chain(pattern_rewrite.iter())
+            .chain(pattern_segment_layout.iter())
+        {
+            registry.register(Box::new(gauge.clone())).unwrap();
+        }
 
         Self {
             registry,
@@ -197,7 +358,44 @@ impl Metrics {
             cdc_last_processed_timestamp_seconds,
             fts_index_size_bytes,
             fts_segment_count,
+            pattern_index_size_bytes,
+            pattern_segment_count,
+            pattern_search_totals,
+            pattern_rewrite,
+            pattern_segment_layout,
             dirty_indexes: Arc::new(DashSet::new()),
+            pattern_segments_exported: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Replace the segment label sets of one pattern index with `segments`, dropping the
+    /// ordinals a merge has retired since the last scrape.
+    pub(crate) fn set_pattern_segments(
+        &self,
+        keyspace: &str,
+        index_name: &str,
+        segments: &[[Option<f64>; 3]],
+    ) {
+        let key = (keyspace.to_owned(), index_name.to_owned());
+        let previous = self
+            .pattern_segments_exported
+            .insert(key, segments.len())
+            .unwrap_or(0);
+        for (ordinal, values) in segments.iter().enumerate() {
+            let ordinal = ordinal.to_string();
+            let labels = [keyspace, index_name, ordinal.as_str()];
+            for (gauge, value) in self.pattern_segment_layout.iter().zip(values) {
+                match value {
+                    Some(value) => gauge.with_label_values(&labels).set(*value),
+                    None => _ = gauge.remove_label_values(&labels),
+                }
+            }
+        }
+        for ordinal in segments.len()..previous {
+            let ordinal = ordinal.to_string();
+            for gauge in &self.pattern_segment_layout {
+                let _ = gauge.remove_label_values(&[keyspace, index_name, ordinal.as_str()]);
+            }
         }
     }
 
@@ -234,6 +432,20 @@ impl Metrics {
         let _ = self
             .fts_segment_count
             .remove_label_values(&[keyspace, index_name]);
+        let _ = self
+            .pattern_index_size_bytes
+            .remove_label_values(&[keyspace, index_name]);
+        let _ = self
+            .pattern_segment_count
+            .remove_label_values(&[keyspace, index_name]);
+        for gauge in self
+            .pattern_search_totals
+            .iter()
+            .chain(self.pattern_rewrite.iter())
+        {
+            let _ = gauge.remove_label_values(&[keyspace, index_name]);
+        }
+        self.set_pattern_segments(keyspace, index_name, &[]);
         for op in OPERATIONS {
             let _ = self
                 .modified
@@ -303,6 +515,73 @@ mod tests {
         assert!(
             !output.contains(r#"keyspace="ks""#),
             "metric output should not contain labels for deleted index, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn pattern_search_totals_and_segment_layout_are_exported() {
+        let metrics = Metrics::new();
+
+        metrics.pattern_search_totals[0]
+            .with_label_values(&["ks", "idx"])
+            .set(7.0);
+        metrics.set_pattern_segments(
+            "ks",
+            "idx",
+            &[[Some(10.0), Some(1.0), Some(5.0)], [Some(3.0), None, None]],
+        );
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            output.contains(r#"pattern_search_total{index_name="idx",keyspace="ks"} 7"#),
+            "search total missing from export:\n{output}"
+        );
+        assert!(
+            output
+                .contains(r#"pattern_segment_docs{index_name="idx",keyspace="ks",segment="0"} 10"#),
+            "segment 0 docs missing from export:\n{output}"
+        );
+        assert!(
+            output.contains(
+                r#"pattern_segment_sort_max{index_name="idx",keyspace="ks",segment="0"} 5"#
+            ),
+            "segment 0 sort max missing from export:\n{output}"
+        );
+        assert!(
+            output
+                .contains(r#"pattern_segment_docs{index_name="idx",keyspace="ks",segment="1"} 3"#),
+            "segment 1 docs missing from export:\n{output}"
+        );
+        assert!(
+            !output.contains(
+                r#"pattern_segment_sort_min{index_name="idx",keyspace="ks",segment="1"}"#
+            ),
+            "an unordered segment must export no bounds:\n{output}"
+        );
+    }
+
+    #[test]
+    fn set_pattern_segments_drops_retired_ordinals() {
+        let metrics = Metrics::new();
+        let segment = |docs| [Some(docs), Some(0.0), Some(1.0)];
+
+        metrics.set_pattern_segments("ks", "idx", &[segment(1.0), segment(2.0), segment(3.0)]);
+        metrics.set_pattern_segments("ks", "idx", &[segment(6.0)]);
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            output.contains(r#"segment="0"} 6"#),
+            "the merged segment should be exported:\n{output}"
+        );
+        assert!(
+            !output.contains(r#"segment="1""#) && !output.contains(r#"segment="2""#),
+            "retired ordinals should be gone:\n{output}"
+        );
+
+        metrics.remove_index_labels("ks", "idx");
+        assert!(
+            !metric_families_text(&metrics).contains("pattern_segment"),
+            "removing the index should clear its segments"
         );
     }
 
@@ -555,6 +834,42 @@ mod tests {
         assert!(
             output.contains(r#"fts_index_size_bytes{index_name="idx",keyspace="ks"} 1024"#),
             "expected observed value in export:\n{output}"
+        );
+    }
+
+    #[test]
+    fn pattern_gauges_are_exported_and_removed_with_the_index() {
+        let metrics = Metrics::new();
+
+        metrics
+            .pattern_index_size_bytes
+            .with_label_values(&["ks", "idx"])
+            .set(2048.0);
+        metrics
+            .pattern_segment_count
+            .with_label_values(&["ks", "idx"])
+            .set(2.0);
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            output.contains("# TYPE pattern_index_size_bytes gauge"),
+            "pattern_index_size_bytes gauge missing from export:\n{output}"
+        );
+        assert!(
+            output.contains(r#"pattern_index_size_bytes{index_name="idx",keyspace="ks"} 2048"#),
+            "expected observed value in export:\n{output}"
+        );
+        assert!(
+            output.contains(r#"pattern_segment_count{index_name="idx",keyspace="ks"} 2"#),
+            "expected observed value in export:\n{output}"
+        );
+
+        metrics.remove_index_labels("ks", "idx");
+
+        let output = metric_families_text(&metrics);
+        assert!(
+            !output.contains(r#"index_name="idx""#),
+            "the index's series should be removed, got:\n{output}"
         );
     }
 

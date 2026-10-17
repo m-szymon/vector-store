@@ -4,7 +4,8 @@
  */
 
 use crate::IndexKey;
-use crate::pattern_index::PatternIndex;
+use crate::IndexOptionsPattern;
+use crate::pattern_index::actor::PatternIndex;
 use crate::table::Table;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug)]
 pub(crate) struct PatternIndexConfiguration {
     pub key: IndexKey,
+    pub options: IndexOptionsPattern,
 }
 
 pub(crate) trait PatternIndexFactory {

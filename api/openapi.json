@@ -427,7 +427,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Performs a LIKE 'pattern' search query against the specified index. Returns primary keys of the documents matched to the provided pattern. The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, '\\' is the escape character, and matching is case-sensitive. The maximum number of results is controlled by the optional 'limit' parameter in the payload. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+        "description": "Performs a LIKE search against the specified pattern index. Returns the primary keys of the rows whose indexed value matches the `LIKE` pattern in the payload, read with ScyllaDB's `LIKE` rules: `%` matches any run of characters, `_` exactly one, `\\\\` makes the next character literal, and the whole value has to match. The index serves `'%keyword%'`, `'keyword%'` and `'%keyword'`; any other pattern, or a keyword shorter than the index's `min_gram`, is answered with 400 and the reason. Matching is exact, with no ranking or scoring, and case-sensitive unless the index was created with `case_sensitive` set to false. An index created with `order_by` returns the rows ordered by that column and pages with `cursor`; any other index returns them in index order, and 'offset' pages through them, which is only stable between writes. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
         "operationId": "post_index_like",
         "parameters": [
           {
@@ -461,7 +461,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successful pattern search. Returns a list of primary keys for the relevant documents found.",
+            "description": "Successful pattern search. Returns the primary keys of the matching rows.",
             "content": {
               "application/json": {
                 "schema": {
@@ -471,7 +471,7 @@
             }
           },
           "400": {
-            "description": "Bad request. Possible causes: malformed input, invalid pattern, or missing required fields.",
+            "description": "Bad request. Possible causes: malformed input, an empty query, or a query shorter than the index's min_gram.",
             "content": {
               "application/json": {
                 "schema": {
@@ -894,7 +894,35 @@
       },
       "PatternIndexOptions": {
         "type": "object",
-        "description": "Options a pattern index was created with."
+        "description": "Options a pattern index was created with.",
+        "required": [
+          "min_gram",
+          "max_gram",
+          "case_sensitive"
+        ],
+        "properties": {
+          "case_sensitive": {
+            "type": "boolean",
+            "description": "Whether matching is case-sensitive (the CQL `LIKE` semantics) or lowercases both values and queries."
+          },
+          "max_gram": {
+            "type": "integer",
+            "description": "Length in characters of the longest indexed substring; longer queries are answered by intersecting their substrings and verifying candidates.",
+            "minimum": 0
+          },
+          "min_gram": {
+            "type": "integer",
+            "description": "Length in characters of the shortest indexed substring; queries shorter than this are rejected.",
+            "minimum": 0
+          },
+          "order_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The column results are ordered by, or absent for unspecified order."
+          }
+        }
       },
       "PostIndexAnnFilter": {
         "type": "object",
@@ -1374,12 +1402,65 @@
           "pattern"
         ],
         "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Resume an ordered search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's sort key and primary key). Only meaningful for an index created with an `order_by` column; ignored otherwise."
+          },
           "limit": {
-            "$ref": "#/components/schemas/Limit"
+            "$ref": "#/components/schemas/Limit",
+            "description": "The maximum number of primary keys to return."
+          },
+          "max_sort_value": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SortBound",
+                "description": "Restrict the search to rows whose sort value is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "min_sort_value": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SortBound",
+                "description": "Restrict the search to rows whose sort value is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "offset": {
+            "type": "integer",
+            "description": "The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.",
+            "minimum": 0
+          },
+          "order": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SortOrder",
+                "description": "The direction along the sort column; descending when absent. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "pattern": {
             "type": "string",
-            "description": "The text pattern to search for."
+            "description": "The `LIKE` pattern, as written in the query: `%` matches any run of characters, `_` exactly one, and `\\\\` makes the next character literal, as ScyllaDB's own `LIKE` does; the whole value has to match. The index serves `'%keyword%'`, `'keyword%'` and `'%keyword'` (repeated `%` count as one) and answers any other pattern with 400. Matching is case-sensitive unless the index was created with `case_sensitive` set to false."
+          },
+          "verify": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the index checks each candidate for a keyword longer than `max_gram` against the stored value before returning it. `true` (the default) returns only rows that match. `false` returns the rows whose value holds every gram of the keyword, which is a superset of the matches, and the response says so in `verified`; a caller that reads the rows anyway can apply the pattern itself and spare the index its document-store reads. A keyword within `max_gram` is exact either way."
           }
         }
       },
@@ -1390,8 +1471,16 @@
           "primary_keys"
         ],
         "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as the next request's `cursor`, unchanged, to read the following page. Absent when the index has no sort column, or when this page exhausted the matches."
+          },
           "primary_keys": {
             "type": "object",
+            "description": "Primary keys of the matching rows, one array of values per primary key column. Ordered by the index's sort column when it has one.",
             "additionalProperties": {
               "type": "array",
               "items": {}
@@ -1400,6 +1489,10 @@
               "type": "string",
               "description": "Name of the column in a db table."
             }
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Whether every returned row is known to match. `false` only when the request asked for `verify: false` and the keyword was longer than `max_gram`: the rows are then candidates holding every gram, and the caller has to apply the pattern to the value."
           }
         }
       },
@@ -1417,6 +1510,30 @@
         "type": "number",
         "format": "float",
         "description": "Similarity score between vectors derived from the distance. Higher score means more similar."
+      },
+      "SortBound": {
+        "type": "object",
+        "description": "One end of a range on an ordered index's sort column: a value of that column, in the same\nJSON encoding the response's `primary_keys` use for a value of its type (a number for the\ninteger types, an ISO 8601 string for a date, time or timestamp), and whether the bound\nincludes the value itself. The index turns the value into its own sort key, so a caller\nnever has to know how the index orders.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "inclusive": {
+            "type": "boolean",
+            "description": "Whether rows whose sort value equals `value` are inside the range. Inclusive when absent."
+          },
+          "value": {
+            "description": "The bounding value, encoded as a value of the sort column's CQL type."
+          }
+        }
+      },
+      "SortOrder": {
+        "type": "string",
+        "description": "The direction of an ordered pattern search along its sort column.",
+        "enum": [
+          "desc",
+          "asc"
+        ]
       },
       "Vector": {
         "type": "array",

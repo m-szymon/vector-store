@@ -55,7 +55,12 @@ pub(crate) async fn new(
     let (tx, mut rx) = mpsc::channel(perf::channel_size().into());
     tokio::spawn(
         async move {
-            let (interval_duration, mut alter_index_simulator, mut fulltext_indexes) = {
+            let (
+                interval_duration,
+                mut alter_index_simulator,
+                mut fulltext_indexes,
+                mut pattern_indexes,
+            ) = {
                 let config = config_rx.borrow_and_update();
                 (
                     config
@@ -63,6 +68,7 @@ pub(crate) async fn new(
                         .unwrap_or(Duration::from_secs(1)),
                     config.alter_index_simulator,
                     config.fulltext_indexes,
+                    config.pattern_indexes,
                 )
             };
             let mut interval = time::interval(interval_duration);
@@ -74,6 +80,9 @@ pub(crate) async fn new(
             }
             if fulltext_indexes {
                 info!("monitor_indexes: fulltext indexes are enabled");
+            }
+            if pattern_indexes {
+                info!("monitor_indexes: pattern indexes are enabled");
             }
             while !rx.is_closed() {
                 tokio::select! {
@@ -98,7 +107,11 @@ pub(crate) async fn new(
                             continue;
                         };
 
-                        let new_indexes = filter_disabled_index_kinds(new_indexes, fulltext_indexes);
+                        let new_indexes = filter_disabled_index_kinds(
+                            new_indexes,
+                            fulltext_indexes,
+                            pattern_indexes,
+                        );
 
                         if alter_index_simulator {
                             node_state.send_event(Event::IndexesDiscovered(
@@ -142,6 +155,7 @@ pub(crate) async fn new(
                         let config = config_rx.borrow_and_update();
                         update_flag(&mut alter_index_simulator, config.alter_index_simulator, "alter index simulator");
                         update_flag(&mut fulltext_indexes, config.fulltext_indexes, "fulltext indexes");
+                        update_flag(&mut pattern_indexes, config.pattern_indexes, "pattern indexes");
                     }
 
                     _ = rx.recv() => { }
@@ -362,13 +376,18 @@ fn update_flag(current: &mut bool, new_value: bool, name: &str) {
 fn filter_disabled_index_kinds(
     indexes: HashSet<IndexMetadata>,
     fulltext_indexes: bool,
+    pattern_indexes: bool,
 ) -> HashSet<IndexMetadata> {
-    if fulltext_indexes {
+    if fulltext_indexes && pattern_indexes {
         return indexes;
     }
     indexes
         .into_iter()
-        .filter(|idx| !matches!(idx.kind, IndexKind::Fts(_)))
+        .filter(|idx| match idx.kind {
+            IndexKind::Vs(_) => true,
+            IndexKind::Fts(_) => fulltext_indexes,
+            IndexKind::Pattern(_) => pattern_indexes,
+        })
         .collect()
 }
 
@@ -1155,6 +1174,92 @@ mod tests {
         mock_db
     }
 
+    fn mock_db_with_pattern_index(options: Option<IndexOptionsPattern>) -> MockSimDb {
+        let mut mock_db = MockSimDb::new();
+
+        mock_db.expect_get_indexes().returning(move |tx| {
+            async move {
+                tx.send(Ok(vec![DbCustomIndex {
+                    keyspace: "ks".to_string().into(),
+                    index: "sub_idx".to_string().into(),
+                    table: "tbl".to_string().into(),
+                    primary_key_columns: NonemptyArc::new(["pk"]).unwrap(),
+                    partition_key_count: NonZeroUsize::new(1).unwrap(),
+                    target_columns: NonemptyArc::new(["nickname"]).unwrap(),
+                    partitioning: DbIndexPartitioning::Global,
+                    filtering_columns: Arc::new([]),
+                    alternator_attribute_types: Arc::new(BTreeMap::new()),
+                    kind: DbIndexKind::Pattern,
+                }]))
+                .unwrap();
+            }
+            .boxed()
+        });
+
+        mock_db
+            .expect_get_index_version()
+            .returning(move |_, _, _, tx| {
+                async move {
+                    tx.send(Ok(Some(Uuid::new_v4().into()))).unwrap();
+                }
+                .boxed()
+            });
+
+        mock_db
+            .expect_get_pattern_index_params()
+            .returning(move |_, _, _, tx| {
+                let options = options.clone();
+                async move {
+                    tx.send(Ok(options)).unwrap();
+                }
+                .boxed()
+            });
+
+        mock_db.expect_is_valid_index().returning(move |_, tx| {
+            async move {
+                tx.send(true).unwrap();
+            }
+            .boxed()
+        });
+
+        mock_db.expect_is_valid_schema().returning(move |_, tx| {
+            async move {
+                tx.send(true).unwrap();
+            }
+            .boxed()
+        });
+
+        mock_db
+    }
+
+    #[tokio::test]
+    async fn get_indexes_returns_pattern_index() {
+        let options = IndexOptionsPattern {
+            min_gram: "2".parse().unwrap(),
+            max_gram: "4".parse().unwrap(),
+            case_sensitive: false.into(),
+            ..Default::default()
+        };
+        let db = db::tests::new(mock_db_with_pattern_index(Some(options.clone())));
+
+        let result = get_indexes(&db, Uuid::new_v4()).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        let idx = result.into_iter().next().unwrap();
+        assert_eq!(idx.index_name.as_ref(), "sub_idx");
+        assert_eq!(idx.kind, IndexKind::Pattern(options));
+    }
+
+    #[tokio::test]
+    async fn get_indexes_defaults_pattern_options_when_db_has_none() {
+        let db = db::tests::new(mock_db_with_pattern_index(None));
+
+        let result = get_indexes(&db, Uuid::new_v4()).await.unwrap();
+
+        let idx = result.into_iter().next().unwrap();
+        assert_eq!(idx.kind, IndexKind::Pattern(IndexOptionsPattern::default()));
+    }
+
     #[tokio::test]
     async fn get_indexes_returns_fts_index() {
         let options = IndexOptionsFts {
@@ -1354,9 +1459,49 @@ mod tests {
         let fts_idx = sample_fts_index_metadata("fts_idx");
         let indexes: HashSet<_> = [vs_idx, fts_idx].into_iter().collect();
 
-        let result = filter_disabled_index_kinds(indexes, true);
+        let result = filter_disabled_index_kinds(indexes, true, true);
 
         assert_eq!(result.len(), 2);
+    }
+
+    fn sample_pattern_index_metadata(name: &str) -> IndexMetadata {
+        IndexMetadata {
+            kind: IndexKind::Pattern(IndexOptionsPattern::default()),
+            ..sample_fts_index_metadata(name)
+        }
+    }
+
+    #[test]
+    fn pattern_indexes_are_filtered_out_when_disabled_keeping_the_rest() {
+        let vs_idx = sample_vs_index_metadata("vs_idx");
+        let fts_idx = sample_fts_index_metadata("fts_idx");
+        let sub_idx = sample_pattern_index_metadata("sub_idx");
+        let indexes: HashSet<_> = [vs_idx, fts_idx, sub_idx].into_iter().collect();
+
+        let result = filter_disabled_index_kinds(indexes, true, false);
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            result
+                .iter()
+                .all(|idx| !matches!(idx.kind, IndexKind::Pattern(_)))
+        );
+    }
+
+    #[test]
+    fn disabling_fulltext_keeps_pattern_indexes() {
+        let fts_idx = sample_fts_index_metadata("fts_idx");
+        let sub_idx = sample_pattern_index_metadata("sub_idx");
+        let indexes: HashSet<_> = [fts_idx, sub_idx].into_iter().collect();
+
+        let result = filter_disabled_index_kinds(indexes, false, true);
+
+        assert_eq!(result.len(), 1);
+        assert!(
+            result
+                .iter()
+                .all(|idx| matches!(idx.kind, IndexKind::Pattern(_)))
+        );
     }
 
     #[test]
@@ -1365,7 +1510,7 @@ mod tests {
         let fts_idx = sample_fts_index_metadata("fts_idx");
         let indexes: HashSet<_> = [vs_idx, fts_idx].into_iter().collect();
 
-        let result = filter_disabled_index_kinds(indexes, false);
+        let result = filter_disabled_index_kinds(indexes, false, true);
 
         assert_eq!(result.len(), 1);
         assert!(

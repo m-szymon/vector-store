@@ -194,7 +194,17 @@ pub struct FulltextIndexOptions {
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Options a pattern index was created with.
-pub struct PatternIndexOptions {}
+pub struct PatternIndexOptions {
+    /// The column results are ordered by, or absent for unspecified order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<String>,
+    /// Length in characters of the shortest indexed substring; queries shorter than this are rejected.
+    pub min_gram: usize,
+    /// Length in characters of the longest indexed substring; longer queries are answered by intersecting their substrings and verifying candidates.
+    pub max_gram: usize,
+    /// Whether matching is case-sensitive (the CQL `LIKE` semantics) or lowercases both values and queries.
+    pub case_sensitive: bool,
+}
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -504,6 +514,90 @@ pub struct PostIndexBm25Response {
     pub scores: Vec<f32>,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Deserialize,
+    serde::Serialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+/// The direction of an ordered pattern search along its sort column.
+pub enum SortOrder {
+    /// Highest sort key first; for a timestamp, newest first.
+    #[default]
+    Desc,
+    /// Lowest sort key first.
+    Asc,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// One end of a range on an ordered index's sort column: a value of that column, in the same
+/// JSON encoding the response's `primary_keys` use for a value of its type (a number for the
+/// integer types, an ISO 8601 string for a date, time or timestamp), and whether the bound
+/// includes the value itself. The index turns the value into its own sort key, so a caller
+/// never has to know how the index orders.
+pub struct SortBound {
+    /// The bounding value, encoded as a value of the sort column's CQL type.
+    pub value: Value,
+    /// Whether rows whose sort value equals `value` are inside the range. Inclusive when absent.
+    #[serde(default = "sort_bound_inclusive_default")]
+    pub inclusive: bool,
+}
+
+fn sort_bound_inclusive_default() -> bool {
+    true
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Request body for LIKE search.
+pub struct PostIndexLikeRequest {
+    /// The `LIKE` pattern, as written in the query: `%` matches any run of characters, `_` exactly one, and `\\` makes the next character literal, as ScyllaDB's own `LIKE` does; the whole value has to match. The index serves `'%keyword%'`, `'keyword%'` and `'%keyword'` (repeated `%` count as one) and answers any other pattern with 400. Matching is case-sensitive unless the index was created with `case_sensitive` set to false.
+    pub pattern: String,
+    /// The maximum number of primary keys to return.
+    #[serde(default)]
+    pub limit: Limit,
+    /// The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.
+    #[serde(default)]
+    pub offset: usize,
+    /// Resume an ordered search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's sort key and primary key). Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// The direction along the sort column; descending when absent. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub order: Option<SortOrder>,
+    /// Restrict the search to rows whose sort value is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub min_sort_value: Option<SortBound>,
+    /// Restrict the search to rows whose sort value is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    #[serde(default)]
+    pub max_sort_value: Option<SortBound>,
+    /// Whether the index checks each candidate for a keyword longer than `max_gram` against the stored value before returning it. `true` (the default) returns only rows that match. `false` returns the rows whose value holds every gram of the keyword, which is a superset of the matches, and the response says so in `verified`; a caller that reads the rows anyway can apply the pattern itself and spare the index its document-store reads. A keyword within `max_gram` is exact either way.
+    #[serde(default)]
+    pub verify: Option<bool>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// Response for LIKE search.
+pub struct PostIndexLikeResponse {
+    /// Primary keys of the matching rows, one array of values per primary key column. Ordered by the index's sort column when it has one.
+    pub primary_keys: HashMap<ColumnName, Vec<Value>>,
+    /// Pass as the next request's `cursor`, unchanged, to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Whether every returned row is known to match. `false` only when the request asked for `verify: false` and the keyword was longer than `max_gram`: the rows are then candidates holding every gram, and the caller has to apply the pattern to the value.
+    #[serde(default = "verified_default")]
+    pub verified: bool,
+}
+
+fn verified_default() -> bool {
+    true
+}
+
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Request body for highlighting.
 pub struct PostIndexHighlightRequest {
@@ -518,19 +612,4 @@ pub struct PostIndexHighlightRequest {
 pub struct PostIndexHighlightResponse {
     /// The highlighted documents. Each document is a string of text with the query terms marked.
     pub highlights: Vec<Option<String>>,
-}
-
-#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
-/// Request body for LIKE search.
-pub struct PostIndexLikeRequest {
-    /// The text pattern to search for.
-    pub pattern: String,
-    #[serde(default)]
-    pub limit: Limit,
-}
-
-#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
-/// Response for LIKE search.
-pub struct PostIndexLikeResponse {
-    pub primary_keys: HashMap<ColumnName, Vec<Value>>,
 }

@@ -34,8 +34,12 @@ use crate::metrics::OP_HIGHLIGHT;
 use crate::metrics::OP_LIKE;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
+use crate::pattern_index::Cursor;
 use crate::pattern_index::PatternIndex;
 use crate::pattern_index::PatternIndexExt;
+use crate::pattern_index::SearchWindow;
+use crate::pattern_index::SortOrder;
+use crate::pattern_index::parse_like_pattern;
 use crate::perf;
 use crate::vector;
 use crate::vs_index;
@@ -174,8 +178,8 @@ fn new_open_api_router() -> (Router<RoutesInnerState>, utoipa::openapi::OpenApi)
                 .routes(routes!(get_index_info))
                 .routes(routes!(post_index_ann))
                 .routes(routes!(post_index_bm25))
-                .routes(routes!(post_index_highlight))
                 .routes(routes!(post_index_like))
+                .routes(routes!(post_index_highlight))
                 .routes(routes!(get_info))
                 .routes(routes!(get_status)),
         )
@@ -264,8 +268,17 @@ impl From<&IndexOptionsFts> for FulltextIndexOptions {
 }
 
 impl From<&IndexOptionsPattern> for PatternIndexOptions {
-    fn from(_options: &IndexOptionsPattern) -> Self {
-        PatternIndexOptions {}
+    fn from(options: &IndexOptionsPattern) -> Self {
+        PatternIndexOptions {
+            order_by: options
+                .order_by
+                .as_ref()
+                .as_ref()
+                .map(|column| column.as_ref().to_string()),
+            min_gram: options.min_gram.as_ref().get(),
+            max_gram: options.max_gram.as_ref().get(),
+            case_sensitive: *options.case_sensitive.as_ref(),
+        }
     }
 }
 
@@ -630,13 +643,66 @@ async fn refresh_index_metrics(
     }
 
     if let Some((index, _)) = state.engine.get_pattern_index(key.clone()).await
-        && let Ok(count) = index.count(key).await
+        && let Ok(stats) = index.stats(key).await
     {
         state
             .metrics
             .size
             .with_label_values(&labels)
-            .set(count as f64);
+            .set(stats.tantivy.num_docs as f64);
+        state
+            .metrics
+            .pattern_index_size_bytes
+            .with_label_values(&labels)
+            .set(stats.tantivy.size_bytes as f64);
+        state
+            .metrics
+            .pattern_segment_count
+            .with_label_values(&labels)
+            .set(stats.tantivy.segment_count as f64);
+        let walk = stats.walk;
+        let totals = [
+            walk.searches as f64,
+            walk.segments_considered as f64,
+            walk.segments_opened as f64,
+            walk.postings_scanned as f64,
+            walk.heap_entrants as f64,
+            walk.store_reads as f64,
+            walk.walk_nanos as f64 / 1e9,
+            walk.column_opens as f64,
+            walk.prepare_nanos as f64 / 1e9,
+            walk.page_resolve_nanos as f64 / 1e9,
+        ];
+        for (gauge, value) in state.metrics.pattern_search_totals.iter().zip(totals) {
+            gauge.with_label_values(&labels).set(value);
+        }
+        let rewrite = stats.rewrite;
+        let progress = [
+            rewrite.ranges_total as f64,
+            rewrite.ranges_done as f64,
+            rewrite.docs_rewritten as f64,
+            rewrite.l0_docs as f64,
+        ];
+        for (gauge, value) in state.metrics.pattern_rewrite.iter().zip(progress) {
+            gauge.with_label_values(&labels).set(value);
+        }
+        // The bounds are exported as the column's own value rather than as the sort key, which
+        // is the value with its sign bit flipped so that it orders as an unsigned integer.
+        let decode = |sort_key: Option<u64>| sort_key.map(|key| (key ^ (1 << 63)) as i64 as f64);
+        let segments = stats
+            .segments
+            .iter()
+            .map(|segment| {
+                [
+                    Some(segment.docs as f64),
+                    decode(segment.sort_min),
+                    decode(segment.sort_max),
+                ]
+            })
+            .collect::<Vec<_>>();
+        state
+            .metrics
+            .set_pattern_segments(labels[0], labels[1], &segments);
     }
 }
 
@@ -1185,6 +1251,328 @@ async fn post_index_bm25(
 
 #[utoipa::path(
     post,
+    path = "/api/v1/indexes/{keyspace}/{index}/like",
+    tag = "scylla-vector-store-index",
+    description = "Performs a LIKE search against the specified pattern index. \
+Returns the primary keys of the rows whose indexed value matches the `LIKE` pattern in the payload, read with ScyllaDB's `LIKE` rules: `%` matches any run of characters, `_` exactly one, `\\\\` makes the next character literal, and the whole value has to match. \
+The index serves `'%keyword%'`, `'keyword%'` and `'%keyword'`; any other pattern, or a keyword shorter than the index's `min_gram`, is answered with 400 and the reason. \
+Matching is exact, with no ranking or scoring, and case-sensitive unless the index was created with `case_sensitive` set to false. \
+An index created with `order_by` returns the rows ordered by that column and pages with `cursor`; any other index returns them in index order, and 'offset' pages through them, which is only stable between writes. \
+If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+    params(
+        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
+        ("index" = httpapi::IndexName, Path, description = "The name of the pattern index within the specified keyspace to search.")
+    ),
+    request_body = httpapi::PostIndexLikeRequest,
+    responses(
+        (
+            status = 200,
+            description = "Successful pattern search. Returns the primary keys of the matching rows.",
+            body = httpapi::PostIndexLikeResponse
+        ),
+        (
+            status = 400,
+            description = "Bad request. Possible causes: malformed input, an empty query, or a query shorter than the index's min_gram.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 403,
+            description = "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 404,
+            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 500,
+            description = "Error while searching. Possible causes: internal error, or search engine issues.",
+            content_type = "application/json",
+            body = ErrorMessage
+        ),
+        (
+            status = 503,
+            response = httpapi::IndexNotReadyResponse
+        )
+    )
+)]
+async fn post_index_like(
+    State(state): State<RoutesInnerState>,
+    extensions: Extensions,
+    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
+    extract::Json(request): extract::Json<httpapi::PostIndexLikeRequest>,
+) -> Response {
+    let keyspace: crate::KeyspaceName = keyspace.into();
+    let index_name: crate::IndexName = index_name.into();
+    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_like") {
+        return resp;
+    }
+
+    let timer = state
+        .metrics
+        .latency
+        .with_label_values(&[keyspace.as_ref(), index_name.as_ref(), OP_LIKE])
+        .start_timer();
+
+    let index_key = IndexKey::new(&keyspace, &index_name);
+
+    let serving_or_progress = {
+        let indexes = state.indexes.read().unwrap();
+        let Some(entry) = indexes.get_pattern(&index_key) else {
+            timer.observe_duration();
+
+            let msg = format!("missing index: {keyspace}.{index_name}");
+            debug!("post_index_like: {msg}");
+            return (StatusCode::NOT_FOUND, msg).into_response();
+        };
+        if entry.status() == crate::node_state::IndexStatus::Serving {
+            Ok((
+                entry.index().clone(),
+                entry.primary_key_columns().clone(),
+                Arc::clone(entry.table_columns()),
+                entry.options().order_by.as_ref().clone(),
+            ))
+        } else {
+            Err(entry.progress())
+        }
+    };
+
+    let (pattern_sender, primary_key_columns, table_columns, order_by) = match check_index_serving(
+        serving_or_progress,
+        &state.node_state,
+        &keyspace,
+        &index_name,
+        "post_index_like",
+    )
+    .await
+    {
+        Ok(serving) => serving,
+        Err(resp) => {
+            timer.observe_duration();
+            return resp;
+        }
+    };
+
+    let cursor = match request
+        .cursor
+        .as_deref()
+        .map(|text| decode_cursor(text, primary_key_columns.as_slice(), &table_columns))
+        .transpose()
+    {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            timer.observe_duration();
+            let msg = format!("index.like request error: invalid cursor: {err}");
+            debug!("post_index_like: {msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
+    let (min_sort_key, max_sort_key) = match sort_bound_keys(
+        request.min_sort_value,
+        request.max_sort_value,
+        order_by.as_ref(),
+        &table_columns,
+    ) {
+        Ok(keys) => keys,
+        Err(err) => {
+            timer.observe_duration();
+            let msg = format!("index.like request error: invalid sort bound: {err}");
+            debug!("post_index_like: {msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
+    let (kind, keyword) = match parse_like_pattern(&request.pattern) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            timer.observe_duration();
+            let msg = format!("index.like request error: {err}");
+            debug!("post_index_like: {msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
+    let search_result = pattern_sender
+        .search(
+            index_key,
+            keyword,
+            kind,
+            request.limit.into(),
+            request.offset,
+            SearchWindow {
+                order: match request.order.unwrap_or_default() {
+                    httpapi::SortOrder::Desc => SortOrder::Desc,
+                    httpapi::SortOrder::Asc => SortOrder::Asc,
+                },
+                cursor,
+                min_sort_key,
+                max_sort_key,
+            },
+            request.verify.unwrap_or(true),
+        )
+        .await;
+
+    timer.observe_duration();
+    // A scrape refreshes an index's gauges only when something changed it, and a search changes
+    // its walk totals; without this the totals would stay at whatever the last write left them.
+    state
+        .metrics
+        .mark_dirty(keyspace.as_ref(), index_name.as_ref());
+
+    match search_result {
+        Err(err) => {
+            let msg = format!("index.like request error: {err}");
+            debug!("post_index_like: {msg}");
+            let status = if err.downcast_ref::<QueryError>().is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg).into_response()
+        }
+        Ok(page) => {
+            let next_cursor = page
+                .next_cursor
+                .as_ref()
+                .map(|cursor| encode_cursor(cursor, primary_key_columns.as_slice()))
+                .transpose();
+            match try_collect_primary_keys(primary_key_columns.as_slice(), &page.primary_keys)
+                .and_then(|primary_keys| Ok((primary_keys, next_cursor?)))
+            {
+                Err(err) => {
+                    debug!("post_index_like: {err}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+                }
+                Ok((primary_keys, next_cursor)) => (
+                    StatusCode::OK,
+                    response::Json(httpapi::PostIndexLikeResponse {
+                        primary_keys,
+                        next_cursor,
+                        verified: page.verified,
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+    }
+}
+
+/// The sort keys a request's typed bounds stand for, `(min, max)`, in the index's own key space.
+///
+/// A bound is a value of the sort column, so it is read with that column's type and mapped the
+/// way the index maps the column when it ingests a row; there is no second encoding to agree
+/// with. An exclusive bound becomes the inclusive one next to it: sort keys are integers, so the
+/// neighbour is exact, and at the ends of the key space it stays put (no real value reaches
+/// them). An index without a sort column ignores the bounds, as it ignores `order` and `cursor`.
+fn sort_bound_keys(
+    min: Option<httpapi::SortBound>,
+    max: Option<httpapi::SortBound>,
+    order_by: Option<&crate::ColumnName>,
+    table_columns: &HashMap<crate::ColumnName, NativeType>,
+) -> anyhow::Result<(Option<u64>, Option<u64>)> {
+    let Some(order_by) = order_by else {
+        return Ok((None, None));
+    };
+    let native_type = table_columns
+        .get(order_by)
+        .ok_or_else(|| anyhow::anyhow!("unknown sort column '{order_by}'"))?;
+    let key_of = |bound: httpapi::SortBound| -> anyhow::Result<(u64, bool)> {
+        let value = cql_types::from_json(bound.value, native_type).map_err(|err| {
+            anyhow::anyhow!("a bound on '{order_by}' is not a {native_type:?}: {err}")
+        })?;
+        let key = cql_types::to_sort_key(&value)
+            .ok_or_else(|| anyhow::anyhow!("column '{order_by}' cannot be ranged over"))?;
+        Ok((key, bound.inclusive))
+    };
+    let min = min.map(key_of).transpose()?.map(|(key, inclusive)| {
+        if inclusive {
+            key
+        } else {
+            key.saturating_add(1)
+        }
+    });
+    let max = max.map(key_of).transpose()?.map(|(key, inclusive)| {
+        if inclusive {
+            key
+        } else {
+            key.saturating_sub(1)
+        }
+    });
+    Ok((min, max))
+}
+
+/// The wire form of a paging cursor: JSON, carried by the caller as an opaque string. The primary
+/// key is the same per-column encoding the page's `primary_keys` use, so a cursor is readable
+/// but never meant to be built by hand.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CursorJson {
+    sort_key: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    primary_key: Option<HashMap<httpapi::ColumnName, Value>>,
+}
+
+fn encode_cursor(
+    cursor: &Cursor,
+    primary_key_columns: &[crate::ColumnName],
+) -> anyhow::Result<String> {
+    let primary_key = cursor
+        .primary_key
+        .as_ref()
+        .map(|key| {
+            try_collect_primary_keys(primary_key_columns, std::slice::from_ref(key)).map(
+                |columns| {
+                    columns
+                        .into_iter()
+                        .filter_map(|(column, mut values)| {
+                            values.pop().map(|value| (column, value))
+                        })
+                        .collect()
+                },
+            )
+        })
+        .transpose()?;
+    Ok(serde_json::to_string(&CursorJson {
+        sort_key: cursor.sort_key,
+        primary_key,
+    })?)
+}
+
+fn decode_cursor(
+    text: &str,
+    primary_key_columns: &[crate::ColumnName],
+    table_columns: &HashMap<crate::ColumnName, NativeType>,
+) -> anyhow::Result<Cursor> {
+    let json: CursorJson = serde_json::from_str(text)?;
+    let primary_key = json
+        .primary_key
+        .map(|mut values| {
+            primary_key_columns
+                .iter()
+                .map(|column| {
+                    let value = values
+                        .remove(&httpapi::ColumnName::from(column.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("the cursor's primary key lacks column '{column}'")
+                        })?;
+                    let native_type = table_columns
+                        .get(column)
+                        .ok_or_else(|| anyhow::anyhow!("unknown primary key column '{column}'"))?;
+                    cql_types::from_json(value, native_type)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map(crate::PrimaryKey::from)
+        })
+        .transpose()?;
+    Ok(Cursor {
+        sort_key: json.sort_key,
+        primary_key,
+    })
+}
+
+#[utoipa::path(
+    post,
     path = "/api/v1/indexes/{keyspace}/{index}/highlight",
     tag = "scylla-vector-store-index",
     description = "Computes a highlighted excerpt (snippet) for each of the supplied document texts. \
@@ -1308,145 +1696,6 @@ async fn post_index_highlight(
             response::Json(httpapi::PostIndexHighlightResponse { highlights }),
         )
             .into_response(),
-    }
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/indexes/{keyspace}/{index}/like",
-    tag = "scylla-vector-store-index",
-    description = "Performs a LIKE 'pattern' search query against the specified index. \
-Returns primary keys of the documents matched to the provided pattern. \
-The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, \
-'\\' is the escape character, and matching is case-sensitive. \
-The maximum number of results is controlled by the optional 'limit' parameter in the payload. \
-If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
-    params(
-        ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
-        ("index" = httpapi::IndexName, Path, description = "The name of the pattern index within the specified keyspace to search.")
-    ),
-    request_body = httpapi::PostIndexLikeRequest,
-    responses(
-        (
-            status = 200,
-            description = "Successful pattern search. Returns a list of primary keys for the relevant documents found.",
-            body = httpapi::PostIndexLikeResponse
-        ),
-        (
-            status = 400,
-            description = "Bad request. Possible causes: malformed input, invalid pattern, or missing required fields.",
-            content_type = "application/json",
-            body = ErrorMessage
-        ),
-        (
-            status = 403,
-            description = "Forbidden. TLS is enabled in the configuration, but the client connected over plain HTTP.",
-            content_type = "application/json",
-            body = ErrorMessage
-        ),
-        (
-            status = 404,
-            description = "Index not found. Possible causes: index does not exist, or is not discovered yet.",
-            content_type = "application/json",
-            body = ErrorMessage
-        ),
-        (
-            status = 500,
-            description = "Error while searching. Possible causes: internal error, or search engine issues.",
-            content_type = "application/json",
-            body = ErrorMessage
-        ),
-        (
-            status = 503,
-            response = httpapi::IndexNotReadyResponse
-        )
-    )
-)]
-async fn post_index_like(
-    State(state): State<RoutesInnerState>,
-    extensions: Extensions,
-    Path((keyspace, index_name)): Path<(httpapi::KeyspaceName, httpapi::IndexName)>,
-    extract::Json(request): extract::Json<httpapi::PostIndexLikeRequest>,
-) -> Response {
-    let keyspace: crate::KeyspaceName = keyspace.into();
-    let index_name: crate::IndexName = index_name.into();
-    if let Some(resp) = check_insecure_tls(state.use_tls, &extensions, "post_index_like") {
-        return resp;
-    }
-
-    let timer = state
-        .metrics
-        .latency
-        .with_label_values(&[keyspace.as_ref(), index_name.as_ref(), OP_LIKE])
-        .start_timer();
-
-    let index_key = IndexKey::new(&keyspace, &index_name);
-
-    let serving_or_progress = {
-        let indexes = state.indexes.read().unwrap();
-        let Some(entry) = indexes.get_pattern(&index_key) else {
-            timer.observe_duration();
-
-            let msg = format!("missing index: {keyspace}.{index_name}");
-            debug!("post_index_like: {msg}");
-            return (StatusCode::NOT_FOUND, msg).into_response();
-        };
-        if entry.status() == crate::node_state::IndexStatus::Serving {
-            Ok((entry.index().clone(), entry.primary_key_columns().clone()))
-        } else {
-            Err(entry.progress())
-        }
-    };
-
-    let (pattern_sender, primary_key_columns) = match check_index_serving(
-        serving_or_progress,
-        &state.node_state,
-        &keyspace,
-        &index_name,
-        "post_index_like",
-    )
-    .await
-    {
-        Ok(sender) => sender,
-        Err(resp) => {
-            timer.observe_duration();
-            return resp;
-        }
-    };
-
-    let search_result = pattern_sender
-        .like(index_key, request.pattern, request.limit.into())
-        .await;
-
-    timer.observe_duration();
-
-    match search_result {
-        Err(err) => {
-            let msg = format!("index.like request error: {err}");
-            debug!("post_index_like: {msg}");
-            let status = if err.downcast_ref::<QueryError>().is_some() {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, msg).into_response()
-        }
-        Ok(primary_keys) => {
-            let primary_keys =
-                try_collect_primary_keys(primary_key_columns.as_slice(), &primary_keys);
-
-            match primary_keys {
-                Err(err) => {
-                    debug!("post_index_like: {err}");
-                    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-                }
-                Ok(primary_keys) => (
-                    StatusCode::OK,
-                    response::Json(httpapi::PostIndexLikeResponse { primary_keys }),
-                )
-                    .into_response(),
-            }
-        }
     }
 }
 
@@ -1771,6 +2020,90 @@ mod tests {
 
     use super::*;
     use crate::Analyzer;
+
+    fn sort_columns() -> HashMap<crate::ColumnName, NativeType> {
+        [
+            ("registered".into(), NativeType::Timestamp),
+            ("score".into(), NativeType::BigInt),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn bound(value: Value, inclusive: bool) -> httpapi::SortBound {
+        httpapi::SortBound { value, inclusive }
+    }
+
+    /// The bound arrives as the column's own value and leaves as the key the index stores for
+    /// that value: the same mapping ingestion applies, from the same function.
+    #[test]
+    fn a_typed_bound_becomes_the_key_the_index_stores() {
+        let score: crate::ColumnName = "score".into();
+        let (min, max) = sort_bound_keys(
+            Some(bound(Value::from(-5), true)),
+            Some(bound(Value::from(7), true)),
+            Some(&score),
+            &sort_columns(),
+        )
+        .unwrap();
+        assert_eq!(min, cql_types::to_sort_key(&CqlValue::BigInt(-5)));
+        assert_eq!(max, cql_types::to_sort_key(&CqlValue::BigInt(7)));
+    }
+
+    #[test]
+    fn a_timestamp_bound_is_read_as_a_timestamp() {
+        let registered: crate::ColumnName = "registered".into();
+        let (min, _) = sort_bound_keys(
+            Some(bound(Value::from("1970-01-01T00:00:01.000Z"), true)),
+            None,
+            Some(&registered),
+            &sort_columns(),
+        )
+        .unwrap();
+        let second =
+            cql_types::to_sort_key(&CqlValue::Timestamp(scylla::value::CqlTimestamp(1000)));
+        assert_eq!(min, second);
+    }
+
+    /// `> 7` is `>= 8` and `< 7` is `<= 6` in key space, which is exact for integer keys.
+    #[test]
+    fn an_exclusive_bound_moves_to_its_inclusive_neighbour() {
+        let score: crate::ColumnName = "score".into();
+        let (min, max) = sort_bound_keys(
+            Some(bound(Value::from(7), false)),
+            Some(bound(Value::from(7), false)),
+            Some(&score),
+            &sort_columns(),
+        )
+        .unwrap();
+        assert_eq!(min, cql_types::to_sort_key(&CqlValue::BigInt(8)));
+        assert_eq!(max, cql_types::to_sort_key(&CqlValue::BigInt(6)));
+    }
+
+    #[test]
+    fn an_index_without_a_sort_column_ignores_the_bounds() {
+        let (min, max) = sort_bound_keys(
+            Some(bound(Value::from(7), true)),
+            None,
+            None,
+            &sort_columns(),
+        )
+        .unwrap();
+        assert_eq!((min, max), (None, None));
+    }
+
+    #[test]
+    fn a_bound_of_the_wrong_type_is_refused() {
+        let score: crate::ColumnName = "score".into();
+        let err = sort_bound_keys(
+            Some(bound(Value::from("seven"), true)),
+            None,
+            Some(&score),
+            &sort_columns(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("score"), "{err}");
+    }
 
     #[test]
     fn try_from_post_index_ann_filter_conversion_ok() {

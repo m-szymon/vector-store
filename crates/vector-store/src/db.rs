@@ -5,6 +5,7 @@
 
 use crate::Analyzer;
 use crate::AsyncInProgress;
+use crate::CaseSensitive;
 use crate::ColumnName;
 use crate::Config;
 use crate::Connectivity;
@@ -23,13 +24,20 @@ use crate::IndexOptionsFts;
 use crate::IndexOptionsPattern;
 use crate::IndexVersion;
 use crate::KeyspaceName;
+use crate::MaxGram;
 use crate::Metrics;
+use crate::MinGram;
 use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
+use crate::OrderBy;
 use crate::Positions;
+use crate::PrimaryIdFast;
 use crate::Quantization;
+use crate::RewriteWideSegments;
+use crate::SegmentMaxDocs;
 use crate::SpaceType;
 use crate::TableName;
+use crate::VerifyInOrder;
 use crate::cql_types;
 use crate::db_driver::DbIndexInfo;
 use crate::db_index;
@@ -133,7 +141,6 @@ pub enum Db {
         index: IndexName,
         tx: oneshot::Sender<GetFtsIndexParamsR>,
     },
-
     GetPatternIndexParams {
         keyspace: KeyspaceName,
         table: TableName,
@@ -1045,7 +1052,35 @@ impl<T: DbDriver> Statements<T> {
         index: IndexName,
     ) -> GetPatternIndexParamsR {
         let options = self.get_index_options(keyspace, table, index).await?;
-        Ok(options.map(|_| IndexOptionsPattern {}))
+        Ok(options.map(|options| {
+            let min_gram: MinGram = parse_index_option(&options, "min_gram");
+            let max_gram: MaxGram = parse_index_option(&options, "max_gram");
+            let case_sensitive: CaseSensitive = parse_index_option(&options, "case_sensitive");
+            // Only that the option names something; that the column exists and can be ordered is
+            // checked later, where the table's schema is in hand.
+            let order_by: OrderBy = parse_index_option(&options, "order_by");
+            // The placeholders ScyllaDB passes through untouched; what each one means is decided
+            // here. `poc_option_1` is the FAST primary id.
+            let primary_id_fast: PrimaryIdFast = parse_index_option(&options, "poc_option_1");
+            // `poc_option_2` caps segment size and switches on the range-aware merge policy.
+            let segment_max_docs: SegmentMaxDocs = parse_index_option(&options, "poc_option_2");
+            // `poc_option_4` keeps the posting-order verification, for measurement only.
+            let verify_in_order: VerifyInOrder = parse_index_option(&options, "poc_option_4");
+            // `poc_option_3` rewrites wide segments into range-aligned ones (needs the cap).
+            let rewrite_wide_segments: RewriteWideSegments =
+                parse_index_option(&options, "poc_option_3");
+            IndexOptionsPattern {
+                min_gram,
+                max_gram,
+                case_sensitive,
+                order_by,
+                primary_id_fast,
+                segment_max_docs,
+                verify_in_order,
+                rewrite_wide_segments,
+            }
+            .validated()
+        }))
     }
 
     async fn is_valid_index(&self, metadata: IndexMetadata) -> IsValidIndexR {
@@ -1745,6 +1780,16 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("not a text column")
         );
+    }
+
+    #[test]
+    fn validate_pattern_accepts_text_and_ascii_columns() {
+        for col_type in [
+            ColumnType::Native(NativeType::Text),
+            ColumnType::Native(NativeType::Ascii),
+        ] {
+            assert!(validate_column_type_for_kind("name", &col_type, DbIndexKind::Pattern).is_ok());
+        }
     }
 
     #[test]
