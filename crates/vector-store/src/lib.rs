@@ -699,54 +699,27 @@ impl FromStr for OrderBy {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
-)]
-/// Whether a pattern index keeps the primary id as a `FAST` column as well as in the document
-/// store. Off by default: it costs index size, and exists to measure what the store reads cost.
-///
-/// ScyllaDB knows this only as the placeholder `poc_option_1`, which it validates as non-empty and
-/// hands through; the meaning lives here.
-pub struct PrimaryIdFast(bool);
-
-impl FromStr for PrimaryIdFast {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "on" | "yes" => Ok(Self(true)),
-            "false" | "0" | "off" | "no" => Ok(Self(false)),
-            _ => Err(anyhow::anyhow!("Unknown primary_id_fast value: {s}")),
-        }
+/// A boolean index option, as ScyllaDB passes it through.
+fn parse_flag(name: &str, s: &str) -> anyhow::Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => Err(anyhow::anyhow!("Unknown {name} value: {s}")),
     }
 }
 
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
 )]
-/// Whether a pattern index rewrites wide segments into range-aligned ones (P3b); `poc_option_3`.
+/// Whether a pattern index rewrites wide segments into range-aligned ones (P3b): the `rewrite`
+/// option, on by default for an index with `order_by` and a segment cap.
 pub struct RewriteWideSegments(bool);
 
 impl FromStr for RewriteWideSegments {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        PrimaryIdFast::from_str(s).map(|flag| Self(*flag.as_ref()))
-    }
-}
-
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
-)]
-/// Whether a pattern index verifies a long keyword's candidates in posting order rather than
-/// from the highest sort key down. The slow way, kept for measurement; `poc_option_4`.
-pub struct VerifyInOrder(bool);
-
-impl FromStr for VerifyInOrder {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        PrimaryIdFast::from_str(s).map(|flag| Self(*flag.as_ref()))
+        parse_flag("rewrite", s).map(Self)
     }
 }
 
@@ -754,8 +727,8 @@ impl FromStr for VerifyInOrder {
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
 )]
 /// The cap on a segment's size for a pattern index that merges by sort range (P3a), or none
-/// to keep Tantivy's default merge policy. ScyllaDB knows this only as the placeholder
-/// `poc_option_2`; the meaning lives here.
+/// to keep Tantivy's default merge policy: the `segment_rows` option. `'0'` turns the cap off;
+/// an index with `order_by` and no `segment_rows` gets [`DEFAULT_SEGMENT_ROWS`].
 pub struct SegmentMaxDocs(Option<NonZeroU32>);
 
 impl FromStr for SegmentMaxDocs {
@@ -765,12 +738,14 @@ impl FromStr for SegmentMaxDocs {
         let docs: u32 = s
             .trim()
             .parse()
-            .map_err(|e| anyhow::anyhow!("segment_max_docs must be a positive integer: {e}"))?;
-        NonZeroU32::new(docs)
-            .map(|docs| Self(Some(docs)))
-            .ok_or_else(|| anyhow::anyhow!("segment_max_docs must be positive"))
+            .map_err(|e| anyhow::anyhow!("segment_rows must be a non-negative integer: {e}"))?;
+        Ok(Self(NonZeroU32::new(docs)))
     }
 }
+
+/// The segment cap of an ordered pattern index that does not set `segment_rows`: the flattest of
+/// the caps measured at 10M rows on 2026-09-30 (`docs/dev/pattern/stage-2-ordering.md`).
+pub const DEFAULT_SEGMENT_ROWS: NonZeroU32 = NonZeroU32::new(200_000).unwrap();
 
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
@@ -895,19 +870,12 @@ pub struct IndexOptionsPattern {
     pub case_sensitive: CaseSensitive,
     /// The column results are ordered by, or none for unspecified order.
     pub order_by: OrderBy,
-    /// Whether the primary id is also kept as a columnar (`FAST`) field, so that resolving a page
-    /// never touches the document store. Read from the `poc_option_1` placeholder.
-    pub primary_id_fast: PrimaryIdFast,
     /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
-    /// default policy. Read from the `poc_option_2` placeholder.
+    /// default policy. The `segment_rows` option.
     pub segment_max_docs: SegmentMaxDocs,
-    /// Verify a long keyword's candidates in posting order, reading the store for each, as the
-    /// first stage-2 build did -- kept only to measure the two-pass walk against it. Read from
-    /// the `poc_option_4` placeholder.
-    pub verify_in_order: VerifyInOrder,
     /// Rewrite segments that span far more of the sort range than their share of the rows
     /// (P3b: an index built by a full scan, or a shuffled load) into range-aligned ones of
-    /// `segment_max_docs` rows. Needs the cap. Read from the `poc_option_3` placeholder.
+    /// `segment_max_docs` rows. Needs the cap. The `rewrite` option.
     pub rewrite_wide_segments: RewriteWideSegments,
 }
 
@@ -927,9 +895,7 @@ impl IndexOptionsPattern {
             // would come back in the wrong order rather than failing.
             return Self {
                 order_by: self.order_by,
-                primary_id_fast: self.primary_id_fast,
                 segment_max_docs: self.segment_max_docs,
-                verify_in_order: self.verify_in_order,
                 rewrite_wide_segments: self.rewrite_wide_segments,
                 ..Self::default()
             };
@@ -1443,9 +1409,7 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
-            primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
-            verify_in_order: VerifyInOrder::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsPattern::default());
@@ -1457,18 +1421,14 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: "registered_at".parse().unwrap(),
-            primary_id_fast: PrimaryIdFast::from(true),
             segment_max_docs: "250000".parse().unwrap(),
-            verify_in_order: VerifyInOrder::from(true),
             rewrite_wide_segments: RewriteWideSegments::from(true),
         };
         assert_eq!(
             inverted_ordered.validated(),
             IndexOptionsPattern {
                 order_by: "registered_at".parse().unwrap(),
-                primary_id_fast: PrimaryIdFast::from(true),
                 segment_max_docs: "250000".parse().unwrap(),
-                verify_in_order: VerifyInOrder::from(true),
                 rewrite_wide_segments: RewriteWideSegments::from(true),
                 ..IndexOptionsPattern::default()
             }
@@ -1479,18 +1439,19 @@ mod tests {
             max_gram: "2".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
-            primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
-            verify_in_order: VerifyInOrder::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
-        assert!("0".parse::<SegmentMaxDocs>().is_err());
+        assert_eq!(
+            "0".parse::<SegmentMaxDocs>().unwrap(),
+            SegmentMaxDocs::default()
+        );
         assert!("many".parse::<SegmentMaxDocs>().is_err());
 
-        assert!(*"TRUE".parse::<PrimaryIdFast>().unwrap().as_ref());
-        assert!(!*"off".parse::<PrimaryIdFast>().unwrap().as_ref());
-        assert!("maybe".parse::<PrimaryIdFast>().is_err());
+        assert!(*"TRUE".parse::<RewriteWideSegments>().unwrap().as_ref());
+        assert!(!*"off".parse::<RewriteWideSegments>().unwrap().as_ref());
+        assert!("maybe".parse::<RewriteWideSegments>().is_err());
     }
 
     #[test]

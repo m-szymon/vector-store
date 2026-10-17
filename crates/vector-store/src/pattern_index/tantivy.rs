@@ -27,9 +27,9 @@
 //!   shorter than the limit, and must follow the cursor instead. The converse is exact: the walk
 //!   reports a cursor only when it filled the page, so no cursor does mean no more results.
 //! * **Pruning depends on segment layout.** Cost is flat only where a segment's span of the sort
-//!   column is narrow. Two options keep it so: `segment_max_docs` (`poc_option_2`) installs a
+//!   column is narrow. Two options keep it so: `segment_rows` installs a
 //!   merge policy that only joins neighbours in sort order under a cap, and
-//!   `rewrite_wide_segments` (`poc_option_3`) moves the rows of segments that span far more than
+//!   `rewrite` moves the rows of segments that span far more than
 //!   their share -- an index built by a full scan, a shuffled load -- into range-aligned ones,
 //!   one range per idle tick. Without them, after an unordered backfill every segment spans
 //!   everything and the search degrades to visiting every match: correct, but not fast. See
@@ -475,7 +475,7 @@ struct SegmentColumns {
     sort: Column<u64>,
     sort_min: u64,
     sort_max: u64,
-    /// Present on every ordered index (the walk breaks ties on it) and with `primary_id_fast`.
+    /// Present on every ordered index (the walk breaks ties on it).
     primary_id: Option<Column<u64>>,
 }
 
@@ -495,7 +495,8 @@ impl PatternBackend {
             .fast_fields()
             .u64(SORT_FIELD)
             .map_err(|e| anyhow!("pattern: failed to open the sort column: {e}"))?;
-        let primary_id = (self.orders_results() || *self.options.primary_id_fast.as_ref())
+        let primary_id = self
+            .orders_results()
             .then(|| segment.fast_fields().u64(PRIMARY_ID_FIELD))
             .transpose()
             .map_err(|e| anyhow!("pattern: failed to open the primary id column: {e}"))?;
@@ -697,10 +698,9 @@ impl TantivyBackend for PatternBackend {
             .set_indexing_options(indexing)
             .set_stored();
         let mut schema_builder = Schema::builder();
-        if self.orders_results() || *self.options.primary_id_fast.as_ref() {
+        if self.orders_results() {
             // Also columnar: an ordered walk reads it per candidate to break ties on the sort
-            // key, and with `primary_id_fast` a page's ids come from it as well. The store keeps
-            // its copy for the verified path, which reads the document anyway.
+            // key. A page's ids still come from the store, which measured no slower.
             schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED | FAST);
         } else {
             schema_builder.add_u64_field(PRIMARY_ID_FIELD, INDEXED | STORED);
@@ -1417,38 +1417,6 @@ fn collect_matches_ordered(
         let store = segment
             .get_store_reader(STORE_CACHE_BLOCKS)
             .map_err(|e| anyhow!("pattern: failed to open the document store: {e}"))?;
-        if *state.backend.options.verify_in_order.as_ref() {
-            // The first stage-2 build's walk, kept to measure the two passes against.
-            let mut doc_id = scorer.doc();
-            while doc_id != TERMINATED {
-                tally.postings_scanned += 1;
-                if alive.is_none_or(|alive| alive.is_alive(doc_id)) {
-                    let pair = pair_of(doc_id);
-                    if window.contains(pair) && beats_page(&best, pair) {
-                        tally.store_reads += 1;
-                        let verified = store
-                            .get::<TantivyDocument>(doc_id)
-                            .map_err(|e| anyhow!("pattern: failed to retrieve doc: {e}"))?
-                            .get_first(text_field)
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|text| text.contains(normalized));
-                        if verified {
-                            tally.heap_entrants += 1;
-                            best.push(Reverse((
-                                pair.0,
-                                pair.1,
-                                DocAddress::new(segment_ord, doc_id),
-                            )));
-                            if best.len() > limit {
-                                best.pop();
-                            }
-                        }
-                    }
-                }
-                doc_id = scorer.advance();
-            }
-            continue;
-        }
         candidates.clear();
         let mut doc_id = scorer.doc();
         while doc_id != TERMINATED {
@@ -1506,34 +1474,19 @@ fn collect_matches_ordered(
     let mut page: Vec<Entry> = best.into_iter().map(|Reverse(entry)| entry).collect();
     page.sort_unstable_by_key(|(sort_key, primary_id, _)| Reverse((*sort_key, *primary_id)));
     let resolving = Instant::now();
-    let ids = if *state.backend.options.primary_id_fast.as_ref() {
-        page.into_iter()
-            .map(|(_, _, address)| {
-                let segment = &searcher.segment_readers()[address.segment_ord as usize];
-                state
-                    .backend
-                    .columns_for(segment, &mut tally.column_opens)?
-                    .primary_id
-                    .as_ref()
-                    .and_then(|column| column.first(address.doc_id))
-                    .map(PrimaryId::from)
-                    .ok_or_else(|| anyhow!("pattern: missing primary_id in the column"))
-            })
-            .collect::<anyhow::Result<_>>()?
-    } else {
-        tally.store_reads += page.len() as u64;
-        page.into_iter()
-            .map(|(_, _, address)| {
-                let doc: TantivyDocument = searcher
-                    .doc(address)
-                    .map_err(|e| anyhow!("pattern: failed to retrieve doc: {e}"))?;
-                doc.get_first(primary_id_field)
-                    .and_then(|value| value.as_u64())
-                    .map(PrimaryId::from)
-                    .ok_or_else(|| anyhow!("pattern: missing primary_id in doc"))
-            })
-            .collect::<anyhow::Result<_>>()?
-    };
+    tally.store_reads += page.len() as u64;
+    let ids = page
+        .into_iter()
+        .map(|(_, _, address)| {
+            let doc: TantivyDocument = searcher
+                .doc(address)
+                .map_err(|e| anyhow!("pattern: failed to retrieve doc: {e}"))?;
+            doc.get_first(primary_id_field)
+                .and_then(|value| value.as_u64())
+                .map(PrimaryId::from)
+                .ok_or_else(|| anyhow!("pattern: missing primary_id in doc"))
+        })
+        .collect::<anyhow::Result<_>>()?;
     let page_resolve = resolving.elapsed();
     state.backend.walk.record(
         tally,
@@ -1934,11 +1887,9 @@ mod tests {
     use crate::MaxGram;
     use crate::MinGram;
     use crate::OrderBy;
-    use crate::PrimaryIdFast;
     use crate::PrimaryKey;
     use crate::RewriteWideSegments;
     use crate::SegmentMaxDocs;
-    use crate::VerifyInOrder;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
     use crate::table::PartitionId;
@@ -2011,9 +1962,7 @@ mod tests {
             max_gram: MaxGram::from(NonZeroUsize::new(max_gram).unwrap()),
             case_sensitive: CaseSensitive::from(case_sensitive),
             order_by: OrderBy::default(),
-            primary_id_fast: PrimaryIdFast::default(),
             segment_max_docs: SegmentMaxDocs::default(),
-            verify_in_order: VerifyInOrder::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
         }
     }
@@ -2568,35 +2517,6 @@ mod tests {
         assert_eq!(walk.store_reads, 2, "{walk:?}");
     }
 
-    /// With the primary id kept as a column, an ordered page is resolved without the store:
-    /// same rows, same order, zero store reads for a keyword the grams answer exactly.
-    #[rstest]
-    #[timeout(Duration::from_secs(10))]
-    #[tokio::test]
-    async fn a_fast_primary_id_resolves_the_page_without_the_store() {
-        let sender = make_sender_with_options(IndexOptionsPattern {
-            primary_id_fast: PrimaryIdFast::from(true),
-            ..ordered_options()
-        });
-        add_docs(&sender, NICKNAMES).await;
-
-        let (ids, cursor) = search_ordered(&sender, "将军", 2, SearchWindow::default()).await;
-        assert_eq!(ids, vec![3, 2]);
-        // The cursor's sort key carries the sign bias, not the value; its primary key is the
-        // last row's.
-        let cursor = cursor.expect("a full page leaves a cursor");
-        assert_eq!(cursor.sort_key, 2 ^ (1 << 63));
-        assert_eq!(
-            cursor.primary_key,
-            Some(PrimaryKey::from(vec![CqlValue::BigInt(2)]))
-        );
-
-        let walk = sender.stats(make_index_key()).await.unwrap().walk;
-        assert_eq!(walk.searches, 1);
-        assert_eq!(walk.store_reads, 0, "{walk:?}");
-        assert!(walk.page_resolve_nanos <= walk.walk_nanos);
-    }
-
     fn id(n: u8) -> SegmentId {
         SegmentId::from_uuid_string(&format!("00000000-0000-0000-0000-0000000000{n:02}")).unwrap()
     }
@@ -3048,57 +2968,6 @@ mod tests {
 
         let (ids, _) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
         assert_eq!(ids, vec![2000, 1999, 1998]);
-    }
-
-    /// With `verify_in_order` the old walk is back: candidates are read as the postings come, so
-    /// a segment scanned in ascending sort order reads nearly all of them. Kept for measurement.
-    #[rstest]
-    #[timeout(Duration::from_secs(10))]
-    #[tokio::test]
-    async fn verifying_in_order_reads_every_candidate_that_beats_the_page() {
-        // The cap folds the pieces a commit's writer threads leave into one segment, which is
-        // what the count below assumes: over several segments the walk prunes most of them.
-        let sender = make_sender_with_options(IndexOptionsPattern {
-            verify_in_order: VerifyInOrder::from(true),
-            segment_max_docs: "1000".parse().unwrap(),
-            ..ordered_options()
-        });
-        let mut acks = Vec::new();
-        for n in 1..=30u64 {
-            let (tx, rx) = mpsc::channel(1);
-            sender
-                .add_document(
-                    test_partition_id(),
-                    n.into(),
-                    format!("x{n}abcdx"),
-                    AsyncInProgress::Fullscan(tx),
-                )
-                .await
-                .unwrap();
-            acks.push(rx);
-        }
-        for mut ack in acks {
-            ack.recv().await;
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while sender
-            .stats(make_index_key())
-            .await
-            .unwrap()
-            .tantivy
-            .segment_count
-            > 1
-            && Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        let (ids, _) = search_ordered(&sender, "abcd", 5, SearchWindow::default()).await;
-        assert_eq!(ids, vec![30, 29, 28, 27, 26]);
-        let walk = sender.stats(make_index_key()).await.unwrap().walk;
-        // Every candidate that beat the page at its moment was read, plus the page itself; with
-        // rows in ascending order that is well over the 5 + 5 the two-pass walk needs.
-        assert!(walk.store_reads > 10, "{walk:?}");
     }
 
     /// The columns are opened once per segment, by the reload that follows a commit, so a search

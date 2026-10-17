@@ -10,6 +10,7 @@ use crate::ColumnName;
 use crate::Config;
 use crate::Connectivity;
 use crate::Credentials;
+use crate::DEFAULT_SEGMENT_ROWS;
 use crate::DbCustomIndex;
 use crate::DbDriver;
 use crate::DbIndexKind;
@@ -31,13 +32,11 @@ use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
 use crate::OrderBy;
 use crate::Positions;
-use crate::PrimaryIdFast;
 use crate::Quantization;
 use crate::RewriteWideSegments;
 use crate::SegmentMaxDocs;
 use crate::SpaceType;
 use crate::TableName;
-use crate::VerifyInOrder;
 use crate::cql_types;
 use crate::db_driver::DbIndexInfo;
 use crate::db_index;
@@ -601,6 +600,44 @@ async fn process<T: DbDriver>(
 
 /// Parses a single value of an index `options` map, falling back to its default
 /// when the option is absent or carries an unsupported value.
+/// The options of a pattern index, with the defaults an ordered index gets.
+fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPattern {
+    let min_gram: MinGram = parse_index_option(options, "min_gram");
+    let max_gram: MaxGram = parse_index_option(options, "max_gram");
+    let case_sensitive: CaseSensitive = parse_index_option(options, "case_sensitive");
+    // Only that the option names something; that the column exists and can be ordered is
+    // checked later, where the table's schema is in hand.
+    let order_by: OrderBy = parse_index_option(options, "order_by");
+    let ordered = order_by.as_ref().is_some();
+    // `segment_rows` caps segment size and switches on the range-aware merge policy. An
+    // ordered index gets the cap unless it says otherwise ('0' turns it off): without it
+    // a deep page costs several times what the first one does.
+    let segment_max_docs: SegmentMaxDocs = if options.contains_key("segment_rows") {
+        parse_index_option(options, "segment_rows")
+    } else if ordered {
+        SegmentMaxDocs::from(Some(DEFAULT_SEGMENT_ROWS))
+    } else {
+        SegmentMaxDocs::default()
+    };
+    // `rewrite` rewrites wide segments into range-aligned ones, which needs the cap. On by
+    // default wherever there is a cap: an index created on a loaded table is unusable for
+    // ordered queries until it runs.
+    let rewrite_wide_segments: RewriteWideSegments = if options.contains_key("rewrite") {
+        parse_index_option(options, "rewrite")
+    } else {
+        RewriteWideSegments::from(segment_max_docs.as_ref().is_some())
+    };
+    IndexOptionsPattern {
+        min_gram,
+        max_gram,
+        case_sensitive,
+        order_by,
+        segment_max_docs,
+        rewrite_wide_segments,
+    }
+    .validated()
+}
+
 fn parse_index_option<T: FromStr + Default>(options: &BTreeMap<String, String>, name: &str) -> T {
     let Some(value) = options.get(name) else {
         return T::default();
@@ -1052,35 +1089,7 @@ impl<T: DbDriver> Statements<T> {
         index: IndexName,
     ) -> GetPatternIndexParamsR {
         let options = self.get_index_options(keyspace, table, index).await?;
-        Ok(options.map(|options| {
-            let min_gram: MinGram = parse_index_option(&options, "min_gram");
-            let max_gram: MaxGram = parse_index_option(&options, "max_gram");
-            let case_sensitive: CaseSensitive = parse_index_option(&options, "case_sensitive");
-            // Only that the option names something; that the column exists and can be ordered is
-            // checked later, where the table's schema is in hand.
-            let order_by: OrderBy = parse_index_option(&options, "order_by");
-            // The placeholders ScyllaDB passes through untouched; what each one means is decided
-            // here. `poc_option_1` is the FAST primary id.
-            let primary_id_fast: PrimaryIdFast = parse_index_option(&options, "poc_option_1");
-            // `poc_option_2` caps segment size and switches on the range-aware merge policy.
-            let segment_max_docs: SegmentMaxDocs = parse_index_option(&options, "poc_option_2");
-            // `poc_option_4` keeps the posting-order verification, for measurement only.
-            let verify_in_order: VerifyInOrder = parse_index_option(&options, "poc_option_4");
-            // `poc_option_3` rewrites wide segments into range-aligned ones (needs the cap).
-            let rewrite_wide_segments: RewriteWideSegments =
-                parse_index_option(&options, "poc_option_3");
-            IndexOptionsPattern {
-                min_gram,
-                max_gram,
-                case_sensitive,
-                order_by,
-                primary_id_fast,
-                segment_max_docs,
-                verify_in_order,
-                rewrite_wide_segments,
-            }
-            .validated()
-        }))
+        Ok(options.as_ref().map(pattern_index_options))
     }
 
     async fn is_valid_index(&self, metadata: IndexMetadata) -> IsValidIndexR {
@@ -1667,6 +1676,44 @@ pub(crate) mod tests {
             Some(DbIndexKind::FullTextSearch)
         );
         assert!(!options.contains_key("class_name"));
+    }
+
+    #[test]
+    fn an_ordered_pattern_index_gets_the_cap_and_the_rewrite_by_default() {
+        let options = |pairs: &[(&str, &str)]| {
+            pattern_index_options(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let unordered = options(&[]);
+        assert_eq!(*unordered.segment_max_docs.as_ref(), None);
+        assert!(!*unordered.rewrite_wide_segments.as_ref());
+
+        let ordered = options(&[("order_by", "register_time")]);
+        assert_eq!(
+            *ordered.segment_max_docs.as_ref(),
+            Some(DEFAULT_SEGMENT_ROWS)
+        );
+        assert!(*ordered.rewrite_wide_segments.as_ref());
+
+        let tuned = options(&[
+            ("order_by", "register_time"),
+            ("segment_rows", "400000"),
+            ("rewrite", "false"),
+        ]);
+        assert_eq!(
+            tuned.segment_max_docs.as_ref().map(|rows| rows.get()),
+            Some(400_000)
+        );
+        assert!(!*tuned.rewrite_wide_segments.as_ref());
+
+        // '0' turns the cap off, and with it the rewrite that needs it.
+        let uncapped = options(&[("order_by", "register_time"), ("segment_rows", "0")]);
+        assert_eq!(*uncapped.segment_max_docs.as_ref(), None);
+        assert!(!*uncapped.rewrite_wide_segments.as_ref());
     }
 
     #[test]
