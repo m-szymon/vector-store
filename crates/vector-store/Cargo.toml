@@ -19,6 +19,14 @@ required-features = ["dev-tools"]
 name = "pipeline"
 harness = false
 
+[[bench]]
+name = "pattern_order"
+harness = false
+
+[[bench]]
+name = "pattern_probe"
+harness = false
+
 [features]
 default = []
 dev-tools = []
