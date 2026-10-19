@@ -369,11 +369,7 @@ impl DbDriver for ScyllaDriver {
         let query = range_scan_query(
             &keyspace_identifier,
             &table_identifier,
-            index
-                .target_columns
-                .iter()
-                .chain(index.nonpk_partition_key_columns().into_iter().flatten())
-                .chain(index.nonpk_filtering_columns()),
+            read_columns(index),
             &st_primary_key_list,
             &st_partition_key_list,
         );
@@ -449,11 +445,7 @@ impl DbDriver for ScyllaDriver {
         let query = request_query(
             &keyspace_identifier,
             &table_identifier,
-            index
-                .target_columns
-                .iter()
-                .chain(index.nonpk_partition_key_columns().into_iter().flatten())
-                .chain(index.nonpk_filtering_columns()),
+            read_columns(index),
             index.primary_key_columns.iter(),
         );
         Ok(session
@@ -685,6 +677,17 @@ fn build_columns_list<'a>(
 ///
 /// For CQL-native tables, selects the vector column directly.
 /// For Alternator tables, selects from the `:attrs` map column.
+/// The columns the full scan and the read of one row select besides the primary key, in the order
+/// the consumer reads them: the target, the partition key columns it does not otherwise get, then
+/// the filtering columns and a pattern index's sort column (`IndexMetadata::ingested_value_columns`).
+fn read_columns(index: &IndexMetadata) -> impl Iterator<Item = &ColumnName> {
+    index
+        .target_columns
+        .iter()
+        .chain(index.nonpk_partition_key_columns().into_iter().flatten())
+        .chain(index.ingested_value_columns())
+}
+
 pub(crate) fn range_scan_query<'a>(
     keyspace: &KeyspaceIdentifier,
     table: &TableIdentifier,
@@ -762,6 +765,30 @@ pub(crate) fn fetch_vector_query<'a, 'b>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_columns_include_the_sort_column_of_a_pattern_index() {
+        let metadata = crate::IndexMetadata {
+            keyspace_name: "ks".into(),
+            table_name: "users".into(),
+            index_name: "idx".into(),
+            target_columns: crate::NonemptyArc::new(["nickname"]).unwrap(),
+            partition_key_count: std::num::NonZeroUsize::new(1).unwrap(),
+            primary_key_columns: crate::NonemptyArc::new(["user_id"]).unwrap(),
+            partitioning: crate::DbIndexPartitioning::Global,
+            filtering_columns: std::sync::Arc::new([]),
+            alternator_attribute_types: Default::default(),
+            version: uuid::Uuid::new_v4().into(),
+            kind: crate::IndexKind::Pattern(crate::IndexOptionsPattern {
+                order_by: "register_time".parse().unwrap(),
+                ..Default::default()
+            }),
+        };
+        let columns: Vec<_> = read_columns(&metadata)
+            .map(|c| c.as_ref().to_string())
+            .collect();
+        assert_eq!(columns, ["nickname", "register_time"]);
+    }
 
     #[test]
     fn range_scan_query_quotes_lowercase_identifiers() {
