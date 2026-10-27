@@ -321,8 +321,12 @@ impl<E> Index<E> {
         self.writer.read().unwrap().writer.set_merge_policy(policy);
     }
 
-    pub(crate) fn has_uncommitted_docs(&self) -> bool {
-        self.writer.read().unwrap().has_uncommitted_docs()
+    /// Whether the writer holds uncommitted documents, or None while someone holds the writer.
+    /// Never waits for the writer: the actors ask on their ticks, and a writer held for seconds --
+    /// a pattern index moving rows between segments -- would stop an actor answering anything.
+    pub(crate) fn has_uncommitted_docs(&self) -> Option<bool> {
+        let writer = self.writer.try_read().ok()?;
+        Some(writer.has_uncommitted_docs())
     }
 
     /// The writer, locked, for a caller that has to read the index and write what it read back
@@ -522,10 +526,14 @@ where
     }
 
     /// Commits every index with uncommitted documents and requests a reload of every other index
-    /// whose committed documents are not searchable yet.
+    /// whose committed documents are not searchable yet. An index whose writer is held right now
+    /// is left for the next tick rather than waited for.
     pub(crate) async fn commit_or_reload(&self) {
         for index in self.indexes.values() {
-            if index.writer.read().unwrap().has_uncommitted_docs() {
+            let Some(uncommitted) = index.has_uncommitted_docs() else {
+                continue;
+            };
+            if uncommitted {
                 let index = Arc::clone(index);
                 let key = self.key.clone();
                 self.worker

@@ -45,8 +45,11 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::Release;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -210,6 +213,25 @@ struct PatternBackend {
     /// P3b: the rewrite of wide segments in progress, if any, and what it has done so far.
     plan: Mutex<Option<RewritePlan>>,
     rewrite: RewriteCounters,
+    /// Set while a tick's work on this index -- learning the layout, a step of the rewrite -- is
+    /// running, so that the next tick does not queue more behind it. See `TickWork`.
+    tick_running: AtomicBool,
+}
+
+/// Holds an index's `tick_running` for one tick's work and clears it however that work ends.
+struct TickWork(Arc<PatternIndexState>);
+
+impl TickWork {
+    /// None while the previous tick's work on this index is still running.
+    fn start(state: &Arc<PatternIndexState>) -> Option<Self> {
+        (!state.backend().tick_running.swap(true, AcqRel)).then(|| Self(Arc::clone(state)))
+    }
+}
+
+impl Drop for TickWork {
+    fn drop(&mut self) {
+        self.0.backend().tick_running.store(false, Release);
+    }
 }
 
 /// A segment is wide when it spans more of the sort range than this many caps' worth of rows
@@ -1015,6 +1037,7 @@ fn new_index(
         bounds: Arc::new(RwLock::new(HashMap::new())),
         plan: Mutex::new(None),
         rewrite: RewriteCounters::default(),
+        tick_running: AtomicBool::new(false),
         options: options.clone(),
     };
     let schema = backend.build_schema();
@@ -1844,33 +1867,40 @@ pub(crate) fn new(
                 }
                 _ = indexes.commit_interval_tick() => {
                     // An index with nothing to commit is idle: the rewrite runs then, one range
-                    // per tick, so it paces itself to the ticks and never starves ingestion or
-                    // searches.
+                    // per tick at most, so it paces itself to the ticks and never starves
+                    // ingestion or searches. One whose writer is held right now is not idle.
                     let idle: Vec<bool> = indexes
                         .iter()
-                        .map(|index| !index.has_uncommitted_docs())
+                        .map(|index| index.has_uncommitted_docs() == Some(false))
                         .collect();
                     indexes.commit_or_reload().await;
                     for (state, idle) in indexes.iter().zip(idle) {
-                        let state = Arc::clone(state);
+                        // A step of the rewrite at 10M rows takes seconds under the writer lock.
+                        // Run on the worker, it took a runtime thread, and the steps the next ticks
+                        // queued behind it took the others, waiting for the lock, until the node
+                        // stopped answering HTTP (AWS runs eb0023ac and 1c3ae034). So the work runs
+                        // on tokio's blocking pool, and a tick adds none while an index's previous
+                        // work still runs.
+                        let Some(work) = TickWork::start(state) else {
+                            continue;
+                        };
                         let key = key.clone();
-                        worker
-                            .spawn_blocking(move || {
-                                let backend = state.backend();
-                                backend.after_reload(&state);
-                                if !idle {
-                                    return;
-                                }
-                                if !backend.rewrite_in_progress() {
-                                    backend.maybe_plan_rewrite(&state);
-                                }
-                                if backend.rewrite_in_progress()
-                                    && let Err(err) = rewrite_next_range(&state, &key)
-                                {
-                                    error!("pattern: rewrite of {key} failed: {err}");
-                                }
-                            })
-                            .await;
+                        tokio::task::spawn_blocking(move || {
+                            let state = &work.0;
+                            let backend = state.backend();
+                            backend.after_reload(state);
+                            if !idle {
+                                return;
+                            }
+                            if !backend.rewrite_in_progress() {
+                                backend.maybe_plan_rewrite(state);
+                            }
+                            if backend.rewrite_in_progress()
+                                && let Err(err) = rewrite_next_range(state, &key)
+                            {
+                                error!("pattern: rewrite of {key} failed: {err}");
+                            }
+                        });
                     }
                     mark_dirty(&index.key);
                 }
@@ -3708,5 +3738,100 @@ mod tests {
         assert_eq!(pattern_of(MatchKind::Prefix, "ab"), "\u{2}ab");
         assert_eq!(pattern_of(MatchKind::Suffix, "ab"), "ab\u{3}");
         assert_eq!(pattern_of(MatchKind::Contains, "ab"), "ab");
+    }
+
+    /// The rewrite of a large index must not stop the node answering. Its steps hold the writer
+    /// lock for seconds. The actor's tick asked every index for uncommitted documents through that
+    /// lock, so the actor, and every request behind it, waited out each step; and steps run on the
+    /// worker took runtime threads. On AWS the node stopped answering HTTP once a 10M-row build
+    /// began its rewrite; at 10M rows on 4 cores this test saw answers 5.9 s late. Too slow for
+    /// the suite: run with `--ignored` (STALL_ROWS sets the size).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn a_rewrite_in_progress_leaves_the_actor_answering() {
+        // STALL_ROWS=10000000, on 4 cores (taskset -c 0-3), is the size and shape of the AWS run.
+        let rows: u64 = std::env::var("STALL_ROWS").map_or(2_000_000, |rows| rows.parse().unwrap());
+        // Shuffled sort keys, as a build by full scan leaves them: every segment spans the range.
+        let mut mock = MockTableSearch::new();
+        let index_id = IndexIdGenerator::new().next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+        mock.expect_index_id().returning(move |_| Some(index_id));
+        mock.expect_partition_id()
+            .returning(move |_, _| Some((partition_id, None)));
+        mock.expect_primary_key().returning(|_, primary_id| {
+            Some(PrimaryKey::from(vec![CqlValue::BigInt(
+                u64::from(primary_id) as i64,
+            )]))
+        });
+        mock.expect_column_value_for()
+            .returning(move |_, primary_id, _| {
+                let shuffled = u64::from(primary_id).wrapping_mul(2_654_435_761) % rows;
+                Some(CqlValue::BigInt(shuffled as i64))
+            });
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options: IndexOptionsPattern {
+                    order_by: "sort_col".parse().unwrap(),
+                    segment_max_docs: "200000".parse().unwrap(),
+                    rewrite_wide_segments: "true".parse().unwrap(),
+                    ..IndexOptionsPattern::default()
+                },
+            },
+            Arc::new(RwLock::new(mock)),
+            worker::new(),
+            make_memory_actor(),
+            COMMIT_INTERVAL,
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        for n in 1..=rows {
+            let name = format!("用户{}号玩家{}", n % 9973, n);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    n.into(),
+                    name,
+                    AsyncInProgress::Fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        rx.recv().await;
+
+        // Ask while the rewrite runs, until it has finished or two minutes pass.
+        let started = Instant::now();
+        let mut slowest = Duration::ZERO;
+        let mut slowest_count = Duration::ZERO;
+        let mut ranges = (0, 0);
+        while started.elapsed() < Duration::from_secs(120) {
+            let asked = Instant::now();
+            sender.count(make_index_key()).await.unwrap();
+            slowest_count = slowest_count.max(asked.elapsed());
+            let asked = Instant::now();
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            slowest = slowest.max(asked.elapsed());
+            ranges = (stats.rewrite.ranges_done, stats.rewrite.ranges_total);
+            if ranges.1 > 0 && ranges.0 == ranges.1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        println!(
+            "STALL rewrite {}/{} ranges after {:.0}s, slowest stats {:?}, slowest count {:?}",
+            ranges.0,
+            ranges.1,
+            started.elapsed().as_secs_f64(),
+            slowest,
+            slowest_count
+        );
+        assert!(ranges.1 > 0, "no rewrite was planned");
+        assert!(
+            slowest_count < Duration::from_secs(1),
+            "the actor stalled for {slowest_count:?}"
+        );
+        assert!(slowest < Duration::from_secs(1), "stats took {slowest:?}");
     }
 }
