@@ -737,14 +737,26 @@ Capacity (unthrottled, 64 in flight), queries per second, with the index node's 
 At a fixed rate below capacity (16 in flight), p99 was 1.8 to 3.6 ms on both indexes, against
 1.6 to 3.4 ms in `7212926d`.
 
-- **The port is 7-21% slower than the stage-5 code on the same layout**, and the index node's walk
-  is 20-28% longer for most shapes. The cause is not established. Tantivy, tokio and mimalloc are
-  at the versions of September. What differs: the port itself (upstream's shared tantivy code, the
-  segment bounds learnt on every commit tick rather than after each commit), and the environment --
-  newer Ubuntu AMIs, and an SCT that runs a vector.dev log shipper on every node. The rows the
-  ScyllaDB side bounds (1 to 4 characters, ~9.7k in September, ~8.7k now) dropped by as much as the
-  rows the index node bounds, which points at the environment more than at the index. A benchmark
-  of the two commits on one machine, or one AWS run of each, would settle it.
+- **The port measured 7-21% below the stage-5 code, and the difference is not attributed to the
+  code.** Per query the two did the same work: the same 51 segments, the same segments opened,
+  the same postings (21,135 against 21,022 at one character), no column opens, the same prepare
+  time; only the time differs, and it differs at a low fixed rate too (32 characters: 416 against
+  566 us at 500 queries a second, on an idle node), so it is not contention. The search code is
+  the same in both commits (the walk, the segment skip, the query building and the window differ
+  only by an accessor rename), as are the toolchain (Rust 1.97.1) and the build configuration. What
+  differs is the machines: every AMI was a month newer (Ubuntu 2026-10-23 under ScyllaDB, the
+  vector-store 1.14.0 AMI on that month's Ubuntu under the index node), and the rows ScyllaDB bounds
+  dropped by as much as those the index node bounds. Images, instances and the day are not
+  separable in one run, so the AWS test case now pins its AMIs (SCT `9447658ea`), and the next run
+  carries this run's default index as a control: its difference from this run is the first measure
+  of run-to-run noise. Until then, differences between runs of up to ~20% in this note -- the
+  segment-size sweep against the A/B run, the gain credited to `a7fefd2` -- are not established
+  either; differences within a run, and the large ones (the segment skip, the rewrite), stand.
+- **The port merges an index loaded in bulk much sooner.** In a local benchmark of both commits on
+  2M names with a 200k cap, through the actor, the port settled at 11 segments within 10 s of the
+  last commit; the stage-5 code stood at 162 segments after four minutes. The port learns the new
+  segments' bounds and asks for their merges on every commit tick, the stage-5 code only after
+  each commit and on idle ticks.
 - **cap_300k does not balance better than 200k here**: it is better at 1 and 8 characters and worse
   at 2, 4 and 32. Its weakest shape (32 characters, 7.6k) is about as weak as the default's
   (16 characters, 7.2k).
