@@ -711,6 +711,52 @@ segment an 8-character keyword went from 8.7 to 6.9 us, -21%, which is the reuse
 Raw results: `~/sct-results/20260930-075658-530733/` on the laptop that drove the run, with one
 row per phase in `summary.csv`.
 
+### Measured at 10M names: the port onto upstream's pattern index (AWS, 2026-10-27, run `eb0023ac`)
+
+Plan `aws_port_config.yaml`: the first run of the `pattern-index-poc` branches (scylladb
+`45236f6c70`, vector-store `1b279cb`), with the corpus, phases and machines of run `7212926d`,
+case-sensitive and verifying on the node. Two indexes ingested the load: `default` (no options:
+the port's 200k cap, the rewrite on) and `cap_300k`. Both caught up 498 s after the load and
+settled within 31 s, at 51 and 34 segments; 51 is what `7212926d`'s 200k index settled at.
+
+Capacity (unthrottled, 64 in flight), queries per second, with the index node's walk in us, and
+`7212926d`'s 200k index for comparison:
+
+| keyword | default (200k) | 7212926d, 200k | change | cap_300k |
+|---|---|---|---|---|
+| 1 char | 8,651 (390) | 9,973 (308) | -13% | 9,037 (217) |
+| 2 chars | 8,828 (258) | 9,731 (208) | -9% | 8,399 (150) |
+| 2 chars, window 0.5 | 8,687 (380) | 9,628 (319) | -10% | 8,626 (306) |
+| 4 chars | 8,800 (193) | 9,737 (186) | -10% | 8,339 (165) |
+| 8 chars | 10,667 (313) | 12,094 (275) | -12% | 14,635 (221) |
+| 8 chars, window 0.5 | 21,754 (147) | 23,401 (137) | -7% | 28,013 (110) |
+| 16 chars | 7,237 (490) | 8,661 (404) | -16% | 8,268 (418) |
+| 32 chars | 8,142 (423) | 10,282 (330) | -21% | 7,578 (462) |
+| no match | 59,276 (33) | 64,669 (35) | -8% | 59,114 (20) |
+
+At a fixed rate below capacity (16 in flight), p99 was 1.8 to 3.6 ms on both indexes, against
+1.6 to 3.4 ms in `7212926d`.
+
+- **The port is 7-21% slower than the stage-5 code on the same layout**, and the index node's walk
+  is 20-28% longer for most shapes. The cause is not established. Tantivy, tokio and mimalloc are
+  at the versions of September. What differs: the port itself (upstream's shared tantivy code, the
+  segment bounds learnt on every commit tick rather than after each commit), and the environment --
+  newer Ubuntu AMIs, and an SCT that runs a vector.dev log shipper on every node. The rows the
+  ScyllaDB side bounds (1 to 4 characters, ~9.7k in September, ~8.7k now) dropped by as much as the
+  rows the index node bounds, which points at the environment more than at the index. A benchmark
+  of the two commits on one machine, or one AWS run of each, would settle it.
+- **cap_300k does not balance better than 200k here**: it is better at 1 and 8 characters and worse
+  at 2, 4 and 32. Its weakest shape (32 characters, 7.6k) is about as weak as the default's
+  (16 characters, 7.2k).
+- **The backfill half was not measured.** Both indexes were created on the reloaded table and the
+  default built by full scan in 220 s; while the cap_300k one was still building, one status request
+  from the runner timed out after 30 s, together with SSH channels to the nodes, and the test ended
+  (fixed in SCT `54537260a`: a poll without an answer is skipped). The rewrite at 10M stays
+  unmeasured.
+
+Raw results: `~/sct-results/20261027-090852-795237/` on the laptop that drove the run
+(`latency_results.json`, `sct.log`). The index node's logs were not collected.
+
 ## Open questions and risks
 
 - ~~**The sort-key encoding is written twice**~~ Closed (stage 4): a range bound travels as a
