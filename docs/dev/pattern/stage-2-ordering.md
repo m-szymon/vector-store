@@ -763,8 +763,8 @@ At a fixed rate below capacity (16 in flight), p99 was 1.8 to 3.6 ms on both ind
 - **The backfill half was not measured.** Both indexes were created on the reloaded table and the
   default built by full scan in 220 s; while the cap_300k one was still building, one status request
   from the runner timed out after 30 s, together with SSH channels to the nodes, and the test ended
-  (fixed in SCT `54537260a`: a poll without an answer is skipped). The rewrite at 10M stays
-  unmeasured.
+  (fixed in SCT `54537260a`: a poll without an answer is skipped). The rewrite at 10M was
+  measured in run `e78f96a6`, below.
 
 Raw results: `~/sct-results/20261027-090852-795237/` on the laptop that drove the run
 (`latency_results.json`, `sct.log`). The index node's logs were not collected.
@@ -807,6 +807,52 @@ What is left: a step of the rewrite still holds the writer for seconds, and writ
 wait for it -- under a steady CDC stream, ingestion stalls once per step. Moving the reading part
 of a step out from under the lock needs a way to keep a concurrent update from being undone by the
 re-add; not done.
+
+### The backfill half measured (AWS, 2026-10-27, run `e78f96a6`)
+
+Plan `aws_backfill_config.yaml` again, on the same pinned images, with vector-store `a4fcd76` (the
+fix above). The `control` index is the third sample of the same index:
+
+| keyword | eb0023ac | 1c3ae034 | e78f96a6 |
+|---|---|---|---|
+| 1 char | 8,652 | 9,714 | 9,162 |
+| 2 chars | 8,829 | 9,413 | 9,124 |
+| 4 chars | 8,800 | 9,264 | 8,547 |
+| 8 chars | 10,668 | 12,375 | 10,609 |
+| 16 chars | 7,237 | 8,482 | 6,753 |
+| 32 chars | 8,142 | 10,230 | 7,777 |
+| no match | 59,276 | 61,605 | 57,294 |
+
+The third run lands near the first: the spread is ~10% at 1-4 characters and up to ~30% at 16-32,
+with no sign that either end is the "right" one. Compare within a run.
+
+The control caught up 90 s after the load and settled at 51 segments. The backfill index, created
+on the reloaded table, built by full scan and caught up 120 s after the load; its rewrite moved
+all 75 ranges in about 3 minutes (one range every ~2.4 s, as locally) and it settled at 54
+segments, 204 s after it caught up. The node answered every status poll and metrics scrape
+throughout.
+
+Capacity (unthrottled, 64 in flight), queries per second, with the index node's walk in us:
+
+| keyword | control | backfill | change |
+|---|---|---|---|
+| 1 char | 9,162 (312) | 9,363 (339) | +2% |
+| 2 chars | 9,124 (211) | 9,148 (228) | 0% |
+| 2 chars, window 0.5 | 8,983 (317) | 8,970 (334) | 0% |
+| 4 chars | 8,547 (194) | 8,911 (295) | +4% |
+| 8 chars | 10,609 (314) | 10,056 (334) | -5% |
+| 8 chars, window 0.5 | 21,572 (148) | 20,378 (158) | -6% |
+| 16 chars | 6,753 (528) | 6,784 (526) | 0% |
+| 32 chars | 7,777 (445) | 8,033 (429) | +3% |
+| no match | 57,294 (32) | 58,184 (34) | +2% |
+
+At a fixed rate below capacity (16 in flight), p99 was 2.0 to 3.8 ms on the control and 1.9 to
+3.2 ms on the backfill index. **An index built on a loaded table and rewritten serves as well as
+one that ingested the load**: the same segments opened per query (2 at 1-4 characters, 37-40 at 8,
+~28 at 16, ~9.5 at 32), capacity within 6%, and the walk within ~10% except at 4 characters (295
+against 194 us, at a higher rate), all inside the noise of a run.
+
+Raw results: `~/sct-results/20261027-192653-792986/` on the laptop that drove the run.
 
 ## Open questions and risks
 
