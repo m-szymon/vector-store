@@ -769,6 +769,45 @@ At a fixed rate below capacity (16 in flight), p99 was 1.8 to 3.6 ms on both ind
 Raw results: `~/sct-results/20261027-090852-795237/` on the laptop that drove the run
 (`latency_results.json`, `sct.log`). The index node's logs were not collected.
 
+### Run-to-run noise, and the backfill half again (AWS, 2026-10-27, run `1c3ae034`)
+
+Plan `aws_backfill_config.yaml`, on the images of run `eb0023ac`, now pinned in the SCT test case.
+Its `control` index repeats `eb0023ac`'s `default` (same code, corpus, phases, images), so the
+difference between the two is noise:
+
+| keyword | eb0023ac | control | change |
+|---|---|---|---|
+| 1 char | 8,652 | 9,714 | +12% |
+| 2 chars | 8,829 | 9,413 | +7% |
+| 4 chars | 8,800 | 9,264 | +5% |
+| 8 chars | 10,668 | 12,375 | +16% |
+| 16 chars | 7,237 | 8,482 | +17% |
+| 32 chars | 8,142 | 10,230 | +26% |
+
+For the 8- to 32-character keywords the index opened the same segments as in `eb0023ac`, and the
+walk took 14-22% less time; the 1- and 2-character pages came from one segment here and two there.
+The control is back at the numbers of `7212926d` (9.7k against 9.97k at one character, 8.5k against
+8.7k at 16, 10.2k against 10.3k at 32). So the "slowdown" of `eb0023ac` was the run, not the port,
+and **two runs of the same code differ by up to ~25%**: more than most of the differences between
+runs this note has read as effects.
+
+The backfill index was built by full scan in 122 s. As its rewrite began, the node stopped answering
+HTTP for more than 30 s and the test ended, the same moment and the same symptom as in `eb0023ac`.
+The cause was in the pattern index, not the network: every commit tick asked each index whether it
+had uncommitted documents by taking its writer lock to read, from inside the actor's task, and a step
+of the rewrite holds that lock for seconds. The actor, and every request queued behind it, waited out
+each step; and the steps, run on the shared worker, took the runtime's threads besides, queued one
+behind another by the following ticks. A test of the rewrite of 10M rows on 4 cores reproduces it
+(answers 5.9 s late). Fixed by a tick that never waits for a writer (`try_read`; a held writer means
+"not idle, commit next tick") and by tick work that runs on tokio's blocking pool, one at a time per
+index: the same test then answers within 10 ms. The rewrite runs at most one range per tick now, 75
+ranges in about three minutes at 10M locally.
+
+What is left: a step of the rewrite still holds the writer for seconds, and writes to that index
+wait for it -- under a steady CDC stream, ingestion stalls once per step. Moving the reading part
+of a step out from under the lock needs a way to keep a concurrent update from being undone by the
+re-add; not done.
+
 ## Open questions and risks
 
 - ~~**The sort-key encoding is written twice**~~ Closed (stage 4): a range bound travels as a
