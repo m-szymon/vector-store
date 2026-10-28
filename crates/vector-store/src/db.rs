@@ -1718,13 +1718,16 @@ pub(crate) mod tests {
         assert_eq!(*uncapped.segment_max_docs.as_ref(), None);
         assert!(!*uncapped.rewrite_wide_segments.as_ref());
 
-        // A long keyword intersects all of its grams unless `rarest_grams` says how many; '0' is
-        // all of them too.
-        assert_eq!(*ordered.rarest_grams.as_ref(), None);
-        let rarest = options(&[("rarest_grams", "4")]);
+        // A long keyword intersects its 4 rarest grams unless `rarest_grams` says how many; '0' is
+        // all of them.
+        assert_eq!(
+            *ordered.rarest_grams.as_ref(),
+            Some(crate::DEFAULT_RAREST_GRAMS)
+        );
+        let rarest = options(&[("rarest_grams", "2")]);
         assert_eq!(
             rarest.rarest_grams.as_ref().map(|grams| grams.get()),
-            Some(4)
+            Some(2)
         );
         let all = options(&[("rarest_grams", "0")]);
         assert_eq!(*all.rarest_grams.as_ref(), None);

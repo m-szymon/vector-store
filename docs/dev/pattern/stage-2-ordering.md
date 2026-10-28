@@ -900,6 +900,9 @@ the control again at the end): at about 5.2M names each the index node (c8g.xlar
 thrash -- CPU down from ~88% to ~22%, 12 GB read from its disk in five minutes, no answers -- and the
 run was aborted. Three indexes at 10M is what that node carries.
 
+`rarest_grams` 4 is the default since this run: it lost no phase and costs no index size. `'0'`
+still intersects all grams. Whether `max_gram` 4 should be the default stays open.
+
 Raw results: `~/sct-results/20261028-125049-031151/` on the laptop that drove the run.
 
 ## Open questions and risks

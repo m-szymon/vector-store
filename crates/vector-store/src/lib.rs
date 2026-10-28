@@ -748,15 +748,24 @@ impl FromStr for SegmentMaxDocs {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
 /// How many of a keyword's grams a pattern index intersects for a keyword past `max_gram`, the
 /// ones with the fewest documents in each segment first, or none for all of them: the
-/// `rarest_grams` option, `'0'` for all. The verification drops whatever the grams left out would
-/// have, so fewer grams open fewer posting lists and read more candidates from the store; a
-/// keyword with no more grams than this is intersected whole.
+/// `rarest_grams` option, `'0'` for all, [`DEFAULT_RAREST_GRAMS`] when absent. The verification
+/// drops whatever the grams left out would have, so fewer grams open fewer posting lists and read
+/// more candidates from the store; a keyword with no more grams than this is intersected whole.
 pub struct RarestGrams(Option<NonZeroUsize>);
+
+/// The `rarest_grams` of a pattern index that does not set it: at 10M rows on AWS (run a7be7f76,
+/// `docs/dev/pattern/stage-2-ordering.md`) 4 grams took 8, 16 and 32 characters up 22-94% against
+/// all of them, with no phase slower and the index the same size.
+pub const DEFAULT_RAREST_GRAMS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
+impl Default for RarestGrams {
+    fn default() -> Self {
+        Self(Some(DEFAULT_RAREST_GRAMS))
+    }
+}
 
 impl FromStr for RarestGrams {
     type Err = anyhow::Error;
