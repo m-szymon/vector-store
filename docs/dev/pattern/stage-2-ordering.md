@@ -854,6 +854,54 @@ against 194 us, at a higher rate), all inside the noise of a run.
 
 Raw results: `~/sct-results/20261027-192653-792986/` on the laptop that drove the run.
 
+### Rarest grams and max_gram 4 (AWS, 2026-10-28, run `a7be7f76`)
+
+Plan `aws_rarest_config.yaml`: vector-store `dbbb491`, scylladb `6a0b52f4bf`, the pinned images,
+three indexes built while the table loaded. `control` is the port's default; `rarest` intersects only
+the 4 grams of a long keyword with the fewest documents in each segment (`rarest_grams: '4'`);
+`gram4_rarest` does that over `max_gram: '4'`. All three caught up 788-804 s after the load and
+settled at 51 segments. `control` and `rarest` are 56.3 bytes a name, `gram4_rarest` 74.8 (+33%).
+
+Capacity (unthrottled, 64 in flight), queries per second, with the index node's walk in us and the
+segments opened per query:
+
+| keyword | control | rarest | gram4_rarest |
+|---|---|---|---|
+| 1 char | 9,533 (295, 2) | 9,529 (286, 2) | 9,351 (301, 2) |
+| 2 chars | 9,509 (201, 2) | 9,448 (194, 2) | 9,264 (205, 2) |
+| 2 chars, window 0.5 | 9,407 (322, 2) | 9,304 (321, 2) | 9,123 (321, 2) |
+| 4 chars | 9,268 (194, 2) | 9,315 (190, 2) | 9,173 (66, 2) |
+| 8 chars | 10,555 (316, 38) | 12,882 (255, 38) +22% | 19,620 (164, 24) +86% |
+| 8 chars, window 0.5 | 21,308 (150, 19) | 23,959 (131, 19) +12% | 30,570 (94, 12) +43% |
+| 16 chars | 6,891 (516, 28) | 12,202 (268, 28) +77% | 25,406 (120, 8) +269% |
+| 32 chars | 7,794 (445, 10) | 15,148 (210, 10) +94% | 34,810 (74, 1) +347% |
+| no match | 59,459 (31) | 61,209 (32) | 60,253 (31) |
+
+At a fixed rate below capacity, p99 at 16 characters went from 3.0 ms (control) to 2.1 ms on both,
+and at 32 from 4.1 to 2.5 and 2.1 ms.
+
+- **Both are far outside the noise.** The control is where the three earlier controls are (16
+  characters 6.9k against 6.8-8.5k), and the gains at 8-32 characters are 22% to 4.5x.
+- **Rarest grams halve the walk at 16 and 32 characters** (516 to 268 us, 445 to 210), with the same
+  segments opened: the cost was opening and walking the common grams' postings. It helps 8
+  characters too (+22%), more than the 2M-name bench suggested.
+- **max_gram 4 cuts the segments opened** (8 characters 38 to 24, 16 characters 28 to 8, 32
+  characters 10 to 1): a 4-gram is rare enough that few segments hold all of a keyword's without
+  holding it. A 4-character keyword becomes one exact lookup (walk 194 to 66 us), which does not move
+  its capacity, since ScyllaDB's row reads are the limit there.
+- **Every shape now meets 10k except 1 to 4 characters**, which stay at 9.2-9.5k, bounded by
+  ScyllaDB reading 20 rows a query on one node (a dev-mode build in every AWS run so far). The index
+  node is no longer the limit anywhere.
+- The cost is the index, a third larger, and ingestion: not separable here, as the three indexes
+  ingested together (the same 788-804 s each).
+
+Six indexes were tried first (run `4c4b7647`, adding `max_gram` 4 alone, 5 with rarest grams, and
+the control again at the end): at about 5.2M names each the index node (c8g.xlarge, 8 GB) began to
+thrash -- CPU down from ~88% to ~22%, 12 GB read from its disk in five minutes, no answers -- and the
+run was aborted. Three indexes at 10M is what that node carries.
+
+Raw results: `~/sct-results/20261028-125049-031151/` on the laptop that drove the run.
+
 ## Open questions and risks
 
 - ~~**The sort-key encoding is written twice**~~ Closed (stage 4): a range bound travels as a
