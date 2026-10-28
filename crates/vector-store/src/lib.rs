@@ -748,6 +748,28 @@ impl FromStr for SegmentMaxDocs {
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// How many of a keyword's grams a pattern index intersects for a keyword past `max_gram`, the
+/// ones with the fewest documents in each segment first, or none for all of them: the
+/// `rarest_grams` option, `'0'` for all. The verification drops whatever the grams left out would
+/// have, so fewer grams open fewer posting lists and read more candidates from the store; a
+/// keyword with no more grams than this is intersected whole.
+pub struct RarestGrams(Option<NonZeroUsize>);
+
+impl FromStr for RarestGrams {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let grams: usize = s
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("rarest_grams must be a non-negative integer: {e}"))?;
+        Ok(Self(NonZeroUsize::new(grams)))
+    }
+}
+
 /// The segment cap of an ordered pattern index that does not set `segment_rows`: the flattest of
 /// the caps measured at 10M rows on 2026-09-30 (`docs/dev/pattern/stage-2-ordering.md`).
 pub const DEFAULT_SEGMENT_ROWS: NonZeroU32 = NonZeroU32::new(200_000).unwrap();
@@ -882,6 +904,9 @@ pub struct IndexOptionsPattern {
     /// (P3b: an index built by a full scan, or a shuffled load) into range-aligned ones of
     /// `segment_max_docs` rows. Needs the cap. The `rewrite` option.
     pub rewrite_wide_segments: RewriteWideSegments,
+    /// How many of a long keyword's rarest grams are intersected; none for all. The
+    /// `rarest_grams` option.
+    pub rarest_grams: RarestGrams,
 }
 
 impl IndexOptionsPattern {
@@ -1416,6 +1441,7 @@ mod tests {
             order_by: OrderBy::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
+            rarest_grams: RarestGrams::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsPattern::default());
 
@@ -1428,6 +1454,7 @@ mod tests {
             order_by: "registered_at".parse().unwrap(),
             segment_max_docs: "250000".parse().unwrap(),
             rewrite_wide_segments: RewriteWideSegments::from(true),
+            rarest_grams: RarestGrams::default(),
         };
         assert_eq!(
             inverted_ordered.validated(),
@@ -1446,6 +1473,7 @@ mod tests {
             order_by: OrderBy::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
+            rarest_grams: RarestGrams::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
         assert_eq!(

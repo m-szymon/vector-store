@@ -33,6 +33,7 @@ use crate::NonemptyIteratorExt;
 use crate::OrderBy;
 use crate::Positions;
 use crate::Quantization;
+use crate::RarestGrams;
 use crate::RewriteWideSegments;
 use crate::SegmentMaxDocs;
 use crate::SpaceType;
@@ -627,6 +628,7 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
     } else {
         RewriteWideSegments::from(segment_max_docs.as_ref().is_some())
     };
+    let rarest_grams: RarestGrams = parse_index_option(options, "rarest_grams");
     IndexOptionsPattern {
         min_gram,
         max_gram,
@@ -634,6 +636,7 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
         order_by,
         segment_max_docs,
         rewrite_wide_segments,
+        rarest_grams,
     }
     .validated()
 }
@@ -1714,6 +1717,17 @@ pub(crate) mod tests {
         let uncapped = options(&[("order_by", "register_time"), ("segment_rows", "0")]);
         assert_eq!(*uncapped.segment_max_docs.as_ref(), None);
         assert!(!*uncapped.rewrite_wide_segments.as_ref());
+
+        // A long keyword intersects all of its grams unless `rarest_grams` says how many; '0' is
+        // all of them too.
+        assert_eq!(*ordered.rarest_grams.as_ref(), None);
+        let rarest = options(&[("rarest_grams", "4")]);
+        assert_eq!(
+            rarest.rarest_grams.as_ref().map(|grams| grams.get()),
+            Some(4)
+        );
+        let all = options(&[("rarest_grams", "0")]);
+        assert_eq!(*all.rarest_grams.as_ref(), None);
     }
 
     #[test]

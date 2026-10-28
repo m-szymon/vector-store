@@ -687,6 +687,10 @@ impl PatternBackend {
         self.options.max_gram.as_ref().get()
     }
 
+    fn rarest_grams(&self) -> Option<usize> {
+        self.options.rarest_grams.as_ref().map(|grams| grams.get())
+    }
+
     /// Whether this index was given a column to order by. Without one it answers in whatever order
     /// the walk finds matches, and carries no sort field at all.
     fn orders_results(&self) -> bool {
@@ -1128,19 +1132,27 @@ enum PatternQuery {
 /// and open a field-norm reader an unscored walk never reads. Measured on the 10M-name corpus
 /// (`benches/pattern_probe.rs`), that second pass was a third of the walk for 8 to 32
 /// characters.
+///
+/// With `rarest`, only that many of the grams found, those with the fewest documents in the
+/// segment, are intersected: the verification drops what the others would have. A long keyword's
+/// grams are mostly common ones, and each costs a posting list opened and walked; a few rare ones
+/// narrow the candidates nearly as far (`benches/pattern_probe.rs`: at 16 characters, 4 of the
+/// keyword's 14 grams took the walk to a quarter, with the same matches).
 struct GramProbe {
     terms: Vec<Term>,
     field: tantivy::schema::Field,
     found: Vec<TermInfo>,
+    rarest: Option<usize>,
 }
 
 impl GramProbe {
-    fn new(terms: Vec<Term>, field: tantivy::schema::Field) -> Self {
+    fn new(terms: Vec<Term>, field: tantivy::schema::Field, rarest: Option<usize>) -> Self {
         let found = Vec::with_capacity(terms.len());
         Self {
             terms,
             field,
             found,
+            rarest,
         }
     }
 
@@ -1159,6 +1171,12 @@ impl GramProbe {
                 return Ok(None);
             };
             self.found.push(info);
+        }
+        if let Some(rarest) = self.rarest
+            && rarest < self.found.len()
+        {
+            self.found.sort_unstable_by_key(|info| info.doc_freq);
+            self.found.truncate(rarest);
         }
         let postings = self
             .found
@@ -1198,7 +1216,8 @@ impl QueryPostings {
                 (Self::Term(weight), false)
             }
             PatternQuery::Candidates(terms) => {
-                (Self::Grams(GramProbe::new(terms, text_field)), true)
+                let rarest = state.backend().rarest_grams();
+                (Self::Grams(GramProbe::new(terms, text_field, rarest)), true)
             }
         })
     }
@@ -1920,6 +1939,7 @@ mod tests {
     use crate::MinGram;
     use crate::OrderBy;
     use crate::PrimaryKey;
+    use crate::RarestGrams;
     use crate::RewriteWideSegments;
     use crate::SegmentMaxDocs;
     use crate::memory::Allocate;
@@ -1997,6 +2017,7 @@ mod tests {
             order_by: OrderBy::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
+            rarest_grams: RarestGrams::default(),
         }
     }
 
@@ -2279,6 +2300,50 @@ mod tests {
         add_docs(&sender, &[(1, decoy), (2, query)]).await;
 
         assert_eq!(search(&sender, query).await, vec![2]);
+    }
+
+    /// Intersecting only the rarest grams lets more candidates through, and the verification drops
+    /// them again: the matches are those of the whole intersection, ordered or not.
+    #[rstest]
+    #[case::one_unordered(1, false)]
+    #[case::two_unordered(2, false)]
+    #[case::one_ordered(1, true)]
+    #[case::two_ordered(2, true)]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn rarest_grams_return_the_matches_of_all_grams(
+        #[case] rarest: usize,
+        #[case] ordered: bool,
+    ) {
+        let sender = make_sender_with_options(IndexOptionsPattern {
+            rarest_grams: rarest.to_string().parse().unwrap(),
+            order_by: if ordered {
+                "sort_col".parse().unwrap()
+            } else {
+                OrderBy::default()
+            },
+            ..options(1, 3, true)
+        });
+        // Every decoy holds some of the grams of "abcde", the first one all of them.
+        let docs = [
+            (1, "abcd cde"),
+            (2, "abcde"),
+            (3, "xbcdex"),
+            (4, "zzabcdezz"),
+            (5, "cdeab"),
+            (6, "abc bcd"),
+        ];
+        add_docs(&sender, &docs).await;
+
+        let mut ids = if ordered {
+            search_ordered(&sender, "abcde", 10, SearchWindow::default())
+                .await
+                .0
+        } else {
+            search(&sender, "abcde").await
+        };
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 4]);
     }
 
     #[rstest]
