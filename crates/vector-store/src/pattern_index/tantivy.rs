@@ -917,7 +917,12 @@ impl PatternBackend {
     /// while a build is still committing samples the rows so far and cuts too few, too wide
     /// ranges, whose segments end up spanning several caps and never get revisited.
     fn maybe_plan_rewrite(&self, state: &PatternIndexState) {
-        if !*self.options.rewrite_wide_segments.as_ref() || self.plan.lock().unwrap().is_some() {
+        // An unordered index has no sort order to rewrite into, nor the columns to read one from,
+        // though a segment cap turns the rewrite option on for it as for any other.
+        if !self.orders_results()
+            || !*self.options.rewrite_wide_segments.as_ref()
+            || self.plan.lock().unwrap().is_some()
+        {
             return;
         }
         let Some(cap) = *self.options.segment_max_docs.as_ref() else {
@@ -4384,6 +4389,46 @@ mod tests {
         let (ids, _) = search_ordered(&sender, "将军", 10, ascending()).await;
         assert_eq!(ids, vec![4, 5]);
         assert_eq!(sender.count(make_index_key()).await.unwrap(), 2);
+    }
+
+    /// An unordered index with a segment cap, which turns the rewrite option on, never plans a
+    /// rewrite: it has no order to rewrite into, nor the sort columns a plan reads.
+    #[rstest]
+    #[timeout(Duration::from_secs(30))]
+    #[tokio::test]
+    async fn an_unordered_index_plans_no_rewrite() {
+        let cap = 20u32;
+        let sender = make_sender_for(
+            IndexOptionsPattern {
+                order_by: "unordered".parse().unwrap(),
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: "true".parse().unwrap(),
+                ..IndexOptionsPattern::default()
+            },
+            make_table(bigint_key, |_, _| None),
+            test_layout(),
+        );
+        let mut acks = Vec::new();
+        for id in 1..=200u64 {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    id.into(),
+                    format!("user{id}"),
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let stats = sender.stats(make_index_key()).await.unwrap();
+        assert_eq!(stats.tantivy.num_docs, 200);
+        assert_eq!(stats.rewrite.ranges_total, 0, "{:?}", stats.rewrite);
     }
 
     /// Whether a segment of a few-values index is narrow: one value, or the end of one and the
