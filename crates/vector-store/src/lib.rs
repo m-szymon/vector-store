@@ -65,6 +65,7 @@ pub use crate::nonempty::NonemptyArc;
 pub use crate::nonempty::NonemptyBox;
 pub use crate::nonempty::NonemptyIteratorExt;
 pub use crate::partition_key::PartitionKey;
+pub use crate::pattern_index::KeyLayout;
 pub use crate::primary_key::PrimaryKey;
 pub use crate::similarity::SimilarityScore;
 pub use crate::table::PartitionId;
@@ -684,23 +685,134 @@ impl FromStr for CaseSensitive {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
-/// The column a pattern index orders its results by, if it was given one.
+/// The most columns a pattern index may order by.
+pub const MAX_ORDER_COLUMNS: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// One column of a pattern index's declared order.
+pub struct OrderColumn {
+    pub name: ColumnName,
+    /// Declared `DESC`: the index keeps the column's highest values first.
+    pub descending: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// What a pattern index answers in: the `order_by` option.
 ///
-/// Unset means the index answers in unspecified order, which is what lets a search stop at the
-/// limit instead of examining every match. An index with a sort column pays for the ordering, so
-/// this is opt-in rather than always on.
-pub struct OrderBy(Option<ColumnName>);
+/// - Absent: table order, the order a scan of the table returns, which is what a filtered `LIKE`
+///   returns. Paged.
+/// - `'unordered'`: any matches, in no particular order and unpaged, for tables that need neither
+///   and would rather not pay for keeping an order under writes.
+/// - `'a DESC, b'`: by those columns, each in its declared direction, then in table order; it
+///   serves only queries that `ORDER BY` a prefix of them, declared or reversed.
+///
+/// A value that does not parse is kept as `Invalid` rather than replaced by a default, so that
+/// the index is refused: an ordered index that silently became a table-order one would answer
+/// `ORDER BY` queries in a plausible, wrong order.
+pub enum OrderBy {
+    #[default]
+    Table,
+    Unordered,
+    Columns(Arc<[OrderColumn]>),
+    Invalid(Arc<str>),
+}
+
+impl OrderBy {
+    /// The declared ordering columns; none for table order or no order.
+    pub fn columns(&self) -> &[OrderColumn] {
+        match self {
+            OrderBy::Columns(columns) => columns,
+            OrderBy::Table | OrderBy::Unordered | OrderBy::Invalid(_) => &[],
+        }
+    }
+
+    /// Whether the index keeps an order at all, table order included.
+    pub fn is_ordered(&self) -> bool {
+        matches!(self, OrderBy::Table | OrderBy::Columns(_))
+    }
+}
 
 impl FromStr for OrderBy {
     type Err = anyhow::Error;
 
+    /// A comma-separated list of columns, each optionally followed by `ASC` or `DESC`, or the
+    /// keyword `unordered`. Column names follow CQL's rules: unquoted ones are case-insensitive
+    /// (lowercased), double-quoted ones are taken as written, with `""` for a quote. The keyword is
+    /// unquoted only, so a column named `unordered` is written `"unordered"`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let name = s.trim();
-        if name.is_empty() {
-            return Err(anyhow::anyhow!("order_by must name a column"));
+        let items = split_order_items(s)?;
+        if let [(name, false, None)] = items.as_slice()
+            && name.eq_ignore_ascii_case("unordered")
+        {
+            return Ok(OrderBy::Unordered);
         }
-        Ok(Self(Some(ColumnName::from(name))))
+        anyhow::ensure!(
+            items.len() <= MAX_ORDER_COLUMNS,
+            "order_by names {} columns, at most {MAX_ORDER_COLUMNS} are supported",
+            items.len()
+        );
+        let mut columns: Vec<OrderColumn> = Vec::with_capacity(items.len());
+        for (name, quoted, direction) in items {
+            let name = if quoted { name } else { name.to_lowercase() };
+            let name = ColumnName::from(name);
+            anyhow::ensure!(
+                columns.iter().all(|column| column.name != name),
+                "order_by names column {name} twice"
+            );
+            columns.push(OrderColumn {
+                name,
+                descending: direction == Some(true),
+            });
+        }
+        Ok(OrderBy::Columns(columns.into()))
+    }
+}
+
+/// The items of an `order_by` value: each a name, whether it was quoted, and its direction
+/// (`Some(true)` for `DESC`) if it had one.
+fn split_order_items(s: &str) -> anyhow::Result<Vec<(String, bool, Option<bool>)>> {
+    let mut items = Vec::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let (name, quoted) = if chars.next_if_eq(&'"').is_some() {
+            let mut name = String::new();
+            loop {
+                match chars.next() {
+                    Some('"') if chars.next_if_eq(&'"').is_some() => name.push('"'),
+                    Some('"') => break,
+                    Some(c) => name.push(c),
+                    None => anyhow::bail!("order_by has an unterminated quoted name: {s}"),
+                }
+            }
+            anyhow::ensure!(!name.is_empty(), "order_by has an empty column name: {s}");
+            (name, true)
+        } else {
+            let mut name = String::new();
+            while let Some(c) = chars.next_if(|c| c.is_alphanumeric() || *c == '_') {
+                name.push(c);
+            }
+            anyhow::ensure!(!name.is_empty(), "order_by must name a column: {s}");
+            (name, false)
+        };
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut word = String::new();
+        while let Some(c) = chars.next_if(|c| c.is_ascii_alphabetic()) {
+            word.push(c);
+        }
+        let direction = match word.to_ascii_lowercase().as_str() {
+            "" => None,
+            "asc" => Some(false),
+            "desc" => Some(true),
+            _ => anyhow::bail!("order_by: expected ASC, DESC or a comma after {name}, got {word}"),
+        };
+        items.push((name, quoted, direction));
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        match chars.next() {
+            None => return Ok(items),
+            Some(',') => {}
+            Some(c) => anyhow::bail!("order_by: unexpected {c:?} in {s}"),
+        }
     }
 }
 
@@ -899,12 +1011,12 @@ pub struct IndexOptionsFts {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 /// Pattern-search-specific index configuration.
 ///
-/// Not `Copy`: `order_by` holds a column name. Clone it rather than reaching for a `*`.
+/// Not `Copy`: `order_by` holds column names. Clone it rather than reaching for a `*`.
 pub struct IndexOptionsPattern {
     pub min_gram: MinGram,
     pub max_gram: MaxGram,
     pub case_sensitive: CaseSensitive,
-    /// The column results are ordered by, or none for unspecified order.
+    /// What the index answers in: table order, no order, or the declared columns.
     pub order_by: OrderBy,
     /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
     /// default policy. The `segment_rows` option.
@@ -1068,20 +1180,23 @@ impl IndexMetadata {
     }
 
     /// Every column whose value has to be fetched and kept alongside the indexed one: the filtering
-    /// columns, plus a pattern index's sort column.
+    /// columns, plus a pattern index's ordering columns.
     ///
     /// Three places have to agree on this set -- the full-scan SELECT, the CDC re-SELECT and the
     /// table's column slots -- and a disagreement shows up as a row count mismatch far from the
     /// cause, so they all go through here rather than each assembling their own list.
     pub(crate) fn ingested_value_columns(&self) -> impl Iterator<Item = &ColumnName> {
-        let sort_column = self
+        let order_columns = self
             .kind
             .as_pattern()
-            .and_then(|options| options.order_by.as_ref().as_ref())
-            .filter(|col| {
+            .map(|options| options.order_by.columns())
+            .unwrap_or_default()
+            .iter()
+            .map(|column| &column.name)
+            .filter(move |col| {
                 !self.primary_key_columns.contains(col) && !self.filtering_columns.contains(col)
             });
-        self.nonpk_filtering_columns().chain(sort_column)
+        self.nonpk_filtering_columns().chain(order_columns)
     }
 }
 
@@ -1577,18 +1692,66 @@ mod tests {
     }
 
     #[test]
-    fn order_by_names_a_column_or_nothing() {
+    fn order_by_parses_columns_directions_and_the_unordered_keyword() {
+        let columns = |order_by: OrderBy| -> Vec<(String, bool)> {
+            order_by
+                .columns()
+                .iter()
+                .map(|column| (column.name.as_ref().to_string(), column.descending))
+                .collect()
+        };
         assert_eq!(
-            *"registered_at".parse::<OrderBy>().unwrap().as_ref(),
-            Some("registered_at".into())
+            columns("registered_at".parse().unwrap()),
+            vec![("registered_at".to_string(), false)]
         );
-        // Trimmed, because CQL options come through as free text.
+        // Trimmed, because CQL options come through as free text; directions in any case.
         assert_eq!(
-            *"  registered_at  ".parse::<OrderBy>().unwrap().as_ref(),
-            Some("registered_at".into())
+            columns("  published_at desc ,score ASC  ".parse().unwrap()),
+            vec![
+                ("published_at".to_string(), true),
+                ("score".to_string(), false)
+            ]
         );
-        assert!("".parse::<OrderBy>().is_err());
-        assert!("   ".parse::<OrderBy>().is_err());
-        assert_eq!(*OrderBy::default().as_ref(), None);
+        // Unquoted names are case-insensitive as in CQL; quoted ones are kept, with "" for a quote.
+        assert_eq!(
+            columns(r#"Score, "MixedCase" DESC, "a""b""#.parse().unwrap()),
+            vec![
+                ("score".to_string(), false),
+                ("MixedCase".to_string(), true),
+                ("a\"b".to_string(), false)
+            ]
+        );
+        assert_eq!("unordered".parse::<OrderBy>().unwrap(), OrderBy::Unordered);
+        assert_eq!(
+            " UNORDERED ".parse::<OrderBy>().unwrap(),
+            OrderBy::Unordered
+        );
+        // Quoted, or with a direction, it is a column.
+        assert_eq!(
+            columns(r#""unordered""#.parse().unwrap()),
+            vec![("unordered".to_string(), false)]
+        );
+        assert_eq!(
+            columns("unordered DESC".parse().unwrap()),
+            vec![("unordered".to_string(), true)]
+        );
+        assert_eq!(OrderBy::default(), OrderBy::Table);
+        assert!(OrderBy::Table.is_ordered() && !OrderBy::Unordered.is_ordered());
+
+        for bad in [
+            "",
+            "   ",
+            "a,",
+            ",a",
+            "a b",
+            "a DESC DESC",
+            "a, a",
+            "a; b",
+            r#""unterminated"#,
+            r#""""#,
+            "a, b, c, d, e",
+        ] {
+            assert!(bad.parse::<OrderBy>().is_err(), "{bad:?} parsed");
+        }
     }
 }

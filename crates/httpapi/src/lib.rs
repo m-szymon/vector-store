@@ -526,7 +526,7 @@ pub struct PostIndexBm25Response {
     utoipa::ToSchema,
 )]
 #[serde(rename_all = "lowercase")]
-/// The direction of an ordered pattern search along its sort column.
+/// The direction of an ordered pattern search along its first ordering column.
 pub enum SortOrder {
     /// Highest sort key first; for a timestamp, newest first.
     #[default]
@@ -561,19 +561,19 @@ pub struct PostIndexLikeRequest {
     /// The maximum number of primary keys to return.
     #[serde(default)]
     pub limit: Limit,
-    /// The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.
+    /// The number of matching rows to skip before collecting `limit` of them, for an index created with `'order_by': 'unordered'`: its rows come in no particular order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by every other index, which pages by `cursor` instead.
     #[serde(default)]
     pub offset: usize,
-    /// Resume an ordered search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's sort key and primary key). Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    /// Resume a search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's place in the index's order and its primary key). Ignored by an unordered index.
     #[serde(default)]
     pub cursor: Option<String>,
-    /// The direction along the sort column; descending when absent. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    /// The direction along the index's first ordering column: the declared order when it matches the column's declared direction, its exact reverse otherwise. The declared order when absent; for an index in table order, that is ascending. Ignored by an unordered index.
     #[serde(default)]
     pub order: Option<SortOrder>,
-    /// Restrict the search to rows whose sort value is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    /// Restrict the search to rows whose first ordering column is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with `order_by` columns; ignored otherwise.
     #[serde(default)]
     pub min_sort_value: Option<SortBound>,
-    /// Restrict the search to rows whose sort value is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with an `order_by` column; ignored otherwise.
+    /// Restrict the search to rows whose first ordering column is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with `order_by` columns; ignored otherwise.
     #[serde(default)]
     pub max_sort_value: Option<SortBound>,
     /// Whether the index checks each candidate for a keyword longer than `max_gram` against the stored value before returning it. `true` (the default) returns only rows that match. `false` returns the rows whose value holds every gram of the keyword, which is a superset of the matches, and the response says so in `verified`; a caller that reads the rows anyway can apply the pattern itself and spare the index its document-store reads. A keyword within `max_gram` is exact either way.
@@ -584,9 +584,9 @@ pub struct PostIndexLikeRequest {
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Response for LIKE search.
 pub struct PostIndexLikeResponse {
-    /// Primary keys of the matching rows, one array of values per primary key column. Ordered by the index's sort column when it has one.
+    /// Primary keys of the matching rows, one array of values per primary key column, in the index's order: its `order_by` columns, then table order; table order alone without `order_by`; no particular order for an unordered index.
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
-    /// Pass as the next request's `cursor`, unchanged, to read the following page. Absent when the index has no sort column, or when this page exhausted the matches.
+    /// Pass as the next request's `cursor`, unchanged, to read the following page. Absent for an unordered index, or when this page exhausted the matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     /// Whether every returned row is known to match. `false` only when the request asked for `verify: false` and the keyword was longer than `max_gram`: the rows are then candidates holding every gram, and the caller has to apply the pattern to the value.

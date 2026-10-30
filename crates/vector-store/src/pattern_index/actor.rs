@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+use super::order::SortPrefix;
 use super::tantivy::PatternStatsR;
 use crate::AsyncInProgress;
 use crate::IndexKey;
@@ -26,31 +27,31 @@ pub(crate) enum MatchKind {
     Suffix,
 }
 
-/// Which way an ordered search walks the sort column.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The direction an ordered search asks for, on the index's first ordering column. The node turns
+/// it into "the declared order" or "its reverse"; a search that names none gets the declared order,
+/// which for an index in table order is ascending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SortOrder {
-    /// Highest sort key first: newest first for a timestamp.
-    #[default]
     Desc,
     Asc,
 }
 
-/// Where a page ended: the sort key of its last row and that row's primary key, so that the next
-/// page resumes among the rows sharing that sort key instead of skipping them. The primary key is
-/// what makes the cursor survive a rebuild of the index, whose internal ids are not stable; it is
-/// `None` when the row was gone by the time the page was assembled, and a resume from such a
-/// cursor takes every row sharing the sort key again rather than risk skipping one.
+/// Where a page ended: the sort prefix of its last row and that row's primary key, so that the
+/// next page resumes among the rows sharing that prefix instead of skipping them. The primary key
+/// is `None` when the row was gone by the time the page was assembled; a resume from such a cursor
+/// takes every row sharing the prefix again rather than risk skipping one.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Cursor {
-    pub(crate) sort_key: u64,
+    pub(crate) prefix: SortPrefix,
     pub(crate) primary_key: Option<PrimaryKey>,
 }
 
 /// What an ordered search may return: a direction, the cursor of the previous page, and a range
-/// on the sort column. Ignored by an unordered index.
+/// on the first ordering column, as sort keys of that column's values. Ignored by an unordered
+/// index.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SearchWindow {
-    pub(crate) order: SortOrder,
+    pub(crate) order: Option<SortOrder>,
     pub(crate) cursor: Option<Cursor>,
     pub(crate) min_sort_key: Option<u64>,
     pub(crate) max_sort_key: Option<u64>,

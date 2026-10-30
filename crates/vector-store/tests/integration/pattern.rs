@@ -29,6 +29,7 @@ use vector_store::IndexKind;
 use vector_store::IndexMetadata;
 use vector_store::IndexOptionsPattern;
 use vector_store::NonemptyArc;
+use vector_store::OrderBy;
 use vector_store::Percentage;
 use vector_store::Timestamp;
 use vector_store::node_state::NodeState;
@@ -272,8 +273,12 @@ async fn pattern_contains_returns_empty_for_no_match() {
 async fn pattern_contains_respects_limit_and_offset() {
     crate::enable_tracing();
 
-    let (client, ks, idx, _db, _hold) =
-        setup_and_wait(IndexOptionsPattern::default(), NICKNAMES).await;
+    // Offset paging is what an unordered index offers; the others page by cursor.
+    let options = IndexOptionsPattern {
+        order_by: OrderBy::Unordered,
+        ..Default::default()
+    };
+    let (client, ks, idx, _db, _hold) = setup_and_wait(options, NICKNAMES).await;
 
     let first = contains(&client, &ks, &idx, "宫", 2, 0).await;
     let rest = contains(&client, &ks, &idx, "宫", 2, 2).await;

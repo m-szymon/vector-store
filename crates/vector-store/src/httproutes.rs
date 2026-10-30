@@ -270,11 +270,21 @@ impl From<&IndexOptionsFts> for FulltextIndexOptions {
 impl From<&IndexOptionsPattern> for PatternIndexOptions {
     fn from(options: &IndexOptionsPattern) -> Self {
         PatternIndexOptions {
-            order_by: options
-                .order_by
-                .as_ref()
-                .as_ref()
-                .map(|column| column.as_ref().to_string()),
+            order_by: match &options.order_by {
+                crate::OrderBy::Table => None,
+                crate::OrderBy::Unordered => Some("unordered".to_string()),
+                crate::OrderBy::Invalid(value) => Some(value.to_string()),
+                crate::OrderBy::Columns(columns) => Some(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let direction = if column.descending { "DESC" } else { "ASC" };
+                            format!("{} {direction}", column.name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            },
             min_gram: options.min_gram.as_ref().get(),
             max_gram: options.max_gram.as_ref().get(),
             case_sensitive: *options.case_sensitive.as_ref(),
@@ -1257,7 +1267,7 @@ async fn post_index_bm25(
 Returns the primary keys of the rows whose indexed value matches the `LIKE` pattern in the payload, read with ScyllaDB's `LIKE` rules: `%` matches any run of characters, `_` exactly one, `\\\\` makes the next character literal, and the whole value has to match. \
 The index serves `'%keyword%'`, `'keyword%'` and `'%keyword'`; any other pattern, or a keyword shorter than the index's `min_gram`, is answered with 400 and the reason. \
 Matching is exact, with no ranking or scoring, and case-sensitive unless the index was created with `case_sensitive` set to false. \
-An index created with `order_by` returns the rows ordered by that column and pages with `cursor`; any other index returns them in index order, and 'offset' pages through them, which is only stable between writes. \
+An index returns the rows in its order and pages with `cursor`: one created without `order_by` in table order (by token, then partition key, then clustering key), one with `order_by` columns by those columns and then table order, where `order` names the direction of the first column and the walk is that order or its exact reverse. An index created with `'order_by': 'unordered'` returns matches in no particular order, and 'offset' pages through them, which is only stable between writes. \
 If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
     params(
         ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
@@ -1334,7 +1344,13 @@ async fn post_index_like(
                 entry.index().clone(),
                 entry.primary_key_columns().clone(),
                 Arc::clone(entry.table_columns()),
-                entry.options().order_by.as_ref().clone(),
+                // A range restricts the first ordering column.
+                entry
+                    .options()
+                    .order_by
+                    .columns()
+                    .first()
+                    .map(|column| column.name.clone()),
             ))
         } else {
             Err(entry.progress())
@@ -1402,10 +1418,10 @@ async fn post_index_like(
             request.limit.into(),
             request.offset,
             SearchWindow {
-                order: match request.order.unwrap_or_default() {
+                order: request.order.map(|order| match order {
                     httpapi::SortOrder::Desc => SortOrder::Desc,
                     httpapi::SortOrder::Asc => SortOrder::Asc,
-                },
+                }),
                 cursor,
                 min_sort_key,
                 max_sort_key,
@@ -1508,7 +1524,8 @@ fn sort_bound_keys(
 /// but never meant to be built by hand.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CursorJson {
-    sort_key: u64,
+    /// The last row's sort prefix: its ordering columns' sort keys, then its token.
+    prefix: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     primary_key: Option<HashMap<httpapi::ColumnName, Value>>,
 }
@@ -1534,7 +1551,7 @@ fn encode_cursor(
         })
         .transpose()?;
     Ok(serde_json::to_string(&CursorJson {
-        sort_key: cursor.sort_key,
+        prefix: cursor.prefix.0.to_vec(),
         primary_key,
     })?)
 }
@@ -1565,8 +1582,16 @@ fn decode_cursor(
                 .map(crate::PrimaryKey::from)
         })
         .transpose()?;
+    let prefix =
+        crate::pattern_index::SortPrefix(json.prefix.try_into().map_err(|prefix: Vec<u64>| {
+            anyhow::anyhow!(
+                "the cursor's prefix has {} slots, not {}",
+                prefix.len(),
+                crate::pattern_index::PREFIX_SLOTS
+            )
+        })?);
     Ok(Cursor {
-        sort_key: json.sort_key,
+        prefix,
         primary_key,
     })
 }

@@ -21,6 +21,7 @@ use futures::future::RemoteHandle;
 use scylla_cdc::checkpoints::CDCCheckpointSaver;
 use scylla_cdc::consumer::ConsumerFactory;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,6 +188,19 @@ pub trait DbDriver: Clone + Send + Sync + 'static {
     fn partition_key(&self, table: &Self::Table) -> impl Iterator<Item = ColumnName>;
 
     fn clustering_key(&self, table: &Self::Table) -> impl Iterator<Item = ColumnName>;
+
+    /// Whether the table's tokens are Murmur3 hashes of its partition keys, the only partitioner
+    /// ScyllaDB supports for user tables and the one a pattern index in table order computes.
+    fn uses_murmur3(&self, table: &Self::Table) -> bool;
+
+    /// Each clustering column of the table and whether the schema declares it `DESC`. The
+    /// driver's metadata leaves the clustering order out, so it is read from the schema tables.
+    fn clustering_order(
+        &self,
+        session: &Self::Session,
+        keyspace: &KeyspaceName,
+        table: &TableName,
+    ) -> impl Future<Output = anyhow::Result<HashMap<ColumnName, bool>>> + Send;
 
     fn columns<'a>(&self, table: &'a Self::Table)
     -> impl Iterator<Item = (ColumnName, &'a Column)>;
@@ -443,6 +457,19 @@ pub(crate) mod tests {
 
         fn clustering_key(&self, _: &Self::Table) -> impl Iterator<Item = ColumnName> {
             iter::from_fn(|| unimplemented!())
+        }
+
+        fn uses_murmur3(&self, _: &Self::Table) -> bool {
+            unimplemented!()
+        }
+
+        async fn clustering_order(
+            &self,
+            _: &Self::Session,
+            _: &KeyspaceName,
+            _: &TableName,
+        ) -> anyhow::Result<HashMap<ColumnName, bool>> {
+            unimplemented!()
         }
 
         fn columns<'a>(

@@ -17,6 +17,7 @@ use crate::Metrics;
 use crate::NonRetryable;
 use crate::NonemptyArc;
 use crate::NonemptyBox;
+use crate::OrderBy;
 use crate::Percentage;
 use crate::PrimaryKey;
 use crate::Progress;
@@ -30,6 +31,8 @@ use crate::invariant_key::InvariantKey;
 use crate::node_state::Event;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
+use crate::pattern_index::KeyLayout;
+use crate::pattern_index::is_key_type_supported;
 use crate::perf;
 use crate::timestamp::Timestamped;
 use anyhow::Context;
@@ -68,6 +71,7 @@ use tracing::trace;
 use tracing::warn;
 
 type GetTableColumnsR = Arc<HashMap<ColumnName, NativeType>>;
+type GetKeyLayoutR = KeyLayout;
 type RangeScanResult =
     anyhow::Result<Pin<Box<dyn Stream<Item = DbIndexedRow> + std::marker::Send>>, anyhow::Error>;
 
@@ -95,6 +99,9 @@ pub enum DbIndex {
     GetTableColumns {
         tx: oneshot::Sender<GetTableColumnsR>,
     },
+    GetKeyLayout {
+        tx: oneshot::Sender<GetKeyLayoutR>,
+    },
     FullScanProgress {
         tx: oneshot::Sender<Progress>,
     },
@@ -106,6 +113,7 @@ pub enum DbIndex {
 
 pub(crate) trait DbIndexExt {
     async fn get_table_columns(&self) -> GetTableColumnsR;
+    async fn get_key_layout(&self) -> GetKeyLayoutR;
     async fn full_scan_progress(&self) -> Progress;
     async fn get_vectors(&self, keys: Vec<PrimaryKey>) -> anyhow::Result<Vec<Option<Vector>>>;
 }
@@ -114,6 +122,14 @@ impl DbIndexExt for mpsc::Sender<DbIndex> {
     async fn get_table_columns(&self) -> GetTableColumnsR {
         let (tx, rx) = oneshot::channel();
         self.send(DbIndex::GetTableColumns { tx })
+            .await
+            .expect("internal actor should receive request");
+        rx.await.expect("internal actor should send response")
+    }
+
+    async fn get_key_layout(&self) -> GetKeyLayoutR {
+        let (tx, rx) = oneshot::channel();
+        self.send(DbIndex::GetKeyLayout { tx })
             .await
             .expect("internal actor should receive request");
         rx.await.expect("internal actor should send response")
@@ -375,6 +391,9 @@ async fn process<T: DbDriver>(
         DbIndex::GetTableColumns { tx } => tx
             .send(statements.get_table_columns())
             .unwrap_or_else(|_| trace!("process: Db::GetTableColumns: unable to send response")),
+        DbIndex::GetKeyLayout { tx } => tx
+            .send(statements.key_layout.clone())
+            .unwrap_or_else(|_| trace!("process: Db::GetKeyLayout: unable to send response")),
         DbIndex::FullScanProgress { tx } => {
             let completed_scan_length =
                 completed_scan_length.load(std::sync::atomic::Ordering::Relaxed);
@@ -403,6 +422,7 @@ struct Statements<T: DbDriver> {
     nonpk_partition_key_columns: Box<[ColumnName]>,
     filtering_columns: Arc<[ColumnName]>,
     table_columns: GetTableColumnsR,
+    key_layout: KeyLayout,
     /// Aligned with nonpk_partition_key_columns + filtering_columns: the
     /// NativeType to decode each one's raw ":attrs" value as, or None for a
     /// real CQL column. See parse_values().
@@ -472,7 +492,12 @@ impl<T: DbDriver> Statements<T> {
                 .map(|(name, typ)| (name.clone(), typ.clone())),
             is_alternator,
         ));
-        validate_sort_column(&metadata, &table_columns)?;
+        validate_order(&metadata, &table_columns)?;
+        // Checked against the driver's table now: the query for the clustering order below must
+        // not hold on to it.
+        let needs_clustering_order = check_key_for_order(&db_driver, table, &metadata)?;
+        let key_layout =
+            key_layout(&db_driver, &session, &metadata, needs_clustering_order).await?;
 
         let alternator_decode_types = alternator_decode_types(
             nonpk_partition_key_columns
@@ -491,6 +516,7 @@ impl<T: DbDriver> Statements<T> {
             target_columns,
             filtering_columns,
             table_columns,
+            key_layout,
             alternator_decode_types,
             st_range_scan,
             st_fetch_vector,
@@ -797,41 +823,115 @@ fn range_length(begin: Token, end: Token) -> u64 {
     end.value().abs_diff(begin.value() - 1)
 }
 
-/// Refuses a pattern index whose `order_by` names a column that cannot be ordered.
+/// Refuses a pattern index whose `order_by` did not parse or names a column that cannot be
+/// ordered.
 ///
 /// Checked here rather than where the option is parsed, because `get_pattern_index_params` sees
 /// only names and an options map, while by this point the table's columns are resolved.
 ///
 /// Refusing is deliberate. An unparsable scalar option falls back to its default, which is harmless
-/// -- a different gram size still answers correctly. A sort column that is quietly dropped would
-/// leave `ORDER BY` answering in the index's own order, which looks like a plausible result and is
-/// wrong. Better to have no index than one that silently misorders.
-fn validate_sort_column(
+/// -- a different gram size still answers correctly. An order quietly dropped would leave
+/// `ORDER BY` answering in another order, which looks like a plausible result and is wrong.
+/// Better to have no index than one that silently misorders.
+fn validate_order(
     metadata: &IndexMetadata,
     table_columns: &HashMap<ColumnName, NativeType>,
 ) -> anyhow::Result<()> {
-    let Some(order_by) = metadata
-        .kind
-        .as_pattern()
-        .and_then(|options| options.order_by.as_ref().as_ref())
-    else {
+    let Some(options) = metadata.kind.as_pattern() else {
         return Ok(());
     };
-    let Some(native_type) = table_columns.get(order_by) else {
+    if let OrderBy::Invalid(value) = &options.order_by {
         anyhow::bail!(
-            "pattern index {}.{} orders by column {order_by}, which the table does not have",
+            "pattern index {}.{} has an order_by option that does not parse: '{value}'",
             metadata.keyspace_name,
             metadata.index_name,
         );
-    };
+    }
+    for column in options.order_by.columns() {
+        let order_by = &column.name;
+        let Some(native_type) = table_columns.get(order_by) else {
+            anyhow::bail!(
+                "pattern index {}.{} orders by column {order_by}, which the table does not have",
+                metadata.keyspace_name,
+                metadata.index_name,
+            );
+        };
+        anyhow::ensure!(
+            crate::cql_types::is_orderable(native_type),
+            "pattern index {}.{} orders by column {order_by} of type {native_type:?}, \
+             which has no ordering the index can use",
+            metadata.keyspace_name,
+            metadata.index_name,
+        );
+    }
+    Ok(())
+}
+
+/// Refuses an index in some order -- declared columns or table order -- on a table whose tokens
+/// are not Murmur3 hashes or whose key has a column of a type table order does not support,
+/// rather than answering in a wrong order. Returns whether the index needs the clustering order.
+fn check_key_for_order<T: DbDriver>(
+    db_driver: &T,
+    table: &T::Table,
+    metadata: &IndexMetadata,
+) -> anyhow::Result<bool> {
+    let ordered = metadata
+        .kind
+        .as_pattern()
+        .is_some_and(|options| options.order_by.is_ordered());
+    if !ordered {
+        return Ok(false);
+    }
     anyhow::ensure!(
-        crate::cql_types::is_orderable(native_type),
-        "pattern index {}.{} orders by column {order_by} of type {native_type:?}, \
-         which has no ordering the index can use",
+        db_driver.uses_murmur3(table),
+        "pattern index {}.{}: the table's partitioner is not Murmur3, so the index cannot keep \
+         table order",
         metadata.keyspace_name,
         metadata.index_name,
     );
-    Ok(())
+    for column in metadata.primary_key_columns.iter() {
+        let typ = db_driver.column(table, column).map(|column| &column.typ);
+        anyhow::ensure!(
+            typ.is_some_and(is_key_type_supported),
+            "pattern index {}.{}: primary key column {column} is of a type table order does not \
+             support ({typ:?}); create the index with 'order_by': 'unordered'",
+            metadata.keyspace_name,
+            metadata.index_name,
+        );
+    }
+    Ok(metadata.primary_key_columns.len().get() > metadata.partition_key_count.get())
+}
+
+/// The primary-key layout table order and tokens need: which columns are the partition key and how
+/// each clustering column is ordered. The order is read only when `needs_clustering_order`; an
+/// unordered index, or one of another kind, keeps every column ascending, unused.
+async fn key_layout<T: DbDriver>(
+    db_driver: &T,
+    session: &T::Session,
+    metadata: &IndexMetadata,
+    needs_clustering_order: bool,
+) -> anyhow::Result<KeyLayout> {
+    let partition_key_count = metadata.partition_key_count.get();
+    let clustering_columns = &metadata.primary_key_columns.as_slice()[partition_key_count..];
+    let clustering_descending = if needs_clustering_order {
+        let order = db_driver
+            .clustering_order(session, &metadata.keyspace_name, &metadata.table_name)
+            .await?;
+        clustering_columns
+            .iter()
+            .map(|column| {
+                order.get(column).copied().ok_or_else(|| {
+                    anyhow!("no clustering order for column {column} in system_schema.columns")
+                })
+            })
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        vec![false; clustering_columns.len()]
+    };
+    Ok(KeyLayout {
+        partition_key_count,
+        clustering_descending: clustering_descending.into(),
+    })
 }
 
 /// Builds the `table_columns` lookup Table::new() uses to size and type

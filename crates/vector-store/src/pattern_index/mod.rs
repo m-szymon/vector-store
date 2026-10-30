@@ -8,6 +8,7 @@
 mod actor;
 mod factory;
 mod like;
+mod order;
 mod tantivy;
 
 use crate::memory::Memory;
@@ -21,6 +22,10 @@ pub(crate) use actor::SortOrder;
 pub(crate) use factory::PatternIndexConfiguration;
 pub(crate) use factory::PatternIndexFactory;
 pub(crate) use like::parse as parse_like_pattern;
+pub use order::KeyLayout;
+pub(crate) use order::PREFIX_SLOTS;
+pub(crate) use order::SortPrefix;
+pub(crate) use order::is_key_type_supported;
 use std::sync::Arc;
 use tantivy::TantivyPatternIndexFactory;
 use tokio::sync::mpsc;

@@ -380,10 +380,12 @@ async fn add_index_pattern(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
     let options = ctx.metadata.pattern().ok_or_else(|| {
         anyhow::anyhow!("add_index_pattern must be called with a pattern-search index")
     })?;
+    let key_layout = ctx.db_index.get_key_layout().await;
     let pattern_sender = ctx.index_factories.pattern.create_index(
         PatternIndexConfiguration {
             key: ctx.key.clone(),
             options: options.clone(),
+            key_layout,
         },
         Arc::clone(&ctx.table),
     );

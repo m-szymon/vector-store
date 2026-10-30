@@ -427,7 +427,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Performs a LIKE search against the specified pattern index. Returns the primary keys of the rows whose indexed value matches the `LIKE` pattern in the payload, read with ScyllaDB's `LIKE` rules: `%` matches any run of characters, `_` exactly one, `\\\\` makes the next character literal, and the whole value has to match. The index serves `'%keyword%'`, `'keyword%'` and `'%keyword'`; any other pattern, or a keyword shorter than the index's `min_gram`, is answered with 400 and the reason. Matching is exact, with no ranking or scoring, and case-sensitive unless the index was created with `case_sensitive` set to false. An index created with `order_by` returns the rows ordered by that column and pages with `cursor`; any other index returns them in index order, and 'offset' pages through them, which is only stable between writes. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+        "description": "Performs a LIKE search against the specified pattern index. Returns the primary keys of the rows whose indexed value matches the `LIKE` pattern in the payload, read with ScyllaDB's `LIKE` rules: `%` matches any run of characters, `_` exactly one, `\\\\` makes the next character literal, and the whole value has to match. The index serves `'%keyword%'`, `'keyword%'` and `'%keyword'`; any other pattern, or a keyword shorter than the index's `min_gram`, is answered with 400 and the reason. Matching is exact, with no ranking or scoring, and case-sensitive unless the index was created with `case_sensitive` set to false. An index returns the rows in its order and pages with `cursor`: one created without `order_by` in table order (by token, then partition key, then clustering key), one with `order_by` columns by those columns and then table order, where `order` names the direction of the first column and the walk is that order or its exact reverse. An index created with `'order_by': 'unordered'` returns matches in no particular order, and 'offset' pages through them, which is only stable between writes. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
         "operationId": "post_index_like",
         "parameters": [
           {
@@ -1407,7 +1407,7 @@
               "string",
               "null"
             ],
-            "description": "Resume an ordered search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's sort key and primary key). Only meaningful for an index created with an `order_by` column; ignored otherwise."
+            "description": "Resume a search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's place in the index's order and its primary key). Ignored by an unordered index."
           },
           "limit": {
             "$ref": "#/components/schemas/Limit",
@@ -1417,7 +1417,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/SortBound",
-                "description": "Restrict the search to rows whose sort value is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+                "description": "Restrict the search to rows whose first ordering column is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with `order_by` columns; ignored otherwise."
               },
               {
                 "type": "null"
@@ -1428,7 +1428,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/SortBound",
-                "description": "Restrict the search to rows whose sort value is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+                "description": "Restrict the search to rows whose first ordering column is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with `order_by` columns; ignored otherwise."
               },
               {
                 "type": "null"
@@ -1437,14 +1437,14 @@
           },
           "offset": {
             "type": "integer",
-            "description": "The number of matching rows to skip before collecting `limit` of them. Rows come in index order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by an index that has a sort column, which pages by `cursor` instead.",
+            "description": "The number of matching rows to skip before collecting `limit` of them, for an index created with `'order_by': 'unordered'`: its rows come in no particular order, which may change as the index is updated, so paging by offset is only stable between writes. Ignored by every other index, which pages by `cursor` instead.",
             "minimum": 0
           },
           "order": {
             "oneOf": [
               {
                 "$ref": "#/components/schemas/SortOrder",
-                "description": "The direction along the sort column; descending when absent. Only meaningful for an index created with an `order_by` column; ignored otherwise."
+                "description": "The direction along the index's first ordering column: the declared order when it matches the column's declared direction, its exact reverse otherwise. The declared order when absent; for an index in table order, that is ascending. Ignored by an unordered index."
               },
               {
                 "type": "null"
@@ -1476,11 +1476,11 @@
               "string",
               "null"
             ],
-            "description": "Pass as the next request's `cursor`, unchanged, to read the following page. Absent when the index has no sort column, or when this page exhausted the matches."
+            "description": "Pass as the next request's `cursor`, unchanged, to read the following page. Absent for an unordered index, or when this page exhausted the matches."
           },
           "primary_keys": {
             "type": "object",
-            "description": "Primary keys of the matching rows, one array of values per primary key column. Ordered by the index's sort column when it has one.",
+            "description": "Primary keys of the matching rows, one array of values per primary key column, in the index's order: its `order_by` columns, then table order; table order alone without `order_by`; no particular order for an unordered index.",
             "additionalProperties": {
               "type": "array",
               "items": {}
@@ -1529,7 +1529,7 @@
       },
       "SortOrder": {
         "type": "string",
-        "description": "The direction of an ordered pattern search along its sort column.",
+        "description": "The direction of an ordered pattern search along its first ordering column.",
         "enum": [
           "desc",
           "asc"

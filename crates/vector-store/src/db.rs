@@ -606,13 +606,19 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
     let min_gram: MinGram = parse_index_option(options, "min_gram");
     let max_gram: MaxGram = parse_index_option(options, "max_gram");
     let case_sensitive: CaseSensitive = parse_index_option(options, "case_sensitive");
-    // Only that the option names something; that the column exists and can be ordered is
-    // checked later, where the table's schema is in hand.
-    let order_by: OrderBy = parse_index_option(options, "order_by");
-    let ordered = order_by.as_ref().is_some();
+    // Only the syntax; that the columns exist and can be ordered is checked later, where the
+    // table's schema is in hand. A value that does not parse is kept as `Invalid`, not replaced
+    // by the default, so that the index is refused rather than answering in another order.
+    let order_by: OrderBy = options.get("order_by").map_or(OrderBy::Table, |value| {
+        value.parse().unwrap_or_else(|err| {
+            warn!("invalid value '{value}' of the index option 'order_by': {err}");
+            OrderBy::Invalid(value.as_str().into())
+        })
+    });
+    let ordered = order_by.is_ordered();
     // `segment_rows` caps segment size and switches on the range-aware merge policy. An
-    // ordered index gets the cap unless it says otherwise ('0' turns it off): without it
-    // a deep page costs several times what the first one does.
+    // ordered index -- table order included -- gets the cap unless it says otherwise ('0' turns
+    // it off): without it a deep page costs several times what the first one does.
     let segment_max_docs: SegmentMaxDocs = if options.contains_key("segment_rows") {
         parse_index_option(options, "segment_rows")
     } else if ordered {
@@ -1691,9 +1697,24 @@ pub(crate) mod tests {
                     .collect(),
             )
         };
-        let unordered = options(&[]);
+        let unordered = options(&[("order_by", "unordered")]);
         assert_eq!(*unordered.segment_max_docs.as_ref(), None);
         assert!(!*unordered.rewrite_wide_segments.as_ref());
+
+        // No order_by is table order, which keeps a layout like any other order.
+        let table_order = options(&[]);
+        assert_eq!(table_order.order_by, OrderBy::Table);
+        assert_eq!(
+            *table_order.segment_max_docs.as_ref(),
+            Some(DEFAULT_SEGMENT_ROWS)
+        );
+        assert!(*table_order.rewrite_wide_segments.as_ref());
+
+        // A value that does not parse is kept, to be refused, rather than read as table order.
+        assert!(matches!(
+            options(&[("order_by", "a b")]).order_by,
+            OrderBy::Invalid(_)
+        ));
 
         let ordered = options(&[("order_by", "register_time")]);
         assert_eq!(
