@@ -1,7 +1,8 @@
 # Substring search: ordering and table order
 
 Status: implemented on the index node (vector-store, `pattern_index/order.rs` and the ordered walk
-in `pattern_index/tantivy.rs`); the ScyllaDB side is in progress. It builds on follow-up 4 of
+in `pattern_index/tantivy.rs`) and in ScyllaDB (`pattern_index::parse_order` and `check_order`,
+`pattern_search::fit_ordering` and `index_for`, `ordered_pattern_select_statement`). It builds on follow-up 4 of
 SCYLLADB-5644 and is taken as a requirement for the pattern index before any further
 optimisation.
 
