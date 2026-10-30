@@ -454,7 +454,7 @@ async fn create_cdc_reader<T: DbDriver>(
     tx_embeddings: mpsc::Sender<(DbIndexedRow, AsyncInProgress)>,
     semaphore: Arc<Semaphore>,
     metrics: Arc<Metrics>,
-    reader_name: &str,
+    reader_name: &'static str,
 ) -> anyhow::Result<(
     T::CdcLogReader,
     impl std::future::Future<Output = anyhow::Result<()>>,
@@ -466,6 +466,7 @@ async fn create_cdc_reader<T: DbDriver>(
         Arc::clone(&metrics),
         tx_embeddings,
         semaphore,
+        reader_name,
     )
     .await?;
 

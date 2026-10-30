@@ -1218,9 +1218,10 @@ async fn cdc_indexing_lag_metric_exported(actors: Arc<TestActors>) {
         metrics_output.contains(&format!(r#"index_name="{}""#, index.index.as_ref())),
         "expected index_name label in indexing_lag_seconds metric:\n{metrics_output}"
     );
-    // The _count suffix confirms at least one observation was recorded.
+    // The _count suffix confirms at least one observation was recorded, by the fine reader, which
+    // indexes the change within the latency waited for above.
     let expected_count_line = format!(
-        r#"indexing_lag_seconds_count{{index_name="{}",keyspace="{}"}}"#,
+        r#"indexing_lag_seconds_count{{index_name="{}",keyspace="{}",reader="fine"}}"#,
         index.index.as_ref(),
         keyspace.as_ref()
     );

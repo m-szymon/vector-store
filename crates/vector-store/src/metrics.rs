@@ -201,10 +201,12 @@ impl Metrics {
         let indexing_lag = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "indexing_lag_seconds",
-                "Time in seconds between a CDC-recorded change in ScyllaDB and its indexing in the vector store",
+                "Time in seconds between a CDC-recorded change in ScyllaDB and its indexing in the vector store, \
+                 per CDC reader: the fine reader's is how long a change takes to become searchable, the wide \
+                 reader's that of its delayed re-read",
             )
             .buckets(lag_buckets),
-            &["keyspace", "index_name"],
+            &["keyspace", "index_name", "reader"],
         )
         .unwrap();
 
@@ -423,9 +425,11 @@ impl Metrics {
                 .remove_label_values(&[keyspace, index_name, op]);
         }
         let _ = self.size.remove_label_values(&[keyspace, index_name]);
-        let _ = self
-            .indexing_lag
-            .remove_label_values(&[keyspace, index_name]);
+        for reader in [crate::db_cdc::READER_FINE, crate::db_cdc::READER_WIDE] {
+            let _ = self
+                .indexing_lag
+                .remove_label_values(&[keyspace, index_name, reader]);
+        }
         let _ = self
             .fts_index_size_bytes
             .remove_label_values(&[keyspace, index_name]);
@@ -502,7 +506,7 @@ mod tests {
             .observe(0.001);
         metrics
             .indexing_lag
-            .with_label_values(&["ks", "idx"])
+            .with_label_values(&["ks", "idx", READER_FINE])
             .observe(0.001);
         metrics
             .latency
@@ -631,7 +635,9 @@ mod tests {
         let metrics = Metrics::new();
 
         // Create and immediately drop a Cdc marker to trigger observation.
-        let histogram = metrics.indexing_lag.with_label_values(&["ks", "idx"]);
+        let histogram = metrics
+            .indexing_lag
+            .with_label_values(&["ks", "idx", READER_FINE]);
         drop(AsyncInProgress::cdc(histogram.clone(), Timestamp::MIN));
 
         assert_eq!(histogram.get_sample_count(), 1);
@@ -649,7 +655,9 @@ mod tests {
             "expected keyspace/index_name labels in export:\n{output}"
         );
         assert!(
-            output.contains(r#"indexing_lag_seconds_count{index_name="idx",keyspace="ks"} 1"#),
+            output.contains(
+                r#"indexing_lag_seconds_count{index_name="idx",keyspace="ks",reader="fine"} 1"#
+            ),
             "expected a single observed sample in export:\n{output}"
         );
     }
@@ -663,7 +671,7 @@ mod tests {
         assert_eq!(
             metrics
                 .indexing_lag
-                .with_label_values(&["ks", "idx"])
+                .with_label_values(&["ks", "idx", READER_FINE])
                 .get_sample_count(),
             0
         );

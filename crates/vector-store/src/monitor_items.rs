@@ -426,7 +426,7 @@ mod tests {
     fn indexing_lag_sample_count(metrics: &Metrics) -> u64 {
         metrics
             .indexing_lag
-            .with_label_values(&["vector", "store"])
+            .with_label_values(&["vector", "store", "fine"])
             .get_sample_count()
     }
 
@@ -591,7 +591,9 @@ mod tests {
                     operation: DbIndexedOperation::Upsert(values),
                 },
                 AsyncInProgress::cdc(
-                    metrics.indexing_lag.with_label_values(&["vector", "store"]),
+                    metrics
+                        .indexing_lag
+                        .with_label_values(&["vector", "store", "fine"]),
                     Timestamp::now(),
                 ),
             ))
