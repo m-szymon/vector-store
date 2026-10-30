@@ -753,7 +753,11 @@ impl FromStr for OrderBy {
         );
         let mut columns: Vec<OrderColumn> = Vec::with_capacity(items.len());
         for (name, quoted, direction) in items {
-            let name = if quoted { name } else { name.to_lowercase() };
+            let name = if quoted {
+                name
+            } else {
+                name.to_ascii_lowercase()
+            };
             let name = ColumnName::from(name);
             anyhow::ensure!(
                 columns.iter().all(|column| column.name != name),
@@ -789,7 +793,8 @@ fn split_order_items(s: &str) -> anyhow::Result<Vec<(String, bool, Option<bool>)
             (name, true)
         } else {
             let mut name = String::new();
-            while let Some(c) = chars.next_if(|c| c.is_alphanumeric() || *c == '_') {
+            // CQL's unquoted identifiers are ASCII; anything else has to be quoted.
+            while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
                 name.push(c);
             }
             anyhow::ensure!(!name.is_empty(), "order_by must name a column: {s}");
