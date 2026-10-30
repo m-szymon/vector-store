@@ -495,10 +495,9 @@ fn runs_under(
 struct SegmentColumns {
     /// One column per slot of the sort prefix: the ordering columns, then the token.
     slots: Vec<Column<u64>>,
-    /// The lowest and highest layout key of the segment's rows. Exact when every row shares the
-    /// first slot, which is what a rewritten run of tied values looks like; otherwise widened to
-    /// the whole of the second slot at either end, which only a value at a segment's very edge
-    /// notices.
+    /// The lowest and highest layout key of the segment's rows, exactly: the second slot at either
+    /// end is its rows', not the whole of it, so that a segment holding the last rows of one value
+    /// and the first of the next is as narrow as they are.
     layout_min: u128,
     layout_max: u128,
     /// The walk reads it only to tell apart rows whose whole prefix is equal.
@@ -523,6 +522,32 @@ impl SegmentColumns {
             .map_or(0, |column| u128::from(column.first(doc_id).unwrap_or(0)));
         (first << 64) | second
     }
+}
+
+/// The lowest second slot among the rows whose first slot is `first_min`, and the highest among
+/// those whose first slot is `first_max`, over every row's `(first, second)`: a segment's exact
+/// layout bounds when its rows hold more than one first slot. Bounds taking in the whole second
+/// slot at either end, as before, made a segment holding the end of one value and the start of
+/// the next span both values. With a column of few values the rewrite makes such a piece at every
+/// value it crosses; each read as spread, the spread ones merged among themselves into segments
+/// spanning several values, which the rewrite cut up into such pieces again, without end (a local
+/// run with five values, 2026-10-30). One pass over the two columns, once per segment, as the
+/// columns are cached. Deleted rows count too, as they do in the columns' own bounds.
+fn second_slot_at_the_ends(
+    rows: impl Iterator<Item = (u64, u64)>,
+    first_min: u64,
+    first_max: u64,
+) -> (u64, u64) {
+    let (mut low, mut high) = (None::<u64>, None::<u64>);
+    for (first, second) in rows {
+        if first == first_min {
+            low = Some(low.map_or(second, |low| low.min(second)));
+        }
+        if first == first_max {
+            high = Some(high.map_or(second, |high| high.max(second)));
+        }
+    }
+    (low.unwrap_or(u64::MIN), high.unwrap_or(u64::MAX))
 }
 
 impl PatternBackend {
@@ -565,10 +590,15 @@ impl PatternBackend {
                 (u128::from(first_min) << 64) | u128::from(second.min_value()),
                 (u128::from(first_max) << 64) | u128::from(second.max_value()),
             ),
-            Some(_) => (
-                u128::from(first_min) << 64,
-                (u128::from(first_max) << 64) | u128::from(u64::MAX),
-            ),
+            Some(second) => {
+                let rows = (0..segment.max_doc())
+                    .filter_map(|doc_id| Some((slots[0].first(doc_id)?, second.first(doc_id)?)));
+                let (low, high) = second_slot_at_the_ends(rows, first_min, first_max);
+                (
+                    (u128::from(first_min) << 64) | u128::from(low),
+                    (u128::from(first_max) << 64) | u128::from(high),
+                )
+            }
         };
         let columns = SegmentColumns {
             slots,
@@ -4356,6 +4386,12 @@ mod tests {
         assert_eq!(sender.count(make_index_key()).await.unwrap(), 2);
     }
 
+    /// Whether a segment of a few-values index is narrow: one value, or the end of one and the
+    /// start of the next, which is what a rewritten range crossing a value leaves.
+    fn at_most_two_values(segment: &SegmentLayout) -> bool {
+        segment.sort_max.unwrap() - segment.sort_min.unwrap() <= 1
+    }
+
     /// An ordered index on a column with few values: rows sharing one keep table order, and the
     /// rewrite splits a run of one value by token, so segments end narrow even when every row has
     /// one of three values.
@@ -4400,7 +4436,7 @@ mod tests {
                 && stats
                     .segments
                     .iter()
-                    .all(|s| s.docs <= cap && s.sort_min == s.sort_max);
+                    .all(|s| s.docs <= cap && at_most_two_values(s));
             if settled || Instant::now() > deadline {
                 break stats;
             }
@@ -4411,7 +4447,7 @@ mod tests {
             stats
                 .segments
                 .iter()
-                .all(|s| s.docs <= cap && s.sort_min == s.sort_max),
+                .all(|s| s.docs <= cap && at_most_two_values(s)),
             "{:?}",
             stats.segments
         );
@@ -4435,5 +4471,115 @@ mod tests {
             after.segments_opened - before.segments_opened <= 2,
             "{before:?} -> {after:?}"
         );
+    }
+
+    /// The rewrite of a column with few values comes to an end, and leaves no segment spanning
+    /// more than the end of one value and the start of the next. The endless rewrite of a local run with five values (2026-10-30) needed
+    /// merges this size does not reproduce; `a_segment_across_two_values_is_as_narrow_as_its_rows`
+    /// covers its cause.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn the_rewrite_of_a_column_with_few_values_comes_to_an_end() {
+        // Enough caps that a segment holding the whole of two values is wide: the narrow span is
+        // eight caps' worth of the five values' range, half of one value at 80 caps.
+        let rows = 4000u64;
+        let cap = 50u32;
+        let sender = make_sender_for(
+            IndexOptionsPattern {
+                order_by: "rating DESC".parse().unwrap(),
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: "true".parse().unwrap(),
+                ..IndexOptionsPattern::default()
+            },
+            make_table(bigint_key, |id, _| Some(CqlValue::Int((id % 5) as i32))),
+            test_layout(),
+        );
+        let mut acks = Vec::with_capacity(rows as usize);
+        for id in 1..=rows {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    id.into(),
+                    format!("user{id}将军"),
+                    AsyncInProgress::Fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        // Settled: a rewrite ran to its end, and nothing has been moved since for a while.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut quiet_since = (0, Instant::now());
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let rewrite = &stats.rewrite;
+            let finished = rewrite.ranges_total > 0 && rewrite.ranges_done == rewrite.ranges_total;
+            if !finished || rewrite.docs_rewritten != quiet_since.0 {
+                quiet_since = (rewrite.docs_rewritten, Instant::now());
+            } else if quiet_since.1.elapsed() > Duration::from_secs(3) {
+                break stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the rewrite does not settle: {:?}, {:?}",
+                stats.rewrite,
+                stats.segments
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(stats.tantivy.num_docs, rows);
+        assert!(
+            stats.rewrite.docs_rewritten < 3 * rows,
+            "{:?}",
+            stats.rewrite
+        );
+        assert!(
+            stats.segments.iter().all(at_most_two_values),
+            "{:?}",
+            stats.segments
+        );
+    }
+
+    /// A segment holding the last tokens of one value and the first of the next spans what its
+    /// rows do, not both values whole: narrow, so it neither counts as wide nor joins the spread
+    /// segments that merge whatever they span.
+    #[test]
+    fn a_segment_across_two_values_is_as_narrow_as_its_rows() {
+        let rows = [
+            (3, u64::MAX - 40),
+            (3, u64::MAX - 7),
+            (4, 5),
+            (4, 90),
+            (3, u64::MAX - 20),
+        ];
+        let (low, high) = second_slot_at_the_ends(rows.into_iter(), 3, 4);
+        assert_eq!((low, high), (u64::MAX - 40, 90));
+        let layout = |first: u64, second: u64| (u128::from(first) << 64) | u128::from(second);
+        let (min, max) = (layout(3, low), layout(4, high));
+        assert_eq!(max - min, 131);
+        // Among segments spanning five values of a 1M-row index capped at 20k rows a segment.
+        let tenth = u64::MAX / 10;
+        let segments = [
+            (20_000, layout(0, 0), layout(0, tenth), id(1)),
+            (
+                20_000,
+                layout(4, u64::MAX - tenth),
+                layout(4, u64::MAX),
+                id(2),
+            ),
+            (500, min, max, id(3)),
+        ];
+        let total = 1_000_000;
+        assert!(wide_segments(&segments, total, 0, 20_000).is_empty());
+        assert!(!spread_segments(&segments, total, 20_000).contains(&id(3)));
+        // The bounds as they were: both values whole, which the rewrite plans again and again.
+        let widened = [(500, layout(3, 0), layout(4, u64::MAX), id(3))];
+        let segments = [segments[0], segments[1], widened[0]];
+        assert!(spread_segments(&segments, total, 20_000).contains(&id(3)));
     }
 }

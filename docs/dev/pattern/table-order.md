@@ -227,9 +227,15 @@ option stays.
 - **Layout key:** the merge policy, the wide/spread checks and the rewrite work on a u128 made of
   the first two slots. For one ordering column that is (value, token), which is what lets the
   rewrite split a run of one value; for table order, the token.
-  - A segment's bounds are exact when all its rows share the first slot.
-  - Otherwise they widen to the whole second slot at either end. That costs a span of one unit of
-    the first column, and it is conservative for pruning.
+  - A segment's bounds are exact. When its rows hold more than one first slot, the second slot at
+    either end comes from one pass over the two columns when the segment is first opened.
+  - Bounds widened to the whole second slot at either end, as first implemented, made the rewrite
+    of a column with few values endless. A rewritten range crossing from one value to the next
+    lands in a piece holding the end of one and the start of the other. Widened, the piece spanned
+    two whole values and read as spread. Spread segments merge among themselves whatever they
+    span, so these pieces merged into segments spanning up to four values. The rewrite cut those
+    into crossing pieces again. A local run with five values (2026-10-30) rewrote 75–95k rows every
+    50 s, for as long as it ran.
 - **The walk:**
   - It keeps the page as a vector sorted best first. It compares prefixes, and only on an exact
     prefix tie looks both primary keys up in the table and compares them in table order
