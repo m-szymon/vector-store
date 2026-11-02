@@ -222,6 +222,9 @@ struct PatternBackend {
     /// Set while a tick's work on this index -- learning the layout, a step of the rewrite -- is
     /// running, so that the next tick does not queue more behind it. See `TickWork`.
     tick_running: AtomicBool,
+    /// The merges `after_reload` asked for that are still running; their segments are left out
+    /// of the next ones it asks for.
+    merging: Mutex<MergesInFlight<tantivy::FutureResult<Option<SegmentMeta>>>>,
 }
 
 /// Holds an index's `tick_running` for one tick's work and clears it however that work ends.
@@ -373,6 +376,44 @@ fn quantile_ranges(
 }
 
 type SharedBounds = Arc<RwLock<HashMap<SegmentId, (u128, u128)>>>;
+
+/// The merges `after_reload` has asked the writer for and that have not finished, with the
+/// segments each one reads. Tantivy keeps a merge's segments out of the merges its own policy
+/// picks, but not out of an explicit `IndexWriter::merge`: asked again for segments already being
+/// merged, it queues another full merge of them. `after_reload` asks on every tick, so a merge that
+/// outlasted a tick was queued again on the next one, and the duplicates slowed every merge down
+/// until each was queued many times over. On AWS (run a0e51aa9, a 10M-row table-order index) the
+/// same merge was started 60 times a minute, 24,832 merges were started against 1,703 finished,
+/// the queued ones held their segments in memory, and they went on running after the index was
+/// dropped, until the node ran out of memory.
+///
+/// Generic over the merge's handle so that a test can stand in for a merge it holds back.
+struct MergesInFlight<F> {
+    merges: Vec<(Vec<SegmentId>, F)>,
+}
+
+impl<F> Default for MergesInFlight<F> {
+    fn default() -> Self {
+        Self { merges: Vec::new() }
+    }
+}
+
+impl<F: std::future::Future + Unpin> MergesInFlight<F> {
+    /// The segments of the merges still running; forgets the ones that ended, whether they
+    /// succeeded or not, so that the segments of a failed merge can be asked for again.
+    fn busy(&mut self) -> std::collections::HashSet<SegmentId> {
+        self.merges
+            .retain_mut(|(_, merge)| futures::FutureExt::now_or_never(merge).is_none());
+        self.merges
+            .iter()
+            .flat_map(|(segments, _)| segments.iter().copied())
+            .collect()
+    }
+
+    fn started(&mut self, segments: Vec<SegmentId>, merge: F) {
+        self.merges.push((segments, merge));
+    }
+}
 
 /// P3a: merges neighbours in sort order, never past a size cap.
 ///
@@ -893,19 +934,30 @@ impl PatternBackend {
             return;
         };
         let narrow = narrow_span(&geometry, searcher.num_docs(), max_docs.get());
-        let runs = merge_runs(geometry.clone(), max_docs.get(), narrow);
+        let mut merging = self.merging.lock().unwrap();
+        // A run with a segment already being merged waits for that merge: see `MergesInFlight`.
+        // The runs are still cut from every live segment, not from the idle ones alone, which
+        // would make a busy segment's neighbours look adjacent and merge them across it into a
+        // segment overlapping it.
+        let busy = merging.busy();
+        let runs: Vec<Vec<SegmentId>> = merge_runs(geometry, max_docs.get(), narrow)
+            .into_iter()
+            .filter(|run| !run.iter().any(|id| busy.contains(id)))
+            .collect();
         if !runs.is_empty() {
             info!(
-                "pattern: asking for {} merges of {} segments ({} live)",
+                "pattern: asking for {} merges of {} segments ({} live, {} being merged)",
                 runs.len(),
                 runs.iter().map(Vec::len).sum::<usize>(),
-                searcher.segment_readers().len()
+                searcher.segment_readers().len(),
+                busy.len()
             );
         }
         for run in runs {
-            // The merge runs on Tantivy's own thread; the future only reports its outcome, and
-            // the next reload picks the merged segment up either way.
-            drop(state.lock_writer().merge(&run));
+            // The merge runs on Tantivy's own thread; the handle only reports its end, and the
+            // next reload picks the merged segment up either way.
+            let merge = state.lock_writer().merge(&run);
+            merging.started(run, merge);
         }
     }
 }
@@ -1142,6 +1194,7 @@ fn new_index(
         plan: Mutex::new(None),
         rewrite: RewriteCounters::default(),
         tick_running: AtomicBool::new(false),
+        merging: Mutex::new(MergesInFlight::default()),
         options: options.clone(),
     };
     let schema = backend.build_schema();
@@ -2846,6 +2899,34 @@ mod tests {
 
     fn id(n: u8) -> SegmentId {
         SegmentId::from_uuid_string(&format!("00000000-0000-0000-0000-0000000000{n:02}")).unwrap()
+    }
+
+    /// A merge that outlasts a tick keeps its segments out of the next tick's merges: asked for
+    /// them again, Tantivy would queue a second full merge (run a0e51aa9 queued each one up to
+    /// 60 times a minute).
+    #[test]
+    fn segments_being_merged_are_not_merged_again() {
+        let mut merging = MergesInFlight::default();
+        let (finish, merge) = futures::channel::oneshot::channel::<()>();
+        merging.started(vec![id(1), id(2)], merge);
+        let (_still_running, other) = futures::channel::oneshot::channel::<()>();
+        merging.started(vec![id(3)], other);
+        assert_eq!(merging.busy(), [id(1), id(2), id(3)].into());
+        // Still running at the next tick: still busy.
+        assert_eq!(merging.busy(), [id(1), id(2), id(3)].into());
+        finish.send(()).unwrap();
+        assert_eq!(merging.busy(), [id(3)].into());
+    }
+
+    /// A merge that failed frees its segments as one that succeeded does, so that they can be
+    /// merged on a later tick rather than never again.
+    #[test]
+    fn the_segments_of_a_failed_merge_can_be_merged_again() {
+        let mut merging = MergesInFlight::default();
+        let (failed, merge) = futures::channel::oneshot::channel::<()>();
+        merging.started(vec![id(1), id(2)], merge);
+        drop(failed);
+        assert!(merging.busy().is_empty());
     }
 
     /// Neighbours in sort order merge while under the cap; a full segment stands alone and ends
