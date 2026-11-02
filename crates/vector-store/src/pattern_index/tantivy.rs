@@ -2187,6 +2187,7 @@ pub(crate) fn new(
 mod tests {
     use super::*;
     use crate::AsyncInProgress;
+    use crate::DEFAULT_SEGMENT_ROWS;
     use crate::IndexKey;
     use crate::MaxGram;
     use crate::MinGram;
@@ -4219,6 +4220,109 @@ mod tests {
             "the actor stalled for {slowest_count:?}"
         );
         assert!(slowest < Duration::from_secs(1), "stats took {slowest:?}");
+    }
+
+    fn rss_mb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("VmRSS:"))
+                    .and_then(|kb| kb.trim().trim_end_matches(" kB").parse::<u64>().ok())
+            })
+            .map_or(0, |kb| kb / 1024)
+    }
+
+    /// A table-order index with default options, loaded fast, must settle, and once dropped must
+    /// stop working and give its memory back. On AWS (run a0e51aa9, 10M rows ingested in 136 s next
+    /// to an unordered index) it never settled -- about 2000 merges a minute held it at 500-780
+    /// segments -- and after the drop its merges went on, with the node's memory going from 8 to
+    /// 29.5 GB in four minutes. Diagnostic, not a pass/fail check yet: run with `--ignored`
+    /// (CHURN_ROWS sets the size, CHURN_SECS how long to watch before the drop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn a_fast_loaded_table_order_index_settles_and_stops_when_dropped() {
+        let rows: u64 = std::env::var("CHURN_ROWS").map_or(2_000_000, |rows| rows.parse().unwrap());
+        let watch = std::env::var("CHURN_SECS").map_or(900, |secs| secs.parse().unwrap());
+        // RUST_LOG=info shows the merges ('Starting merge', 'pattern: asking for ... merges').
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                // What db.rs gives a table-order index created with no options.
+                options: IndexOptionsPattern {
+                    segment_max_docs: SegmentMaxDocs::from(Some(DEFAULT_SEGMENT_ROWS)),
+                    rewrite_wide_segments: RewriteWideSegments::from(true),
+                    ..IndexOptionsPattern::default()
+                },
+                key_layout: test_layout(),
+            },
+            make_table(bigint_key, |_, _| None),
+            worker::new(),
+            make_memory_actor(),
+            COMMIT_INTERVAL,
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let started = Instant::now();
+        let (tx, mut rx) = mpsc::channel(1);
+        for n in 1..=rows {
+            let name = format!("用户{}号玩家{}", n % 9973, n);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    n.into(),
+                    name,
+                    AsyncInProgress::Fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        rx.recv().await;
+        println!(
+            "CHURN loaded {rows} rows in {:.0}s, rss {} MB",
+            started.elapsed().as_secs_f64(),
+            rss_mb()
+        );
+
+        let loaded = Instant::now();
+        let mut counts = Vec::new();
+        while loaded.elapsed() < Duration::from_secs(watch) {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let segments = stats.tantivy.segment_count;
+            println!(
+                "CHURN t={:.0}s segments={segments} rewrite={}/{} rss={} MB",
+                loaded.elapsed().as_secs_f64(),
+                stats.rewrite.ranges_done,
+                stats.rewrite.ranges_total,
+                rss_mb()
+            );
+            counts.push(segments);
+            let rewrite_done = stats.rewrite.ranges_done == stats.rewrite.ranges_total;
+            if rewrite_done
+                && counts.len() >= 12
+                && counts[counts.len() - 12..].iter().all(|&c| c == segments)
+            {
+                println!("CHURN settled at {segments} segments");
+                break;
+            }
+        }
+
+        drop(sender);
+        let dropped = Instant::now();
+        while dropped.elapsed() < Duration::from_secs(180) {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            println!(
+                "CHURN dropped t={:.0}s rss={} MB",
+                dropped.elapsed().as_secs_f64(),
+                rss_mb()
+            );
+        }
     }
 
     /// A table whose rows are named by id: `key_of` gives a row's primary key and `value_of` the
