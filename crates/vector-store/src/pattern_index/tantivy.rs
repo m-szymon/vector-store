@@ -61,7 +61,6 @@ use tantivy::Term;
 use tantivy::columnar::Column;
 use tantivy::index::SegmentId;
 use tantivy::index::SegmentMeta;
-use tantivy::indexer::MergeCandidate;
 use tantivy::indexer::MergePolicy;
 use tantivy::postings::TermInfo;
 use tantivy::query::ConstScorer;
@@ -211,9 +210,6 @@ struct PatternBackend {
     /// the handle itself is a cheap clone. Keyed by segment id, so a merge simply leaves stale
     /// entries behind, which `prune_columns` drops once they outnumber the live segments.
     columns: RwLock<HashMap<SegmentId, SegmentColumns>>,
-    /// Each live segment's sort bounds, for the merge policy, which sees only segment metas.
-    /// Refreshed after every reload; shared with the policy the writer holds.
-    bounds: SharedBounds,
     /// P3b: the rewrite of wide segments in progress, if any, and what it has done so far.
     plan: Mutex<Option<RewritePlan>>,
     /// The table's primary-key layout: tokens and table order.
@@ -375,8 +371,6 @@ fn quantile_ranges(
     ranges
 }
 
-type SharedBounds = Arc<RwLock<HashMap<SegmentId, (u128, u128)>>>;
-
 /// The merges `after_reload` has asked the writer for and that have not finished, with the
 /// segments each one reads. Tantivy keeps a merge's segments out of the merges its own policy
 /// picks, but not out of an explicit `IndexWriter::merge`: asked again for segments already being
@@ -441,51 +435,6 @@ pub(crate) struct MergeTotals {
     pub(crate) started: u64,
     pub(crate) ended: u64,
     pub(crate) running: u64,
-}
-
-/// P3a: merges neighbours in sort order, never past a size cap.
-///
-/// Tantivy's default policy merges segments of similar size whatever they hold, which is how an
-/// index ends up with 1.3M-row segments spanning a quarter of the range each and a tail of small
-/// ones that all reach the top: a page-1 query opens every tail segment and a deep page scans
-/// whichever big segment its cursor lands in. This one sorts the segments by their lowest sort
-/// key and merges runs of neighbours while the run stays under `max_docs`, so a segment only ever
-/// grows into the rows next to it in sort order and never past the cap. A segment at or over the
-/// cap is left alone. Segments whose bounds are not known yet (committed but not reloaded) wait
-/// for the next round.
-///
-/// Wide segments -- rows that arrived out of sort order, a build by full scan -- never join a
-/// narrow run, which would only widen it: they merge among themselves, and the rewrite (P3b)
-/// takes them apart. Without the rewrite they stay, a few segments every ordered query has to
-/// open, which is the stage-2 state.
-///
-/// The price is write amplification on the tail: each commit adds a small segment next to it
-/// and the run is rewritten, up to `max_docs` rows per commit. Acceptable for measuring the
-/// layout; a levelled tail is the obvious refinement.
-#[derive(Debug)]
-struct RangeMergePolicy {
-    max_docs: u32,
-    bounds: SharedBounds,
-}
-
-impl MergePolicy for RangeMergePolicy {
-    fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
-        let bounds = self.bounds.read().unwrap();
-        let known = segments
-            .iter()
-            .filter_map(|meta| {
-                bounds
-                    .get(&meta.id())
-                    .map(|&(low, high)| (meta.num_docs(), low, high, meta.id()))
-            })
-            .collect::<Vec<_>>();
-        let total: u64 = segments.iter().map(|meta| u64::from(meta.num_docs())).sum();
-        let narrow = narrow_span(&known, total, self.max_docs);
-        merge_runs(known, self.max_docs, narrow)
-            .into_iter()
-            .map(MergeCandidate)
-            .collect()
-    }
 }
 
 /// How much of `narrow_span` a merged narrow run may cover: a quarter, i.e. two caps' worth of
@@ -930,23 +879,48 @@ impl PatternBackend {
         doc
     }
 
+    /// P3a: merges neighbours in sort order, never past a size cap.
+    ///
+    /// Tantivy's default policy merges segments of similar size whatever they hold, which is how an
+    /// index ends up with 1.3M-row segments spanning a quarter of the range each and a tail of small
+    /// ones that all reach the top: a page-1 query opens every tail segment and a deep page scans
+    /// whichever big segment its cursor lands in. `merge_runs` sorts the segments by their lowest sort
+    /// key and merges runs of neighbours while the run stays under `max_docs`, so a segment only ever
+    /// grows into the rows next to it in sort order and never past the cap. A segment at or over the
+    /// cap is left alone. Segments whose bounds are not known yet (committed but not reloaded) wait
+    /// for the next tick.
+    ///
+    /// Wide segments -- rows that arrived out of sort order, a build by full scan -- never join a
+    /// narrow run, which would only widen it: they merge among themselves, and the rewrite (P3b)
+    /// takes them apart. Without the rewrite they stay, a few segments every ordered query has to
+    /// open, which is the stage-2 state.
+    ///
+    /// The price is write amplification on the tail: each commit adds a small segment next to it
+    /// and the run is rewritten, up to `max_docs` rows per commit. Acceptable for measuring the
+    /// layout; a levelled tail is the obvious refinement.
+    ///
+    /// All of it is done by `after_reload`, on every tick; the policy the writer holds merges
+    /// nothing, beyond keeping Tantivy's default one out. Two deciders picked the same runs: Tantivy
+    /// hands its policy only the segments no merge is reading, but `after_reload` cut its runs from
+    /// every live segment and knew of its own merges only, so it asked again for each run the policy
+    /// had just started -- in a local run of local_orders_config.yaml, 3,772 merges of 10,810, each
+    /// ending in "couldn't find segment in SegmentManager". With one decider, `MergesInFlight` sees
+    /// every merge. A merge starts up to a tick after the commit that made it possible.
     fn merge_policy(&self) -> Option<Box<dyn MergePolicy>> {
-        let max_docs = (*self.options.segment_max_docs.as_ref())?;
+        self.options.segment_max_docs.as_ref().as_ref()?;
         if !self.orders_results() {
             // Nothing to order the segments by; the cap alone is not worth a policy.
             return None;
         }
-        Some(Box::new(RangeMergePolicy {
-            max_docs: max_docs.get(),
-            bounds: Arc::clone(&self.bounds),
-        }))
+        Some(Box::new(tantivy::indexer::NoMergePolicy))
     }
 
     /// Learns every live segment's bounds (which also warms the column cache), drops the retired
-    /// ones, and asks the writer to merge what the policy would: Tantivy evaluates merges on its
-    /// own after a commit, but at that moment the bounds of the segments the commit produced are
-    /// not known yet, so the runs they belong to would otherwise wait for a commit that may never
-    /// come once the writes stop. Run on every tick, since the reader reloads on its own.
+    /// ones, and asks the writer to merge the runs `merge_runs` cuts from them (see
+    /// `merge_policy`). Not left to Tantivy, which evaluates merges after a commit: at that moment
+    /// the bounds of the segments the commit produced are not known yet, so the runs they belong
+    /// to would wait for a commit that may never come once the writes stop. Run on every tick,
+    /// since the reader reloads on its own.
     fn after_reload(&self, state: &PatternIndexState) {
         if !self.orders_results() {
             return;
@@ -954,10 +928,6 @@ impl PatternBackend {
         let searcher = state.reader.searcher();
         let geometry = self.geometry(&searcher);
         self.prune_columns(searcher.segment_readers());
-        *self.bounds.write().unwrap() = geometry
-            .iter()
-            .map(|&(_, low, high, id)| (id, (low, high)))
-            .collect();
 
         let Some(max_docs) = *self.options.segment_max_docs.as_ref() else {
             return;
@@ -1219,7 +1189,6 @@ fn new_index(
         key_layout: key_layout.clone(),
         walk: WalkCounters::default(),
         columns: RwLock::new(HashMap::new()),
-        bounds: Arc::new(RwLock::new(HashMap::new())),
         plan: Mutex::new(None),
         rewrite: RewriteCounters::default(),
         tick_running: AtomicBool::new(false),

@@ -291,12 +291,17 @@ The per-query counters and the per-segment layout report (`substring_search_*_to
 
 ### P3a as implemented
 
-`poc_option_2` = the segment cap in rows. An ordered index with it installs `RangeMergePolicy`:
+`poc_option_2` = the segment cap in rows. An ordered index with it merges by `merge_runs`:
 segments sorted by lowest sort key, runs of neighbours merged while under the cap, a segment at
-the cap left alone. The side map of bounds the note called for is filled after every reload from
-the column cache, and the actor asks the writer for the merges the policy would choose, since
-Tantivy evaluates merges right after a commit, before the new segments' bounds are known; idle
-ticks reload the reader so merges finishing after the writes stop become visible. Write
+the cap left alone. The bounds come from the column cache after every reload, and the actor asks
+the writer for the merges on every tick, since Tantivy evaluates merges right after a commit,
+before the new segments' bounds are known; idle ticks reload the reader so merges finishing after
+the writes stop become visible. The tick is the only decider: the writer's own policy is
+Tantivy's `NoMergePolicy`. A `RangeMergePolicy` that chose the same runs after each commit, next to
+the tick that knew only its own merges, had each run started twice (2026-11-02), and a tick that
+did not know its own merges still running queued each again on every tick until a 10M-row index's
+node ran out of memory (run a0e51aa9); `MergesInFlight` keeps a run waiting while one of its
+segments is being merged. Write
 amplification on the tail (rewritten every commit, up to the cap) is the known cost; a levelled
 tail is the refinement.
 
