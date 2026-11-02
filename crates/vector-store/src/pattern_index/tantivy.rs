@@ -390,11 +390,18 @@ type SharedBounds = Arc<RwLock<HashMap<SegmentId, (u128, u128)>>>;
 /// Generic over the merge's handle so that a test can stand in for a merge it holds back.
 struct MergesInFlight<F> {
     merges: Vec<(Vec<SegmentId>, F)>,
+    /// Merges asked for, and merges seen to have ended, since the index was created.
+    started: u64,
+    ended: u64,
 }
 
 impl<F> Default for MergesInFlight<F> {
     fn default() -> Self {
-        Self { merges: Vec::new() }
+        Self {
+            merges: Vec::new(),
+            started: 0,
+            ended: 0,
+        }
     }
 }
 
@@ -402,8 +409,10 @@ impl<F: std::future::Future + Unpin> MergesInFlight<F> {
     /// The segments of the merges still running; forgets the ones that ended, whether they
     /// succeeded or not, so that the segments of a failed merge can be asked for again.
     fn busy(&mut self) -> std::collections::HashSet<SegmentId> {
+        let before = self.merges.len();
         self.merges
             .retain_mut(|(_, merge)| futures::FutureExt::now_or_never(merge).is_none());
+        self.ended += (before - self.merges.len()) as u64;
         self.merges
             .iter()
             .flat_map(|(segments, _)| segments.iter().copied())
@@ -412,7 +421,26 @@ impl<F: std::future::Future + Unpin> MergesInFlight<F> {
 
     fn started(&mut self, segments: Vec<SegmentId>, merge: F) {
         self.merges.push((segments, merge));
+        self.started += 1;
     }
+
+    /// As of the last tick: a merge that ended since is still counted as running.
+    fn totals(&self) -> MergeTotals {
+        MergeTotals {
+            started: self.started,
+            ended: self.ended,
+            running: self.merges.len() as u64,
+        }
+    }
+}
+
+/// The merges a pattern index's ticks asked for, as `Stats` reports them. Only these: the merges
+/// Tantivy's own policy starts after a commit are not counted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MergeTotals {
+    pub(crate) started: u64,
+    pub(crate) ended: u64,
+    pub(crate) running: u64,
 }
 
 /// P3a: merges neighbours in sort order, never past a size cap.
@@ -806,6 +834,7 @@ pub(crate) struct PatternStats {
     pub(crate) tantivy: TantivyStats,
     pub(crate) walk: WalkTotals,
     pub(crate) rewrite: RewriteTotals,
+    pub(crate) merges: MergeTotals,
     pub(crate) segments: Vec<SegmentLayout>,
 }
 
@@ -1932,6 +1961,7 @@ fn handle_pattern_stats(state: &PatternIndexState) -> PatternStatsR {
         tantivy,
         walk: state.backend().walk.snapshot(),
         rewrite: state.backend().rewrite_totals(),
+        merges: state.backend().merging.lock().unwrap().totals(),
         segments,
     })
 }
@@ -2917,6 +2947,14 @@ mod tests {
         assert_eq!(merging.busy(), [id(1), id(2), id(3)].into());
         finish.send(()).unwrap();
         assert_eq!(merging.busy(), [id(3)].into());
+        assert_eq!(
+            merging.totals(),
+            MergeTotals {
+                started: 2,
+                ended: 1,
+                running: 1
+            }
+        );
     }
 
     /// A merge that failed frees its segments as one that succeeded does, so that they can be
