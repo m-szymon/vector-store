@@ -39,7 +39,7 @@ pub(crate) struct Metrics {
     /// index on scrape, so they are gauges that only ever grow; a client diffs two scrapes to
     /// price the queries in between. One entry per [`PATTERN_SEARCH_TOTALS`].
     pub pattern_search_totals: Vec<GaugeVec>,
-    /// Progress of a pattern index's rewrite of wide segments. One entry per
+    /// What the repair of a pattern index's layout has done. One entry per
     /// [`PATTERN_REWRITE_GAUGES`].
     pub pattern_rewrite: Vec<GaugeVec>,
     /// The merges a pattern index's ticks ask for. One entry per [`PATTERN_MERGE_GAUGES`].
@@ -103,23 +103,20 @@ pub(crate) const PATTERN_SEARCH_TOTALS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The rewrite (P3b) gauges, in the order `pattern_rewrite` holds them.
+/// The gauges of the repair of a pattern index's layout, in the order `pattern_rewrite` holds
+/// them. An index has settled once nothing is pending and no merge runs.
 pub(crate) const PATTERN_REWRITE_GAUGES: &[(&str, &str)] = &[
     (
-        "pattern_rewrite_ranges_total",
-        "Ranges the current or last rewrite of wide segments was split into",
-    ),
-    (
-        "pattern_rewrite_ranges_done",
-        "Ranges of that rewrite moved so far",
+        "pattern_rewrite_steps_total",
+        "Repair steps since the index was created",
     ),
     (
         "pattern_rewrite_docs_total",
-        "Rows moved by rewrites since the index was created",
+        "Rows moved by repair steps since the index was created",
     ),
     (
-        "pattern_l0_docs",
-        "Rows in wide segments when the current or last rewrite was planned",
+        "pattern_rewrite_pending",
+        "1 while the index has fresh rows, or an ordered stretch past the cap, to repair",
     ),
 ];
 
@@ -161,6 +158,14 @@ pub(crate) const PATTERN_LAYOUT_GAUGES: &[(&str, &str)] = &[
     (
         "pattern_layout_rows_deleted",
         "Deleted rows whose postings a search still reads until a merge drops them",
+    ),
+    (
+        "pattern_layout_fresh_rows",
+        "Rows of a pattern index not yet repaired into its ordered segments",
+    ),
+    (
+        "pattern_layout_fresh_segments",
+        "Segments holding those rows",
     ),
 ];
 

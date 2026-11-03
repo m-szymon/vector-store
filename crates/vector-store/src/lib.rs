@@ -841,8 +841,9 @@ fn parse_flag(name: &str, s: &str) -> anyhow::Result<bool> {
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
 )]
-/// Whether a pattern index rewrites wide segments into range-aligned ones (P3b): the `rewrite`
-/// option, on by default for an index with `order_by` and a segment cap.
+/// Whether a pattern index repairs the rows that arrived out of sort order into segments
+/// disjoint in sort order: the `rewrite` option, on by default for an index with `order_by` and
+/// a segment cap.
 pub struct RewriteWideSegments(bool);
 
 impl FromStr for RewriteWideSegments {
@@ -1034,8 +1035,8 @@ pub struct IndexOptionsPattern {
     /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
     /// default policy. The `segment_rows` option.
     pub segment_max_docs: SegmentMaxDocs,
-    /// Rewrite segments that span far more of the sort range than their share of the rows
-    /// (P3b: an index built by a full scan, or a shuffled load) into range-aligned ones of
+    /// Repair the rows that arrived out of sort order (an index built by a full scan, a shuffled
+    /// load, writes over the range) into segments disjoint in sort order, of at most
     /// `segment_max_docs` rows. Needs the cap. The `rewrite` option.
     pub rewrite_wide_segments: RewriteWideSegments,
     /// How many of a long keyword's rarest grams are intersected; none for all. The

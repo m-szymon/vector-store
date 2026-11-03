@@ -373,6 +373,55 @@ re-indexed once. Unmeasured at 10M; the plan for that is the `names_10M_backfill
 `aws_variants_config.yaml`, an index created after the load with the rewrite on against one
 without.
 
+### Two tiers and a continuous repair (2026-11-03; replaces the plan of P3b)
+
+The widths above told the rows still to be placed from the ones already placed by a segment's
+span, and that guess failed at the boundary: a remainder of a drained segment holding a few rows
+of ranges not moved yet looked narrow, merged with placed pieces into a near-full segment no
+step drained, and segments overlapped for good. A local run with a few-values column ended
+overlapping two runs in eight; a 10M load in table order settled at 435 segments. The layout is
+now two tiers, told apart by where the rows came from rather than by their span:
+
+- **Ordered**: segments a repair step placed (every row carries `repaired = 1`, a fast field of
+  ordered indexes), and segments that overlapped no other when first seen, which are where they
+  belong whoever placed them: rows inserted in sort order once merged, a build by full scan in
+  table order. Those are adopted, in memory, as is what a merge of ordered segments produces
+  (the merge's future names its output); once adopted a segment stays ordered, so fresh rows
+  arriving over its stretch later are rows to repair into it, not a reason to rewrite it.
+- **Fresh**: everything else, the pieces commits leave.
+
+No merge mixes them. Ordered merges take overlapping segments (a *cluster*: the pieces of one
+repair step, or a segment with the rows later repaired into its stretch) whole, alone up to the
+cap, with their neighbours while within three quarters of it, so that fresh rows fit beside a
+segment before it has to be split; neighbours have no ordered segment between them, so the tier
+stays disjoint. Fresh segments merge in runs by lowest key under the cap, full ones left out. A
+segment whose deleted rows outnumber its live ones is merged on its own, which drops them.
+
+The repair is continuous, worst first. The ordered clusters cut the key space into stretches
+(each cluster's own, and the gaps between); a stretch is as bad as the fresh rows in it,
+estimated from a sample of the fresh tier's keys, and a cluster past the cap counts its own
+rows. A step takes the worst stretch, at most a cap of its fresh rows from its lowest keys, and,
+under the writer lock as before, deletes and re-adds them as repaired: in a gap they make a
+cluster of their own, in a cluster's stretch they overlap it and merge into it. Rows that would
+not fit beside the cluster under the cap are moved with the cluster's own, in parts of half a cap
+over disjoint key ranges, one commit each. An idle tick always takes a step, so an idle index
+converges to an empty fresh tier and a disjoint ordered one; while the index ingests, a step
+waits until the fresh tier holds two caps and then takes at most half of the time, so a burst of
+writes grows the fresh tier, which searches pay for with an open per fresh segment, rather than
+the lag.
+
+`/metrics` has `pattern_rewrite_steps_total`, `pattern_rewrite_docs_total` and
+`pattern_rewrite_pending` (an index has settled once nothing is pending and no merge runs), and
+the layout's `pattern_layout_fresh_rows` and `pattern_layout_fresh_segments` beside its overlap
+depth. In-process: the few-values tests are stable (eight runs of eight); shuffled loads end
+with no fresh rows and depth 1; deletes and updates during the repair are kept, an update
+moving a row's sort value takes it to its new place, and most rows deleted compact to a few
+segments with no deleted row left.
+
+Known costs: rows that arrive out of sort order are indexed twice, once by the ingest and once
+by the repair, as they were by the rewrite; and fresh rows repaired into a full stretch rewrite
+the stretch's rows too, at most every quarter of a cap of inflow.
+
 ### Measured at 10M names (AWS, 2026-09-27, one run, six index variants)
 
 i4i.xlarge Scylla, c8g.xlarge vector-store (4 cores), 20 rows per page, 10k queries/s offered

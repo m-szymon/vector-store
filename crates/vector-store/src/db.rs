@@ -626,7 +626,7 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
     } else {
         SegmentMaxDocs::default()
     };
-    // `rewrite` rewrites wide segments into range-aligned ones, which needs the cap. On by
+    // `rewrite` repairs rows out of sort order into disjoint segments, which needs the cap. On by
     // default wherever there is a cap: an index created on a loaded table is unusable for
     // ordered queries until it runs.
     let rewrite_wide_segments: RewriteWideSegments = if options.contains_key("rewrite") {

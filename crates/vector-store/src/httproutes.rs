@@ -688,10 +688,9 @@ async fn refresh_index_metrics(
         }
         let rewrite = stats.rewrite;
         let progress = [
-            rewrite.ranges_total as f64,
-            rewrite.ranges_done as f64,
+            rewrite.steps as f64,
             rewrite.docs_rewritten as f64,
-            rewrite.l0_docs as f64,
+            f64::from(u8::from(rewrite.pending)),
         ];
         for (gauge, value) in state.metrics.pattern_rewrite.iter().zip(progress) {
             gauge.with_label_values(&labels).set(value);
@@ -715,6 +714,8 @@ async fn refresh_index_metrics(
             },
             overlap.rows_over_tolerance as f64,
             overlap.rows_deleted as f64,
+            overlap.fresh_rows as f64,
+            overlap.fresh_segments as f64,
         ];
         for (gauge, value) in state.metrics.pattern_layout.iter().zip(layout) {
             gauge.with_label_values(&labels).set(value);
