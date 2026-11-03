@@ -44,6 +44,9 @@ pub(crate) struct Metrics {
     pub pattern_rewrite: Vec<GaugeVec>,
     /// The merges a pattern index's ticks ask for. One entry per [`PATTERN_MERGE_GAUGES`].
     pub pattern_merges: Vec<GaugeVec>,
+    /// How far a pattern index's segments are from disjoint. One entry per
+    /// [`PATTERN_LAYOUT_GAUGES`].
+    pub pattern_layout: Vec<GaugeVec>,
     /// The worker pool's totals per task class, read off `worker::STATS` on scrape. One entry
     /// per [`WORKER_GAUGES`].
     pub worker: Vec<GaugeVec>,
@@ -136,6 +139,28 @@ pub(crate) const PATTERN_MERGE_GAUGES: &[(&str, &str)] = &[
     (
         "pattern_merges_running",
         "Merges a pattern index asked for that are still running",
+    ),
+];
+
+/// The gauges of how far a pattern index's segments are from disjoint, in the order
+/// `pattern_layout` holds them (see `LayoutOverlap`). A depth of 1 is a disjoint layout, what an
+/// ordered walk prunes best; the unordered index reports only its deleted rows.
+pub(crate) const PATTERN_LAYOUT_GAUGES: &[(&str, &str)] = &[
+    (
+        "pattern_layout_depth_max",
+        "Most segments of a pattern index covering one sort key",
+    ),
+    (
+        "pattern_layout_depth_mean",
+        "Segments covering a row's stretch of sort keys, averaged over rows",
+    ),
+    (
+        "pattern_layout_rows_over_tolerance",
+        "Rows in segments covered more than twice over",
+    ),
+    (
+        "pattern_layout_rows_deleted",
+        "Deleted rows whose postings a search still reads until a merge drops them",
     ),
 ];
 
@@ -359,6 +384,16 @@ impl Metrics {
                 .unwrap()
             })
             .collect::<Vec<_>>();
+        let pattern_layout = PATTERN_LAYOUT_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
         let pattern_segment_layout = PATTERN_SEGMENT_GAUGES
             .iter()
             .map(|(name, help)| {
@@ -400,6 +435,7 @@ impl Metrics {
             .iter()
             .chain(pattern_rewrite.iter())
             .chain(pattern_merges.iter())
+            .chain(pattern_layout.iter())
             .chain(worker.iter())
             .chain(pattern_segment_layout.iter())
         {
@@ -423,6 +459,7 @@ impl Metrics {
             pattern_search_totals,
             pattern_rewrite,
             pattern_merges,
+            pattern_layout,
             worker,
             pattern_segment_layout,
             dirty_indexes: Arc::new(DashSet::new()),
@@ -516,6 +553,7 @@ impl Metrics {
             .iter()
             .chain(self.pattern_rewrite.iter())
             .chain(self.pattern_merges.iter())
+            .chain(self.pattern_layout.iter())
         {
             let _ = gauge.remove_label_values(&[keyspace, index_name]);
         }
@@ -930,10 +968,17 @@ mod tests {
         metrics.pattern_merges[2]
             .with_label_values(&["ks", "idx"])
             .set(1.0);
+        metrics.pattern_layout[0]
+            .with_label_values(&["ks", "idx"])
+            .set(3.0);
 
         let output = metric_families_text(&metrics);
         assert!(
             output.contains(r#"pattern_merges_running{index_name="idx",keyspace="ks"} 1"#),
+            "expected observed value in export:\n{output}"
+        );
+        assert!(
+            output.contains(r#"pattern_layout_depth_max{index_name="idx",keyspace="ks"} 3"#),
             "expected observed value in export:\n{output}"
         );
         assert!(

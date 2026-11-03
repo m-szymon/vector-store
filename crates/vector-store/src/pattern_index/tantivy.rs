@@ -784,7 +784,66 @@ pub(crate) struct PatternStats {
     pub(crate) walk: WalkTotals,
     pub(crate) rewrite: RewriteTotals,
     pub(crate) merges: MergeTotals,
+    pub(crate) overlap: LayoutOverlap,
     pub(crate) segments: Vec<SegmentLayout>,
+}
+
+/// How many segments may cover one key before the rows there count as misplaced: a value that
+/// fills more than a segment, or a boundary two neighbours share, puts a key in two segments
+/// even when the layout is as good as it gets.
+const OVERLAP_TOLERANCE: u32 = 2;
+
+/// How far an ordered index's segments are from disjoint, by their layout-key bounds. A
+/// segment's depth is the most segments covering any one key within its bounds: what an ordered
+/// walk through that stretch has to open where one would do. 1 everywhere is a disjoint layout;
+/// the wide pieces a commit leaves over the whole range give every segment the depth of their
+/// count. Zero for an unordered index, which keeps no bounds, but for the deleted rows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayoutOverlap {
+    /// The deepest any key is covered.
+    pub(crate) depth_max: u32,
+    /// Live rows summed over segments, each segment's weighted by its depth: over `rows`, the
+    /// depth a row sits at on average.
+    pub(crate) depth_rows: u64,
+    /// Live rows in the segments with bounds.
+    pub(crate) rows: u64,
+    /// Live rows in segments deeper than `OVERLAP_TOLERANCE`.
+    pub(crate) rows_over_tolerance: u64,
+    /// Deleted rows not yet merged away: a search still reads their postings.
+    pub(crate) rows_deleted: u64,
+}
+
+/// [`LayoutOverlap`] of `segments`, given as `(docs, layout_min, layout_max, id)` with inclusive
+/// bounds. Empty segments are left out.
+fn layout_overlap(segments: &[(u32, u128, u128, SegmentId)]) -> LayoutOverlap {
+    let segments: Vec<_> = segments.iter().filter(|s| s.0 > 0).collect();
+    let mut starts: Vec<u128> = segments.iter().map(|s| s.1).collect();
+    let mut ends: Vec<u128> = segments.iter().map(|s| s.2).collect();
+    starts.sort_unstable();
+    ends.sort_unstable();
+    // The depth at a key is the segments starting at or before it less those ending before it.
+    // Within any span it peaks at some segment's start, so the starts are the keys to look at.
+    let depths: Vec<u32> = starts
+        .iter()
+        .map(|&key| {
+            (starts.partition_point(|&start| start <= key) - ends.partition_point(|&end| end < key))
+                as u32
+        })
+        .collect();
+    let mut overlap = LayoutOverlap::default();
+    for &&(docs, min, max, _) in &segments {
+        let from = starts.partition_point(|&start| start < min);
+        let to = starts.partition_point(|&start| start <= max);
+        let depth = depths[from..to].iter().copied().max().unwrap_or(1);
+        let docs = u64::from(docs);
+        overlap.depth_max = overlap.depth_max.max(depth);
+        overlap.depth_rows += docs * u64::from(depth);
+        overlap.rows += docs;
+        if depth > OVERLAP_TOLERANCE {
+            overlap.rows_over_tolerance += docs;
+        }
+    }
+    overlap
 }
 
 pub(crate) type PatternStatsR = anyhow::Result<PatternStats>;
@@ -1926,11 +1985,22 @@ fn handle_pattern_stats(state: &PatternIndexState) -> PatternStatsR {
             })
         })
         .collect::<anyhow::Result<_>>()?;
+    let mut overlap = if state.backend().orders_results() {
+        layout_overlap(&state.backend().geometry(&searcher))
+    } else {
+        LayoutOverlap::default()
+    };
+    overlap.rows_deleted = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| u64::from(segment.num_deleted_docs()))
+        .sum();
     Ok(PatternStats {
         tantivy,
         walk: state.backend().walk.snapshot(),
         rewrite: state.backend().rewrite_totals(),
         merges: state.backend().merging.lock().unwrap().totals(),
+        overlap,
         segments,
     })
 }
@@ -2881,6 +2951,10 @@ mod tests {
             let (min, max) = (segment.sort_min.unwrap(), segment.sort_max.unwrap());
             assert!(min <= max, "segment bounds inverted: {segment:?}");
         }
+        let overlap = before.overlap;
+        assert_eq!(overlap.rows, before.tantivy.num_docs);
+        assert!(overlap.depth_max >= 1, "{overlap:?}");
+        assert!(overlap.depth_rows >= overlap.rows, "{overlap:?}");
 
         search_ordered(&sender, "将军", 2, SearchWindow::default()).await;
 
@@ -2935,6 +3009,67 @@ mod tests {
         merging.started(vec![id(1), id(2)], merge);
         drop(failed);
         assert!(merging.busy().is_empty());
+    }
+
+    /// Disjoint segments sit at depth 1, and neighbours sharing a boundary key at 2, within the
+    /// tolerance; the depth counts the segments over the deepest key of a segment's span, so a
+    /// wide one over narrow ones deepens them all, and a second wide one takes them over it.
+    #[test]
+    fn layout_overlap_counts_the_segments_over_each_key() {
+        let disjoint = [
+            (100, 0, 9, id(1)),
+            (100, 10, 19, id(2)),
+            (100, 20, 29, id(3)),
+        ];
+        assert_eq!(
+            layout_overlap(&disjoint),
+            LayoutOverlap {
+                depth_max: 1,
+                depth_rows: 300,
+                rows: 300,
+                ..LayoutOverlap::default()
+            }
+        );
+
+        // A layout key ties the sort value with the second slot, so one value filling several
+        // segments still leaves them disjoint; three meeting at one key is past the tolerance.
+        let shared = [
+            (100, 0, 10, id(1)),
+            (100, 10, 10, id(2)),
+            (100, 10, 29, id(3)),
+        ];
+        let overlap = layout_overlap(&shared);
+        assert_eq!((overlap.depth_max, overlap.rows_over_tolerance), (3, 300));
+        let neighbours = [(100, 0, 10, id(1)), (100, 10, 29, id(2))];
+        let overlap = layout_overlap(&neighbours);
+        assert_eq!((overlap.depth_max, overlap.rows_over_tolerance), (2, 0));
+
+        let mut covered = disjoint.to_vec();
+        covered.push((50, 0, 29, id(4)));
+        let overlap = layout_overlap(&covered);
+        assert_eq!(
+            (
+                overlap.depth_max,
+                overlap.depth_rows,
+                overlap.rows_over_tolerance
+            ),
+            (2, 2 * 350, 0)
+        );
+        covered.push((50, 5, 25, id(5)));
+        let overlap = layout_overlap(&covered);
+        assert_eq!(
+            (
+                overlap.depth_max,
+                overlap.depth_rows,
+                overlap.rows_over_tolerance
+            ),
+            (3, 3 * 400, 400)
+        );
+
+        // An empty segment covers nothing.
+        let emptied = [(100, 0, 9, id(1)), (0, 0, 9, id(2))];
+        assert_eq!(layout_overlap(&emptied).depth_max, 1);
+        assert_eq!(layout_overlap(&[]), LayoutOverlap::default());
     }
 
     /// Neighbours in sort order merge while under the cap; a full segment stands alone and ends
