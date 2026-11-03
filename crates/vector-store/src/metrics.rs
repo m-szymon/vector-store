@@ -44,6 +44,9 @@ pub(crate) struct Metrics {
     pub pattern_rewrite: Vec<GaugeVec>,
     /// The merges a pattern index's ticks ask for. One entry per [`PATTERN_MERGE_GAUGES`].
     pub pattern_merges: Vec<GaugeVec>,
+    /// The worker pool's totals per task class, read off `worker::STATS` on scrape. One entry
+    /// per [`WORKER_GAUGES`].
+    pub worker: Vec<GaugeVec>,
     /// A pattern index's segments, one label set per segment ordinal: how many rows each holds
     /// and the span of sort keys its pruning is judged by. See [`PATTERN_SEGMENT_GAUGES`].
     pub pattern_segment_layout: Vec<GaugeVec>,
@@ -133,6 +136,22 @@ pub(crate) const PATTERN_MERGE_GAUGES: &[(&str, &str)] = &[
     (
         "pattern_merges_running",
         "Merges a pattern index asked for that are still running",
+    ),
+];
+
+/// The worker pool's gauges, in the order `worker` holds them, labelled by task class ('search',
+/// 'indexing'). Totals since the process started, so a client diffs two scrapes: queue seconds
+/// over tasks is the mean wait, and a sustained wait in both classes is a node too small for its
+/// load (see `worker`).
+pub(crate) const WORKER_GAUGES: &[(&str, &str)] = &[
+    ("worker_tasks_total", "Tasks the worker pool ran"),
+    (
+        "worker_queue_wait_seconds_total",
+        "Time those tasks waited in the worker pool's queue",
+    ),
+    (
+        "worker_busy_seconds_total",
+        "Time those tasks ran on the worker pool",
     ),
 ];
 
@@ -324,6 +343,12 @@ impl Metrics {
                 .unwrap()
             })
             .collect::<Vec<_>>();
+        let worker = WORKER_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(prometheus::Opts::new(*name, *help), &["class"]).unwrap()
+            })
+            .collect::<Vec<_>>();
         let pattern_merges = PATTERN_MERGE_GAUGES
             .iter()
             .map(|(name, help)| {
@@ -375,6 +400,7 @@ impl Metrics {
             .iter()
             .chain(pattern_rewrite.iter())
             .chain(pattern_merges.iter())
+            .chain(worker.iter())
             .chain(pattern_segment_layout.iter())
         {
             registry.register(Box::new(gauge.clone())).unwrap();
@@ -397,6 +423,7 @@ impl Metrics {
             pattern_search_totals,
             pattern_rewrite,
             pattern_merges,
+            worker,
             pattern_segment_layout,
             dirty_indexes: Arc::new(DashSet::new()),
             pattern_segments_exported: Arc::new(DashMap::new()),
@@ -405,6 +432,15 @@ impl Metrics {
 
     /// Replace the segment label sets of one pattern index with `segments`, dropping the
     /// ordinals a merge has retired since the last scrape.
+    /// Copies the worker pool's totals into the `worker_*` gauges.
+    pub(crate) fn set_worker_totals(&self) {
+        for (class, tasks, queued, busy) in crate::worker::STATS.snapshot() {
+            for (gauge, value) in self.worker.iter().zip([tasks as f64, queued, busy]) {
+                gauge.with_label_values(&[class.name()]).set(value);
+            }
+        }
+    }
+
     pub(crate) fn set_pattern_segments(
         &self,
         keyspace: &str,
@@ -920,6 +956,26 @@ mod tests {
             !output.contains(r#"index_name="idx""#),
             "the index's series should be removed, got:\n{output}"
         );
+    }
+
+    #[test]
+    fn worker_totals_are_exported_by_class() {
+        let metrics = Metrics::new();
+        metrics.set_worker_totals();
+
+        let output = metric_families_text(&metrics);
+        for name in [
+            "worker_tasks_total",
+            "worker_queue_wait_seconds_total",
+            "worker_busy_seconds_total",
+        ] {
+            for class in ["search", "indexing"] {
+                assert!(
+                    output.contains(&format!(r#"{name}{{class="{class}"}}"#)),
+                    "{name} for {class} missing from export:\n{output}"
+                );
+            }
+        }
     }
 
     #[test]

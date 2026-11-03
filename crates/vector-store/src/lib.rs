@@ -220,6 +220,12 @@ pub struct Config {
     pub vector_store_addr: std::net::SocketAddr,
     pub scylladb_uri: String,
     pub threads: Option<usize>,
+    /// How long the oldest indexing task may wait while searches are served first; see
+    /// `worker::Scheduling`. `None`: zero, indexing first.
+    pub indexing_queue_budget: Option<Duration>,
+    /// The minimum share of the workers' time, in percent, searches get while they wait; see
+    /// `worker::Scheduling`. `None`: `worker::DEFAULT_MIN_SEARCH_SHARE`.
+    pub min_search_share_pct: Option<u8>,
     pub memory_limit: Option<u64>,
     pub memory_usage_check_interval: Option<Duration>,
     pub opensearch_addr: Option<String>,
@@ -257,6 +263,8 @@ impl Default for Config {
             vector_store_addr: "127.0.0.1:6080".parse().unwrap(),
             scylladb_uri: "127.0.0.1:9042".to_string(),
             threads: None,
+            indexing_queue_budget: None,
+            min_search_share_pct: None,
             memory_limit: None,
             memory_usage_check_interval: None,
             opensearch_addr: None,
@@ -1306,7 +1314,18 @@ pub async fn run(
     let db_driver = db_driver::new_scylla();
     let internals = internals::new(db_driver.clone());
     let memory = memory::new(internals.clone(), config_rx.clone());
-    let worker = worker::new();
+    let worker = {
+        let config = config_rx.borrow();
+        let defaults = worker::Scheduling::default();
+        worker::with_scheduling(worker::Scheduling {
+            indexing_queue_budget: config
+                .indexing_queue_budget
+                .unwrap_or(defaults.indexing_queue_budget),
+            min_search_share: config
+                .min_search_share_pct
+                .map_or(defaults.min_search_share, |pct| f64::from(pct) / 100.0),
+        })
+    };
 
     let vs_index_factory = if let Some(addr) = opensearch_addr {
         tracing::info!("Using OpenSearch index factory at {addr}");

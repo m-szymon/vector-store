@@ -743,6 +743,7 @@ async fn get_metrics(
         let index_name = IndexName::from(index_name_str);
         refresh_index_metrics(&state, keyspace, index_name).await;
     }
+    state.metrics.set_worker_totals();
     let metric_families = state.metrics.registry.gather();
 
     // Decide which encoder and content-type to use
