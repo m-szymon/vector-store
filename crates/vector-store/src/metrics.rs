@@ -101,6 +101,10 @@ pub(crate) const PATTERN_SEARCH_TOTALS: &[(&str, &str)] = &[
         "pattern_search_page_resolve_seconds_total",
         "Time pattern searches spent turning the page into primary ids (part of the walk time), summed over searches",
     ),
+    (
+        "pattern_search_segments_wasted_total",
+        "Segments an ordered pattern search opened that put no row on its page, summed over searches",
+    ),
 ];
 
 /// The gauges of the repair of a pattern index's layout, in the order `pattern_rewrite` holds

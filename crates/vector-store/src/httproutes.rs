@@ -682,6 +682,7 @@ async fn refresh_index_metrics(
             walk.column_opens as f64,
             walk.prepare_nanos as f64 / 1e9,
             walk.page_resolve_nanos as f64 / 1e9,
+            walk.segments_wasted as f64,
         ];
         for (gauge, value) in state.metrics.pattern_search_totals.iter().zip(totals) {
             gauge.with_label_values(&labels).set(value);

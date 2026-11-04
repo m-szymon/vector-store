@@ -416,6 +416,12 @@ tick waited under 1 ms on average). A step holds the writer lock, so the writes 
 back the queue up and the next tick holds off: a burst of writes grows the fresh tier, which
 searches pay for with an open per fresh segment, rather than the lag.
 
+The searches say where the overlap costs them. An ordered search counts the segments it opened
+that put no row on its page (`pattern_search_segments_wasted_total`), and the last 4096 that
+wasted any are kept with the layout key their page ended at. A stretch's fresh rows count up to
+nine times as much in the repair's choice where those searches went, so the stretches searched
+most are repaired first; heat alone, over a stretch with no fresh rows, is not worth a step.
+
 Locally, 10M rows by full scan in table order (4 cores, `a_fast_loaded_table_order_index_settles_and_stops_when_dropped`):
 
 | | rewrite plan (`8e5e26f`) | repair during the scan, at most half of the time | repair after the scan |

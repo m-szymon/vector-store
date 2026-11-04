@@ -41,6 +41,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -226,6 +227,8 @@ struct PatternBackend {
     /// were found (see `ordered_tier`), or merged from ordered segments. In memory only, as the
     /// index is; a segment a merge retired is dropped from it by `prune_columns`.
     adopted: Mutex<HashSet<SegmentId>>,
+    /// Where the recent searches opened segments in vain: see [`Heat`].
+    heat: Mutex<Heat>,
     /// Set when a row of a full scan is added, and taken by the next tick: the repair waits for
     /// the scan to end (see `maybe_repair`).
     scan_rows: AtomicBool,
@@ -445,6 +448,34 @@ fn merge_runs(pieces: &[Piece], cap: u32) -> Vec<(Vec<SegmentId>, bool)> {
     runs
 }
 
+/// Searches kept: the heat is over the most recent ones.
+const HEAT_SEARCHES: usize = 4096;
+/// How much more a fresh row counts in the stretch where all the searches opened segments in
+/// vain than in one where none did.
+const HEAT_BOOST: u64 = 8;
+
+/// Where the recent ordered searches that opened segments in vain went: the layout key their
+/// page ended at, and how many segments they opened that put no row on it. Those are what an
+/// overlapping stretch costs, and only where searches go, so the repair takes the stretches that
+/// cost searches the most first. In memory only, over the last `HEAT_SEARCHES` such searches.
+#[derive(Debug, Default)]
+struct Heat {
+    searches: VecDeque<(u128, u64)>,
+}
+
+impl Heat {
+    fn record(&mut self, key: u128, wasted: u64) {
+        if self.searches.len() == HEAT_SEARCHES {
+            self.searches.pop_front();
+        }
+        self.searches.push_back((key, wasted));
+    }
+
+    fn snapshot(&self) -> Vec<(u128, u64)> {
+        self.searches.iter().copied().collect()
+    }
+}
+
 /// A repair step's work: the fresh rows with layout keys in `low..=high`, and with them the rows
 /// of `cluster` -- the ordered segments of the stretch the range is in, if any -- when those would
 /// not fit beside the cluster under the cap.
@@ -461,12 +492,15 @@ struct RepairRange {
 /// between clusters. A stretch is as bad as the fresh rows in it -- every search through it opens
 /// the fresh segments as well as the ordered one -- estimated from `fresh_keys`, a sorted sample of
 /// the fresh tier's keys each standing for `weight` rows; a cluster past the cap counts its own
-/// rows too, as it overlaps itself until split. The worst stretch is repaired, at most a cap of
-/// its fresh rows at a time, lowest keys first. Pure, so it can be tested without an index.
+/// rows too, as it overlaps itself until split. The fresh rows weigh more where the recent
+/// searches opened segments in vain (`heat`, see [`Heat`]): up to `1 + HEAT_BOOST` times in the
+/// stretch where all of them did. The worst stretch is repaired, at most a cap of its fresh rows
+/// at a time, lowest keys first. Pure, so it can be tested without an index.
 fn plan_repair(
     pieces: &[Piece],
     fresh_keys: &[u128],
     weight: u64,
+    heat: &[(u128, u64)],
     cap: u32,
 ) -> Option<RepairRange> {
     let ordered = ordered_tier(pieces);
@@ -490,9 +524,18 @@ fn plan_repair(
         keys[stretch] = (from, to);
         from = to;
     }
+    let mut wasted = vec![0u64; keys.len()];
+    for &(key, opens) in heat {
+        wasted[stretch_of(key)] += opens;
+    }
+    let all_wasted: u64 = wasted.iter().sum();
     let score = |stretch: usize| {
         let (from, to) = keys[stretch];
         let fresh = (to - from) as u64 * weight;
+        let fresh = fresh
+            + (fresh * HEAT_BOOST * wasted[stretch])
+                .checked_div(all_wasted)
+                .unwrap_or(0);
         let overfull = (stretch % 2 == 1)
             .then(|| &clusters[stretch / 2])
             .filter(|cluster| cluster.docs > u64::from(cap))
@@ -840,6 +883,7 @@ struct WalkCounters {
     heap_entrants: AtomicU64,
     store_reads: AtomicU64,
     column_opens: AtomicU64,
+    segments_wasted: AtomicU64,
     walk_nanos: AtomicU64,
     prepare_nanos: AtomicU64,
     page_resolve_nanos: AtomicU64,
@@ -854,6 +898,8 @@ struct WalkTally {
     heap_entrants: u64,
     store_reads: u64,
     column_opens: u64,
+    /// Segments opened that put no row on the page.
+    segments_wasted: u64,
 }
 
 /// How long the parts of one search took.
@@ -876,6 +922,8 @@ impl WalkCounters {
         self.heap_entrants.fetch_add(tally.heap_entrants, Relaxed);
         self.store_reads.fetch_add(tally.store_reads, Relaxed);
         self.column_opens.fetch_add(tally.column_opens, Relaxed);
+        self.segments_wasted
+            .fetch_add(tally.segments_wasted, Relaxed);
         let nanos = |d: Duration| d.as_nanos().try_into().unwrap_or(u64::MAX);
         self.walk_nanos.fetch_add(nanos(times.walk), Relaxed);
         self.prepare_nanos.fetch_add(nanos(times.prepare), Relaxed);
@@ -892,6 +940,7 @@ impl WalkCounters {
             heap_entrants: self.heap_entrants.load(Relaxed),
             store_reads: self.store_reads.load(Relaxed),
             column_opens: self.column_opens.load(Relaxed),
+            segments_wasted: self.segments_wasted.load(Relaxed),
             walk_nanos: self.walk_nanos.load(Relaxed),
             prepare_nanos: self.prepare_nanos.load(Relaxed),
             page_resolve_nanos: self.page_resolve_nanos.load(Relaxed),
@@ -910,6 +959,9 @@ pub(crate) struct WalkTotals {
     pub(crate) store_reads: u64,
     /// Columns opened, i.e. misses of the per-segment column cache.
     pub(crate) column_opens: u64,
+    /// Segments an ordered search opened that put no row on its page: what the overlap of the
+    /// layout costs the searches, where they go.
+    pub(crate) segments_wasted: u64,
     pub(crate) walk_nanos: u64,
     /// Time spent before the first posting: reading every segment's bounds. Part of `walk_nanos`.
     pub(crate) prepare_nanos: u64,
@@ -1448,7 +1500,8 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
         }
     }
     sample.sort_unstable();
-    let Some(range) = plan_repair(&pieces, &sample, stride, cap) else {
+    let heat = backend.heat.lock().unwrap().snapshot();
+    let Some(range) = plan_repair(&pieces, &sample, stride, &heat, cap) else {
         return Ok(false);
     };
 
@@ -1538,6 +1591,7 @@ fn new_index(
         columns: RwLock::new(HashMap::new()),
         repair: RepairCounters::default(),
         adopted: Mutex::new(HashSet::new()),
+        heat: Mutex::new(Heat::default()),
         scan_rows: AtomicBool::new(false),
         ticks_since_scan: AtomicU32::new(SCAN_QUIET_TICKS),
         indexing_before: Mutex::new(worker::STATS.indexing()),
@@ -1936,6 +1990,9 @@ impl Ties<'_> {
 struct PageEntry {
     prefix: SortPrefix,
     primary_id: u64,
+    /// The ordinal of the segment the row is in, to tell the segments the page needed from the
+    /// ones it opened in vain.
+    segment: u32,
 }
 
 /// The best `limit` rows so far, best first, in walk orientation with exact ties broken by key.
@@ -2045,7 +2102,7 @@ fn collect_matches_ordered(
         ties: &ties,
     };
     let mut candidates: Vec<(SortPrefix, u32)> = Vec::new();
-    for (_segment_ord, segment, columns, upper_bound) in segments {
+    for (segment_ord, segment, columns, upper_bound) in segments {
         if let Some(weakest) = page.weakest()
             && upper_bound < weakest.prefix.layout_key()
         {
@@ -2061,7 +2118,11 @@ fn collect_matches_ordered(
         // The row's entry if it is in the window and enters the page; its id is read only then.
         let entry_of = |page: &Page, prefix: SortPrefix, doc_id: u32| -> Option<PageEntry> {
             let primary_id = columns.primary_id.first(doc_id).unwrap_or(0);
-            let entry = PageEntry { prefix, primary_id };
+            let entry = PageEntry {
+                prefix,
+                primary_id,
+                segment: segment_ord,
+            };
             (window.below_cursor(prefix, || key_of(primary_id.into()), &ties) && page.takes(&entry))
                 .then_some(entry)
         };
@@ -2135,6 +2196,16 @@ fn collect_matches_ordered(
     // so there is nothing left to resume from and a cursor would only cost the caller an empty
     // round trip. (Rows dropped later, in `handle_search`, shorten the page after this point and
     // must not suppress the cursor -- which is why this asks the page, not the returned rows.)
+    let needed: HashSet<u32> = page.entries.iter().map(|entry| entry.segment).collect();
+    tally.segments_wasted = tally.segments_opened - needed.len() as u64;
+    if tally.segments_wasted > 0
+        && let Some(weakest) = page.weakest()
+    {
+        state.backend().heat.lock().unwrap().record(
+            window.unorient(weakest.prefix).layout_key(),
+            tally.segments_wasted,
+        );
+    }
     let resolving = Instant::now();
     let resume_at = page.weakest().map(|weakest| Cursor {
         prefix: window.unorient(weakest.prefix),
@@ -3249,6 +3320,8 @@ mod tests {
         let walk = after.walk;
         assert_eq!(walk.searches, 1);
         assert!(walk.segments_opened >= 1 && walk.segments_opened <= walk.segments_considered);
+        // The page is not empty, so at least one segment opened was needed.
+        assert!(walk.segments_wasted < walk.segments_opened, "{walk:?}");
         // Two of the three matches fill the page; the third enters only if its segment was not
         // pruned by then, which depends on how the documents were merged.
         assert!(walk.postings_scanned >= 2, "{walk:?}");
@@ -3491,16 +3564,16 @@ mod tests {
     #[test]
     fn the_repair_takes_the_worst_stretch_first() {
         let cap = 100;
-        assert_eq!(plan_repair(&[], &[], 1, cap), None);
+        assert_eq!(plan_repair(&[], &[], 1, &[], cap), None);
         // Nothing fresh, nothing past the cap: nothing to do.
         let settled = [ordered(50, 0, 99, 1), ordered(50, 100, 199, 2)];
-        assert_eq!(plan_repair(&settled, &[], 1, cap), None);
+        assert_eq!(plan_repair(&settled, &[], 1, &[], cap), None);
 
         // Everything fresh: one gap; 300 sampled keys a row each, so the first 100.
         let fresh = [piece(150, 0, 299, 1), piece(150, 0, 299, 2)];
         let keys: Vec<u128> = (0..300).collect();
         assert_eq!(
-            plan_repair(&fresh, &keys, 1, cap),
+            plan_repair(&fresh, &keys, 1, &[], cap),
             Some(RepairRange {
                 low: 0,
                 high: 99,
@@ -3509,7 +3582,7 @@ mod tests {
         );
         // Each sampled key standing for 10 rows: 10 keys make a cap.
         assert_eq!(
-            plan_repair(&fresh, &keys, 10, cap).map(|range| (range.low, range.high)),
+            plan_repair(&fresh, &keys, 10, &[], cap).map(|range| (range.low, range.high)),
             Some((0, 9))
         );
 
@@ -3520,24 +3593,44 @@ mod tests {
             piece(40, 0, 500, 3),
         ];
         let keys = [10, 150, 310, 320, 330, 450];
-        let range = plan_repair(&pieces, &keys, 1, cap).unwrap();
+        let range = plan_repair(&pieces, &keys, 1, &[], cap).unwrap();
         assert_eq!((range.low, range.high), (300, 399));
         assert_eq!(range.cluster.map(|cluster| cluster.ids), Some(vec![id(2)]));
         // Most of them in the gap between: the range is the gap's.
         let keys = [150, 210, 220, 230, 310];
-        let range = plan_repair(&pieces, &keys, 1, cap).unwrap();
+        let range = plan_repair(&pieces, &keys, 1, &[], cap).unwrap();
         assert_eq!((range.low, range.high, range.cluster), (200, 299, None));
         // Above everything: up to the top of the key space.
         let keys = [410, 420];
-        let range = plan_repair(&pieces, &keys, 1, cap).unwrap();
+        let range = plan_repair(&pieces, &keys, 1, &[], cap).unwrap();
         assert_eq!((range.low, range.high), (400, u128::MAX));
+    }
+
+    /// Of two stretches with as many fresh rows, the one where searches opened segments in vain
+    /// goes first; heat over a stretch with no fresh rows does not make it worth a step.
+    #[test]
+    fn the_repair_takes_the_stretch_searches_pay_for_first() {
+        let cap = 100;
+        let pieces = [ordered(50, 100, 199, 1), piece(40, 0, 500, 2)];
+        // Twice as many fresh rows below the cluster as above it.
+        let keys = [10, 20, 30, 40, 300, 310];
+        let range = plan_repair(&pieces, &keys, 1, &[], cap).unwrap();
+        assert_eq!((range.low, range.high), (0, 99));
+        // Searches paying above it: 2 rows * 9 outweigh 4.
+        let heat = [(350, 3), (360, 1)];
+        let range = plan_repair(&pieces, &keys, 1, &heat, cap).unwrap();
+        assert_eq!((range.low, range.high), (200, u128::MAX));
+        // Searches paying in the cluster, which has no fresh rows: still the most rows first.
+        let heat = [(150, 5)];
+        let range = plan_repair(&pieces, &keys, 1, &heat, cap).unwrap();
+        assert_eq!((range.low, range.high), (0, 99));
     }
 
     /// An ordered cluster past the cap is repaired even with no fresh rows over it.
     #[test]
     fn an_ordered_stretch_past_the_cap_is_repaired() {
         let pieces = [ordered(80, 0, 99, 1), ordered(60, 50, 150, 2)];
-        let range = plan_repair(&pieces, &[], 1, 100).unwrap();
+        let range = plan_repair(&pieces, &[], 1, &[], 100).unwrap();
         assert_eq!((range.low, range.high), (0, 150));
         assert_eq!(range.cluster.unwrap().docs, 140);
     }
