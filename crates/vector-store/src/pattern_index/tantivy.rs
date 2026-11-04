@@ -4786,14 +4786,22 @@ mod tests {
             let stats = sender.stats(make_index_key()).await.unwrap();
             let segments = stats.tantivy.segment_count;
             println!(
-                "CHURN t={:.0}s segments={segments} repair={} steps, pending {} rss={} MB",
+                "CHURN t={:.0}s segments={segments} repair={} steps {} rows, pending {} \
+                 fresh={}/{} depth={}/{:.2} merges={}/{} rss={} MB",
                 loaded.elapsed().as_secs_f64(),
                 stats.rewrite.steps,
+                stats.rewrite.docs_rewritten,
                 stats.rewrite.pending,
+                stats.overlap.fresh_rows,
+                stats.overlap.fresh_segments,
+                stats.overlap.depth_max,
+                stats.overlap.depth_rows as f64 / stats.overlap.rows.max(1) as f64,
+                stats.merges.started,
+                stats.merges.ended,
                 rss_mb()
             );
             counts.push(segments);
-            let rewrite_done = !stats.rewrite.pending;
+            let rewrite_done = !stats.rewrite.pending && stats.merges.running == 0;
             if rewrite_done
                 && counts.len() >= 12
                 && counts[counts.len() - 12..].iter().all(|&c| c == segments)
