@@ -404,11 +404,27 @@ rows. A step takes the worst stretch, at most a cap of its fresh rows from its l
 under the writer lock as before, deletes and re-adds them as repaired: in a gap they make a
 cluster of their own, in a cluster's stretch they overlap it and merge into it. Rows that would
 not fit beside the cluster under the cap are moved with the cluster's own, in parts of half a cap
-over disjoint key ranges, one commit each. An idle tick always takes a step, so an idle index
-converges to an empty fresh tier and a disjoint ordered one; while the index ingests, a step
-waits until the fresh tier holds two caps and then takes at most half of the time, so a burst of
-writes grows the fresh tier, which searches pay for with an open per fresh segment, rather than
-the lag.
+over disjoint key ranges, one commit each.
+
+When a step may run depends on what brings the rows. During a full scan, which builds the index
+and serves no queries, no step runs: the scan gets the node, and the repair then works from every
+row at once (the scan counts as ended five ticks after its last row). After it, an idle tick
+always takes a step, so an idle index converges to an empty fresh tier and a disjoint ordered
+one; while the index ingests, a step waits until the fresh tier holds two caps, and runs only
+while indexing does not wait in the worker's queue (nothing queued, and the tasks since the last
+tick waited under 1 ms on average). A step holds the writer lock, so the writes waiting for it
+back the queue up and the next tick holds off: a burst of writes grows the fresh tier, which
+searches pay for with an open per fresh segment, rather than the lag.
+
+Locally, 10M rows by full scan in table order (4 cores, `a_fast_loaded_table_order_index_settles_and_stops_when_dropped`):
+
+| | rewrite plan (`8e5e26f`) | repair during the scan, at most half of the time | repair after the scan |
+|---|---|---|---|
+| load | 67 s | 124 s | **49 s** |
+| settled after the load | ~310 s | ~300 s | **~200 s** |
+| segments, depth | 56, not measured | 78, 1 | 65, 1 |
+| rows moved | | 14.7M | 9.8M (the rest adopted where they were) |
+| RSS peak, after the drop | 3.1 GB, 1.4 GB | 2.3 GB, 1.7 GB | 2.1 GB, 1.2 GB |
 
 `/metrics` has `pattern_rewrite_steps_total`, `pattern_rewrite_docs_total` and
 `pattern_rewrite_pending` (an index has settled once nothing is pending and no merge runs), and

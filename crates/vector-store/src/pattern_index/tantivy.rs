@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Relaxed;
@@ -87,6 +88,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::AsyncInProgress;
 use crate::CaseSensitive;
 use crate::IndexKey;
 use crate::IndexOptionsPattern;
@@ -104,6 +106,7 @@ use crate::tantivy::COMMIT_INTERVAL;
 use crate::tantivy::Index;
 use crate::tantivy::Indexes;
 use crate::tantivy::MAX_UNCOMMITTED_THRESHOLD;
+use crate::worker;
 use crate::worker::Worker;
 use crate::worker::WorkerExt;
 
@@ -223,9 +226,13 @@ struct PatternBackend {
     /// were found (see `ordered_tier`), or merged from ordered segments. In memory only, as the
     /// index is; a segment a merge retired is dropped from it by `prune_columns`.
     adopted: Mutex<HashSet<SegmentId>>,
-    /// While the index ingests, the earliest a repair step may start: one step's time after the
-    /// last ended, so that the repair takes at most half of the time the writes go on.
-    repair_not_before: Mutex<Option<Instant>>,
+    /// Set when a row of a full scan is added, and taken by the next tick: the repair waits for
+    /// the scan to end (see `maybe_repair`).
+    scan_rows: AtomicBool,
+    /// Ticks since one last took `scan_rows` set.
+    ticks_since_scan: AtomicU32,
+    /// The worker pool's indexing load at the last tick, to tell whether indexing waited since.
+    indexing_before: Mutex<worker::IndexingLoad>,
     /// Set while a tick's work on this index -- learning the layout, a step of the rewrite -- is
     /// running, so that the next tick does not queue more behind it. See `TickWork`.
     tick_running: AtomicBool,
@@ -255,6 +262,11 @@ const REPAIR_SAMPLE_TARGET: u64 = 200_000;
 /// While an index ingests, the fresh rows, in caps, it holds before a repair step competes with
 /// the writes for the node. Under that, the fresh tier waits for an idle tick.
 const LOAD_FRESH_CAPS: u64 = 2;
+/// Ticks without a row of a full scan before the scan counts as ended.
+const SCAN_QUIET_TICKS: u32 = 5;
+/// The mean time indexing tasks may have waited in the worker's queue since the last tick for
+/// a repair step to run while the index ingests.
+const INDEXING_WAIT_LIMIT: Duration = Duration::from_millis(1);
 
 /// How full a merge of ordered neighbours may make a segment: three quarters of the cap, so that
 /// fresh rows repaired into its stretch later fit beside it, and merge into it, before it has to
@@ -1213,11 +1225,19 @@ fn live_segments(searcher: &tantivy::Searcher) -> HashSet<SegmentId> {
 
 impl PatternBackend {
     /// Whether the layout has anything to repair, recorded for `Stats`, and a repair step when
-    /// it does and the moment allows: on an idle tick always, so that an idle index converges to
-    /// an empty fresh tier and a disjoint ordered one; while the index ingests, only once the
-    /// fresh tier holds `LOAD_FRESH_CAPS` caps, and for at most half of the time, so that a burst
-    /// of writes grows the fresh tier, which searches pay for with an open per fresh segment,
-    /// rather than the lag.
+    /// it does and the moment allows (see `repair_due`). Two policies, by what brings the rows:
+    ///
+    /// - A full scan, building the index: no step until it ends, `SCAN_QUIET_TICKS` ticks after
+    ///   its last row. The scan goes at the node's pace, and the repair then works from every row
+    ///   at once rather than placing the first ones only to split their stretches again as the
+    ///   rest arrive: a 10M-row build repaired during its scan took 124 s instead of 67, and
+    ///   moved 1.5 rows for each one.
+    /// - Writes after that: on an idle tick always, so that an idle index converges to an empty
+    ///   fresh tier and a disjoint ordered one; while the index ingests, once the fresh tier
+    ///   holds `LOAD_FRESH_CAPS` caps, and only while indexing does not wait in the worker's
+    ///   queue. A step holds the writer lock, so writes waiting for it back up the queue, and the
+    ///   next tick holds off: a burst of writes grows the fresh tier, which searches pay for with
+    ///   an open per fresh segment, rather than the lag.
     fn maybe_repair(&self, state: &PatternIndexState, key: &IndexKey, idle: bool) {
         // An unordered index has no sort order to repair into, nor the columns to read one from,
         // though a segment cap turns the rewrite option on for it as for any other.
@@ -1228,6 +1248,16 @@ impl PatternBackend {
             return;
         };
         let cap = u64::from(cap.get());
+        let since_scan = if self.scan_rows.swap(false, Relaxed) {
+            0
+        } else {
+            self.ticks_since_scan.load(Relaxed).saturating_add(1)
+        };
+        self.ticks_since_scan.store(since_scan, Relaxed);
+        let scanning = since_scan < SCAN_QUIET_TICKS;
+        let load = worker::STATS.indexing();
+        let before = std::mem::replace(&mut *self.indexing_before.lock().unwrap(), load);
+        let contended = load.contended_since(&before, INDEXING_WAIT_LIMIT);
         let pieces = self.geometry(&state.reader.searcher());
         let ordered = ordered_tier(&pieces);
         let fresh_rows: u64 = pieces
@@ -1244,16 +1274,12 @@ impl PatternBackend {
         if !pending {
             return;
         }
-        let not_before = *self.repair_not_before.lock().unwrap();
-        if !repair_due(idle, fresh_rows, overfull, cap, not_before, Instant::now()) {
+        if !repair_due(idle, scanning, contended, fresh_rows, overfull, cap) {
             return;
         }
-        let started = Instant::now();
         if let Err(err) = repair_step(state) {
             error!("pattern: repair of {key} failed: {err}");
         }
-        *self.repair_not_before.lock().unwrap() =
-            (!idle).then(|| Instant::now() + started.elapsed());
     }
 
     fn rewrite_totals(&self) -> RewriteTotals {
@@ -1265,23 +1291,22 @@ impl PatternBackend {
     }
 }
 
-/// Whether a repair step may run now, given what there is to repair: always on an idle tick;
-/// while the index ingests, once the fresh tier holds `LOAD_FRESH_CAPS` caps or an ordered
-/// stretch is past the cap, and not before `not_before`. Pure, so it can be tested without an
-/// index.
+/// Whether a repair step may run now, given what there is to repair: never while a full scan
+/// goes on; on an idle tick always; while the index ingests, once the fresh tier holds
+/// `LOAD_FRESH_CAPS` caps or an ordered stretch is past the cap, and only if indexing has not
+/// been `contended`. Pure, so it can be tested without an index.
 fn repair_due(
     idle: bool,
+    scanning: bool,
+    contended: bool,
     fresh_rows: u64,
     overfull: bool,
     cap: u64,
-    not_before: Option<Instant>,
-    now: Instant,
 ) -> bool {
-    if fresh_rows == 0 && !overfull {
+    if (fresh_rows == 0 && !overfull) || scanning {
         return false;
     }
-    idle || ((fresh_rows >= LOAD_FRESH_CAPS * cap || overfull)
-        && not_before.is_none_or(|not_before| now >= not_before))
+    idle || (!contended && (fresh_rows >= LOAD_FRESH_CAPS * cap || overfull))
 }
 
 /// A row a repair step moves: its layout key, the term that deletes its current copy, and the
@@ -1513,7 +1538,9 @@ fn new_index(
         columns: RwLock::new(HashMap::new()),
         repair: RepairCounters::default(),
         adopted: Mutex::new(HashSet::new()),
-        repair_not_before: Mutex::new(None),
+        scan_rows: AtomicBool::new(false),
+        ticks_since_scan: AtomicU32::new(SCAN_QUIET_TICKS),
+        indexing_before: Mutex::new(worker::STATS.indexing()),
         tick_running: AtomicBool::new(false),
         merging: Mutex::new(MergesInFlight::default()),
         options: options.clone(),
@@ -2397,8 +2424,12 @@ pub(crate) fn new(
                                 );
                                 continue;
                             }
+                            let scanned = matches!(in_progress, AsyncInProgress::Fullscan(_));
                             indexes
                                 .add_document_with(primary_id, in_progress, move |index| {
+                                    if scanned {
+                                        index.backend().scan_rows.store(true, Relaxed);
+                                    }
                                     index.backend().create_doc(
                                         &index.schema,
                                         primary_id,
@@ -5488,22 +5519,22 @@ mod tests {
         assert_eq!(first_page(&sender, "将军", 1000).await, expected);
     }
 
-    /// While the index ingests, the repair waits for the fresh tier to grow past two caps, or a
-    /// stretch past the cap, and then for its turn; on an idle tick it runs whenever there is
-    /// anything to repair.
+    /// Nothing is repaired while a full scan goes on, idle tick or not. After it, an idle tick
+    /// repairs whatever there is; while the index ingests, the repair waits for the fresh tier
+    /// to grow past two caps, or a stretch past the cap, and for indexing not to wait.
     #[test]
-    fn the_repair_waits_its_turn_under_load() {
-        let now = Instant::now();
-        let later = Some(now + Duration::from_secs(1));
-        let earlier = Some(now - Duration::from_secs(1));
+    fn the_repair_waits_for_the_scan_and_gives_way_to_indexing() {
         let cap = 100;
-        assert!(!repair_due(true, 0, false, cap, None, now));
-        assert!(repair_due(true, 1, false, cap, later, now));
-        assert!(!repair_due(false, 199, false, cap, None, now));
-        assert!(repair_due(false, 200, false, cap, None, now));
-        assert!(!repair_due(false, 200, false, cap, later, now));
-        assert!(repair_due(false, 200, false, cap, earlier, now));
-        assert!(repair_due(false, 0, true, cap, None, now));
+        // (idle, scanning, contended, fresh rows, overfull)
+        assert!(!repair_due(true, false, false, 0, false, cap));
+        assert!(repair_due(true, false, true, 1, false, cap));
+        assert!(!repair_due(true, true, false, 1_000, true, cap));
+        assert!(!repair_due(false, true, false, 1_000, true, cap));
+        assert!(!repair_due(false, false, false, 199, false, cap));
+        assert!(repair_due(false, false, false, 200, false, cap));
+        assert!(!repair_due(false, false, true, 200, false, cap));
+        assert!(repair_due(false, false, false, 0, true, cap));
+        assert!(!repair_due(false, false, true, 0, true, cap));
     }
 
     /// A segment holding the last tokens of one value and the first of the next spans what its
