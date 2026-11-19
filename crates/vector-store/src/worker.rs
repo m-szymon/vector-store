@@ -277,6 +277,7 @@ impl Queues {
         let share = self.recent.search_share(now);
         let class = pick_class(search_waiting, oldest_indexing_wait, share, scheduling)?;
         let queued = self.by_class[class.index()].pop_front()?;
+        STATS.queued[class.index()].fetch_sub(1, Ordering::Relaxed);
         Some((queued, class))
     }
 
@@ -301,13 +302,39 @@ pub(crate) struct WorkerStats {
     tasks: [AtomicU64; 2],
     queue_wait_nanos: [AtomicU64; 2],
     busy_nanos: [AtomicU64; 2],
+    /// Tasks in the queues now.
+    queued: [AtomicU64; 2],
 }
 
 pub(crate) static STATS: WorkerStats = WorkerStats {
     tasks: [AtomicU64::new(0), AtomicU64::new(0)],
     queue_wait_nanos: [AtomicU64::new(0), AtomicU64::new(0)],
     busy_nanos: [AtomicU64::new(0), AtomicU64::new(0)],
+    queued: [AtomicU64::new(0), AtomicU64::new(0)],
 };
+
+/// How the indexing class fares at one moment, over every pool: what background work that
+/// competes with indexing for the node -- the repair of a pattern index's layout -- reads to hold
+/// back while indexing waits. Totals since the process started, so a caller diffs two readings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IndexingLoad {
+    /// Indexing tasks in the queues now.
+    pub(crate) queued: u64,
+    pub(crate) tasks: u64,
+    pub(crate) queue_wait_nanos: u64,
+}
+
+impl IndexingLoad {
+    /// Whether indexing waited since `before`: tasks are queued now, or the tasks taken since
+    /// waited more than `limit` on average.
+    pub(crate) fn contended_since(&self, before: &IndexingLoad, limit: Duration) -> bool {
+        let tasks = self.tasks.saturating_sub(before.tasks);
+        let waited = self
+            .queue_wait_nanos
+            .saturating_sub(before.queue_wait_nanos);
+        self.queued > 0 || (tasks > 0 && waited / tasks > limit.as_nanos() as u64)
+    }
+}
 
 impl WorkerStats {
     fn record(&self, class: TaskClass, queue_wait: Duration, busy: Duration) {
@@ -315,6 +342,15 @@ impl WorkerStats {
         self.tasks[class].fetch_add(1, Ordering::Relaxed);
         self.queue_wait_nanos[class].fetch_add(queue_wait.as_nanos() as u64, Ordering::Relaxed);
         self.busy_nanos[class].fetch_add(busy.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn indexing(&self) -> IndexingLoad {
+        let i = TaskClass::Indexing.index();
+        IndexingLoad {
+            queued: self.queued[i].load(Ordering::Relaxed),
+            tasks: self.tasks[i].load(Ordering::Relaxed),
+            queue_wait_nanos: self.queue_wait_nanos[i].load(Ordering::Relaxed),
+        }
     }
 
     /// Per class: (class, tasks run, seconds queued, seconds running).
@@ -418,6 +454,7 @@ pub(crate) fn with_scheduling(scheduling: Scheduling) -> Sender<Worker> {
                                 msg,
                                 enqueued: Instant::now(),
                             });
+                            STATS.queued[class.index()].fetch_add(1, Ordering::Relaxed);
                             break;
                         }
                     }
@@ -527,6 +564,36 @@ mod tests {
         indexing_queue_budget: Duration::from_millis(100),
         min_search_share: 0.25,
     };
+
+    /// Indexing is contended while tasks wait in its queue, or when the tasks taken since the
+    /// last reading waited past the limit on average; a reading with nothing taken and nothing
+    /// queued is not.
+    #[test]
+    fn indexing_is_contended_while_its_tasks_wait() {
+        let limit = Duration::from_millis(1);
+        let before = IndexingLoad {
+            queued: 0,
+            tasks: 100,
+            queue_wait_nanos: 1_000_000,
+        };
+        assert!(!before.contended_since(&before, limit));
+        let quick = IndexingLoad {
+            tasks: 200,
+            queue_wait_nanos: 1_000_000 + 100 * 50_000,
+            ..before
+        };
+        assert!(!quick.contended_since(&before, limit));
+        let slow = IndexingLoad {
+            queue_wait_nanos: 1_000_000 + 100 * 2_000_000,
+            ..quick
+        };
+        assert!(slow.contended_since(&before, limit));
+        let backlog = IndexingLoad {
+            queued: 3,
+            ..before
+        };
+        assert!(backlog.contended_since(&before, limit));
+    }
 
     #[test]
     fn an_empty_queue_gives_nothing_and_a_lone_class_goes_first() {
