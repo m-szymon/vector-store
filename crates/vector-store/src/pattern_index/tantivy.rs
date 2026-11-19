@@ -2206,12 +2206,21 @@ impl RegionWalk<'_> {
     /// Offers the page the matching rows with doc ids in `regions`, which are disjoint and in
     /// doc order, with one pass of the postings: opened once, or the ones left from the last
     /// call if they stand before the first region, as postings only seek forward.
+    ///
+    /// Of a region that is a stretch of a run, only the `take` matches at the end
+    /// the walk reads from are offered, and the region is cut to what was read: the matches may
+    /// lie anywhere in it, and many more of them than a page needs once they start. Where the
+    /// walk starts at the region's first doc ids, the region ends with the last match taken.
+    /// Where it starts at the last, the postings come from the far end, so the region is halved
+    /// towards the near one until what is left holds `take` matches or fewer. A coarse run is
+    /// cut at a block's edge.
     fn scan(
         &mut self,
         page: &mut Page,
         tally: &mut WalkTally,
         candidates: &mut Vec<(SortPrefix, u32)>,
         regions: &mut [Region],
+        take: usize,
     ) -> anyhow::Result<()> {
         let Some(first) = regions.first().map(|region| region.from) else {
             return Ok(());
@@ -2224,6 +2233,7 @@ impl RegionWalk<'_> {
             },
         };
         let forward = self.window.complement;
+        let mut last: Vec<u32> = Vec::new();
         for region in regions {
             let runs = region.run.and(self.columns.runs.as_deref());
             let run = runs
@@ -2262,11 +2272,65 @@ impl RegionWalk<'_> {
                 doc_id
             };
             doc_id = enter(doc_id, &mut scorer, page);
-            while doc_id < region.to {
-                tally.postings_scanned += 1;
-                self.offer(page, tally, candidates, doc_id);
-                doc_id = scorer.advance();
-                doc_id = enter(doc_id, &mut scorer, page);
+            match run {
+                // The matches the walk is after lie at the far end of the region's doc ids:
+                // going down a run whose keys go up with them, or up one whose keys go down.
+                Some(run) if forward == run.reversed => {
+                    // The postings come from the far end of the region. Its nearer half is
+                    // tried over and over, until it holds no more than `take` matches: each try
+                    // reads that many and no more, and seeks on.
+                    let mut from = region.from;
+                    loop {
+                        last.clear();
+                        while doc_id < region.to && last.len() <= take {
+                            tally.postings_scanned += 1;
+                            last.push(doc_id);
+                            doc_id = scorer.advance();
+                            doc_id = enter(doc_id, &mut scorer, page);
+                        }
+                        if last.len() <= take || doc_id >= region.to {
+                            break;
+                        }
+                        // From a block's edge in a coarse run, whose blocks are read whole.
+                        let half = run.edge_up((from + (region.to - from) / 2).max(doc_id));
+                        if half >= region.to {
+                            // The last block alone holds more: all of what is left, then.
+                            while doc_id < region.to {
+                                tally.postings_scanned += 1;
+                                last.push(doc_id);
+                                doc_id = scorer.advance();
+                                doc_id = enter(doc_id, &mut scorer, page);
+                            }
+                            break;
+                        }
+                        from = half;
+                        if doc_id < from {
+                            doc_id = scorer.seek(from);
+                        }
+                        doc_id = enter(doc_id, &mut scorer, page);
+                    }
+                    region.from = from;
+                    for &doc_id in &last {
+                        self.offer(page, tally, candidates, doc_id);
+                    }
+                }
+                _ => {
+                    let mut taken = 0;
+                    while doc_id < region.to {
+                        tally.postings_scanned += 1;
+                        self.offer(page, tally, candidates, doc_id);
+                        taken += 1;
+                        if let Some(run) = run
+                            && taken == take
+                        {
+                            // To the end of the block for a coarse run, whose rows are in no
+                            // order within it.
+                            region.to = run.edge_up(doc_id + 1).min(region.to);
+                        }
+                        doc_id = scorer.advance();
+                        doc_id = enter(doc_id, &mut scorer, page);
+                    }
+                }
             }
         }
         self.scorer = Some(scorer);
@@ -2424,6 +2488,8 @@ impl RegionWalk<'_> {
         let mut width = ((2 * page.limit) as f64 / density.min(1.0))
             .ceil()
             .clamp(1.0, f64::from(u32::MAX)) as u32;
+        // The matches a run offers of its stretch, which grow with it.
+        let mut take = 2 * page.limit;
         let mut regions: Vec<Region> = Vec::new();
         let mut reading: Vec<u32> = Vec::new();
         // What a run reads of a stretch of `width`: positions `from..to`, going down or up
@@ -2507,8 +2573,10 @@ impl RegionWalk<'_> {
                 }
             }
             regions.sort_unstable_by_key(|region| region.from);
-            self.scan(page, tally, candidates, &mut regions)?;
-            // Each run goes on from where its stretch ended.
+            let scanned = tally.postings_scanned;
+            self.scan(page, tally, candidates, &mut regions, take)?;
+            // A region comes back cut to what was read of it; one that reached no floor, as it
+            // was.
             for region in &regions {
                 let index = region.run.unwrap();
                 let run = &runs[index as usize];
@@ -2524,6 +2592,10 @@ impl RegionWalk<'_> {
             }
             self.verify(page, tally, candidates)?;
             width = width.saturating_mul(4);
+            // More of each run only once the matches of this many were not enough.
+            if tally.postings_scanned > scanned {
+                take = take.saturating_mul(4);
+            }
         }
         self.verify(page, tally, candidates)
     }
@@ -2624,6 +2696,7 @@ fn collect_matches_ordered(
                         to: segment.max_doc(),
                         run: None,
                     }],
+                    usize::MAX,
                 )?;
                 walk.verify(&mut page, &mut tally, &mut candidates)?
             }
