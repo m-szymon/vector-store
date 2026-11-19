@@ -95,6 +95,7 @@ use super::factory::PatternIndexFactory;
 use super::gram;
 use super::like::LikeQuery;
 use super::order::KeyLayout;
+use super::order::PREFIX_SLOTS;
 use super::order::SortPrefix;
 
 pub(crate) struct Factory {
@@ -531,24 +532,48 @@ fn read_prefix(
 
 /// The part of the index's order a search may return, in *walk orientation*: the walk always
 /// takes the highest row first, and a search in the declared order is the same walk over the
-/// bitwise complement of every sort prefix, with ties between whole prefixes reversed too.
+/// bitwise complement of every sort prefix, with ties between whole prefixes reversed too. The
+/// range from the query's `WHERE` (on the first ordering column) and the cursor from the previous
+/// page are resolved into bounds once rather than checked separately on every candidate.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SortWindow {
     complement: bool,
+    /// Inclusive bounds from the range, oriented.
+    lower: Option<SortPrefix>,
+    upper: Option<SortPrefix>,
     /// The previous page's last row, oriented: the page resumes strictly below it. Without a key
     /// the rows sharing its prefix are taken again rather than any skipped.
     cursor: Option<(SortPrefix, Option<PrimaryKey>)>,
 }
 
 impl SortWindow {
-    /// `forward` walks the index's declared order from its start. `cursor` is in the index's own
-    /// space.
-    pub(crate) fn new(forward: bool, cursor: Option<Cursor>) -> Self {
+    /// `forward` walks the index's declared order from its start. `cursor` and the bounds on the
+    /// first slot are in the index's own space.
+    pub(crate) fn new(
+        forward: bool,
+        cursor: Option<Cursor>,
+        min_first: Option<u64>,
+        max_first: Option<u64>,
+    ) -> Self {
         let orient = |prefix: SortPrefix| {
             if forward { prefix.complement() } else { prefix }
         };
+        let with_first = |first: u64, rest: u64| {
+            let mut prefix = SortPrefix([rest; PREFIX_SLOTS]);
+            prefix.0[0] = first;
+            prefix
+        };
+        let low = min_first.map(|key| with_first(key, 0));
+        let high = max_first.map(|key| with_first(key, u64::MAX));
+        let (lower, upper) = if forward {
+            (high.map(orient), low.map(orient))
+        } else {
+            (low, high)
+        };
         Self {
             complement: forward,
+            lower,
+            upper,
             cursor: cursor.map(|cursor| (orient(cursor.prefix), cursor.primary_key)),
         }
     }
@@ -585,12 +610,15 @@ impl SortWindow {
         }
     }
 
-    /// Whether an oriented prefix is not above the cursor's. A prefix equal to the cursor's is
-    /// decided by the keys, in [`SortWindow::below_cursor`].
+    /// Whether an oriented prefix is inside the range, and not above the cursor's. A prefix equal
+    /// to the cursor's is decided by the keys, in [`SortWindow::below_cursor`].
     fn admits(&self, prefix: SortPrefix) -> bool {
-        self.cursor
-            .as_ref()
-            .is_none_or(|(cursor, _)| prefix <= *cursor)
+        self.lower.is_none_or(|lower| prefix >= lower)
+            && self.upper.is_none_or(|upper| prefix <= upper)
+            && self
+                .cursor
+                .as_ref()
+                .is_none_or(|(cursor, _)| prefix <= *cursor)
     }
 
     /// For an admitted row: whether it comes after the cursor in the walk.
@@ -612,14 +640,18 @@ impl SortWindow {
         }
     }
 
-    /// Whether a segment whose lowest oriented layout key is `min` can hold anything in the
-    /// window. Answered from the bound alone, so a segment ruled out here is never opened. The
+    /// Whether a segment spanning `[min, max]` (oriented layout keys) can hold anything in the
+    /// window. Answered from the bounds alone, so a segment ruled out here is never opened. The
     /// layout key is only the first two slots, so a bound equal to it may still hold rows on
     /// either side of it and stays in.
-    fn overlaps(&self, min: u128) -> bool {
-        self.cursor
-            .as_ref()
-            .is_none_or(|(cursor, _)| min <= cursor.layout_key())
+    fn overlaps(&self, min: u128, max: u128) -> bool {
+        let above = self.lower.is_none_or(|lower| max >= lower.layout_key());
+        let below = self.upper.is_none_or(|upper| min <= upper.layout_key())
+            && self
+                .cursor
+                .as_ref()
+                .is_none_or(|(cursor, _)| min <= cursor.layout_key());
+        above && below
     }
 }
 
@@ -859,7 +891,7 @@ fn collect_matches_ordered(
         let (lower_bound, upper_bound) =
             window.orient_bounds(columns.layout_min, columns.layout_max);
         // Ruled out from the bounds alone, so the segment is never opened.
-        if window.overlaps(lower_bound) {
+        if window.overlaps(lower_bound, upper_bound) {
             segments.push((segment_ord as u32, segment, columns, upper_bound));
         }
     }
@@ -1001,9 +1033,21 @@ fn handle_like(
             Some(SortOrder::Asc) => !first_descending,
             Some(SortOrder::Desc) => first_descending,
         };
+        // A range is on the first ordering column's values; a DESC column is stored complemented,
+        // which swaps the ends.
+        let (min_first, max_first) = if columns.is_empty() {
+            (None, None)
+        } else if first_descending {
+            (
+                window.max_sort_key.map(|key| !key),
+                window.min_sort_key.map(|key| !key),
+            )
+        } else {
+            (window.min_sort_key, window.max_sort_key)
+        };
         let key_of =
             |primary_id: PrimaryId| table.read().unwrap().primary_key(partition_id, primary_id);
-        let sort_window = SortWindow::new(forward, window.cursor);
+        let sort_window = SortWindow::new(forward, window.cursor, min_first, max_first);
         collect_matches_ordered(state, &like, limit, sort_window, &key_of)?
     };
 
@@ -1417,7 +1461,11 @@ mod tests {
 
     /// A window whose cursor is the row that sorts at `cursor`: in these fixtures the sort column
     /// mirrors the primary id, so the row is named from the key's value.
-    fn window(cursor: Option<u64>) -> SearchWindow {
+    fn window(
+        cursor: Option<u64>,
+        min_sort_key: Option<u64>,
+        max_sort_key: Option<u64>,
+    ) -> SearchWindow {
         SearchWindow {
             order: Some(SortOrder::Desc),
             cursor: cursor.map(|sort_key| {
@@ -1431,6 +1479,8 @@ mod tests {
                     primary_key: Some(PrimaryKey::from(vec![CqlValue::BigInt(id)])),
                 }
             }),
+            min_sort_key,
+            max_sort_key,
         }
     }
 
@@ -1439,13 +1489,14 @@ mod tests {
         SearchWindow {
             order: Some(order),
             cursor: Some(cursor),
+            ..SearchWindow::default()
         }
     }
 
     fn ascending() -> SearchWindow {
         SearchWindow {
             order: Some(SortOrder::Asc),
-            cursor: None,
+            ..SearchWindow::default()
         }
     }
 
@@ -1877,8 +1928,84 @@ mod tests {
         let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
-        let (ids, _) = search_ordered(&sender, "将军", 10, window(Some(sort_key(1)))).await;
+        let (ids, _) =
+            search_ordered(&sender, "将军", 10, window(Some(sort_key(1)), None, None)).await;
         assert!(ids.is_empty(), "got {ids:?}");
+    }
+
+    /// A range restriction narrows the answer without changing its order.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_range_restricts_which_rows_are_returned() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        // The mock table answers with the primary id as the sort key, so this is ids 2..=3.
+        let window = window(None, Some(sort_key(2)), Some(sort_key(3)));
+        let (ids, _) = search_ordered(&sender, "将军", 10, window).await;
+        assert_eq!(ids, vec![3, 2]);
+    }
+
+    /// The bounds are inclusive, unlike the cursor, which excludes the key it names.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn range_bounds_are_inclusive_and_the_cursor_is_not() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (inclusive, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            window(None, Some(sort_key(3)), Some(sort_key(3))),
+        )
+        .await;
+        assert_eq!(inclusive, vec![3]);
+
+        let (exclusive, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            window(Some(sort_key(3)), Some(sort_key(3)), None),
+        )
+        .await;
+        assert!(exclusive.is_empty(), "got {exclusive:?}");
+    }
+
+    /// A range and a cursor constrain the same value, so the tighter upper bound wins rather than
+    /// one quietly overriding the other.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_cursor_and_a_range_both_apply() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        // The range allows 1..=3, the cursor excludes 3 and above: 2 and 1 remain.
+        let window = window(Some(sort_key(3)), Some(sort_key(1)), Some(sort_key(3)));
+        let (ids, _) = search_ordered(&sender, "将军", 10, window).await;
+        assert_eq!(ids, vec![2, 1]);
+    }
+
+    /// An empty window is not an error, just an empty answer.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_window_matching_nothing_returns_nothing() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, cursor) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            window(None, Some(sort_key(900)), Some(sort_key(999))),
+        )
+        .await;
+        assert!(ids.is_empty(), "got {ids:?}");
+        assert_eq!(cursor, None);
     }
 
     /// A table whose sort column has ties: rows 1..=n share a sort key in pairs (1 and 2 sort
@@ -1933,7 +2060,7 @@ mod tests {
         let mut pages = 0;
         let mut window = SearchWindow {
             order: Some(order),
-            cursor: None,
+            ..SearchWindow::default()
         };
         loop {
             let (ids, cursor) = search_ordered(sender, query, page, window).await;
@@ -2039,6 +2166,21 @@ mod tests {
         assert_eq!(ids, vec![3]);
         assert_eq!(cursor, None);
 
+        // A range applies the same way round: keys 2..=3, lowest first.
+        let (ids, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            SearchWindow {
+                order: Some(SortOrder::Asc),
+                cursor: None,
+                min_sort_key: Some(sort_key(2)),
+                max_sort_key: Some(sort_key(3)),
+            },
+        )
+        .await;
+        assert_eq!(ids, vec![2, 3]);
+
         // Past max_gram too: the verified path orders the same way.
         let (ids, _) = search_ordered(&sender, "将军来了", 10, ascending()).await;
         assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
@@ -2123,7 +2265,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut window = SearchWindow {
             order,
-            cursor: None,
+            ..SearchWindow::default()
         };
         loop {
             let (ids, cursor) = search_ordered(sender, query, page, window).await;
@@ -2133,6 +2275,7 @@ mod tests {
                     window = SearchWindow {
                         order,
                         cursor: Some(cursor),
+                        ..SearchWindow::default()
                     }
                 }
                 None => return seen,
@@ -2216,8 +2359,8 @@ mod tests {
                 match found.next_cursor {
                     Some(cursor) => {
                         window = SearchWindow {
-                            order: None,
                             cursor: Some(cursor),
+                            ..SearchWindow::default()
                         }
                     }
                     None => break,
@@ -2298,6 +2441,9 @@ mod tests {
 
         let (ids, _) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         assert_eq!(ids, vec![5, 4]);
+        let (ids, _) =
+            search_ordered(&sender, "将军", 10, window(None, None, Some(sort_key(4)))).await;
+        assert_eq!(ids, vec![4]);
         let (ids, _) = search_ordered(&sender, "将军", 10, ascending()).await;
         assert_eq!(ids, vec![4, 5]);
         assert_eq!(sender.count(make_index_key()).await.unwrap(), 2);

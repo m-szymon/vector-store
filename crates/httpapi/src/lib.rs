@@ -550,6 +550,24 @@ pub enum SortOrder {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
+/// One end of a range on an ordered index's sort column: a value of that column, in the same
+/// JSON encoding the response's `primary_keys` use for a value of its type (a number for the
+/// integer types, an ISO 8601 string for a date, time or timestamp), and whether the bound
+/// includes the value itself. The index turns the value into its own sort key, so a caller
+/// never has to know how the index orders.
+pub struct SortBound {
+    /// The bounding value, encoded as a value of the sort column's CQL type.
+    pub value: Value,
+    /// Whether rows whose sort value equals `value` are inside the range. Inclusive when absent.
+    #[serde(default = "sort_bound_inclusive_default")]
+    pub inclusive: bool,
+}
+
+fn sort_bound_inclusive_default() -> bool {
+    true
+}
+
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Request body for LIKE search.
 pub struct PostIndexLikeRequest {
     /// The text pattern to search for.
@@ -563,6 +581,12 @@ pub struct PostIndexLikeRequest {
     /// The direction along the index's first ordering column: the declared order when it matches the column's declared direction, its exact reverse otherwise. The declared order when absent; for an index in table order, that is ascending.
     #[serde(default)]
     pub order: Option<SortOrder>,
+    /// Restrict the search to rows whose first ordering column is at least (or, when the bound is exclusive, above) this. Only meaningful for an index created with `order_by` columns; ignored otherwise.
+    #[serde(default)]
+    pub min_sort_value: Option<SortBound>,
+    /// Restrict the search to rows whose first ordering column is at most (or, when the bound is exclusive, below) this. Only meaningful for an index created with `order_by` columns; ignored otherwise.
+    #[serde(default)]
+    pub max_sort_value: Option<SortBound>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]

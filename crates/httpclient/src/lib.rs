@@ -228,6 +228,8 @@ impl HttpClient {
             limit,
             cursor,
             order: None,
+            min_sort_value: None,
+            max_sort_value: None,
         };
         self.client
             .post(format!(

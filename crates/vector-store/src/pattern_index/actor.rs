@@ -34,11 +34,14 @@ pub(crate) struct Cursor {
     pub(crate) primary_key: Option<PrimaryKey>,
 }
 
-/// What an ordered search may return: a direction, and the cursor of the previous page.
+/// What an ordered search may return: a direction, the cursor of the previous page, and a range
+/// on the first ordering column, as sort keys of that column's values.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SearchWindow {
     pub(crate) order: Option<SortOrder>,
     pub(crate) cursor: Option<Cursor>,
+    pub(crate) min_sort_key: Option<u64>,
+    pub(crate) max_sort_key: Option<u64>,
 }
 
 /// One page of a pattern search.
