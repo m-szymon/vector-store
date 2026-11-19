@@ -257,6 +257,7 @@ async fn indexes_lists_all_indexes_with_options() {
 
     let pattern_options = IndexOptionsPattern {
         case_sensitive: false.into(),
+        ..Default::default()
     };
     let pattern_index = make_pattern_index_with_options(
         "fourth",
@@ -300,6 +301,7 @@ async fn indexes_lists_all_indexes_with_options() {
         (
             "fourth",
             IndexOptions::Pattern(PatternIndexOptions {
+                order_by: None,
                 case_sensitive: false,
             }),
         ),

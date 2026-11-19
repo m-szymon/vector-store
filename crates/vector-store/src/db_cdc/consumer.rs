@@ -274,7 +274,7 @@ impl<T: DbDriver> CdcConsumerFactory<T> {
         let primary_key_columns = metadata.primary_key_columns.clone();
 
         let target_columns = metadata.target_columns.clone();
-        let filtering_columns: Arc<[_]> = metadata.nonpk_filtering_columns().cloned().collect();
+        let filtering_columns: Arc<[_]> = metadata.ingested_value_columns().cloned().collect();
 
         let nonpk_partition_key_columns: Box<[_]> = metadata
             .nonpk_partition_key_columns()

@@ -267,6 +267,20 @@ impl From<&IndexOptionsFts> for FulltextIndexOptions {
 impl From<&IndexOptionsPattern> for PatternIndexOptions {
     fn from(options: &IndexOptionsPattern) -> Self {
         PatternIndexOptions {
+            order_by: match &options.order_by {
+                crate::OrderBy::Table => None,
+                crate::OrderBy::Invalid(value) => Some(value.to_string()),
+                crate::OrderBy::Columns(columns) => Some(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let direction = if column.descending { "DESC" } else { "ASC" };
+                            format!("{} {direction}", column.name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            },
             case_sensitive: *options.case_sensitive.as_ref(),
         }
     }

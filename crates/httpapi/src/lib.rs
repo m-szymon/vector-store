@@ -197,6 +197,9 @@ pub struct FulltextIndexOptions {
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Options a pattern index was created with.
 pub struct PatternIndexOptions {
+    /// The column results are ordered by, or absent for unspecified order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_by: Option<String>,
     /// Whether matching distinguishes letter case.
     pub case_sensitive: bool,
 }

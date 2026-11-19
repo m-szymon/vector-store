@@ -209,9 +209,12 @@ fn second_slot_at_the_ends(
 }
 
 impl PatternBackend {
-    /// The fast fields of the sort prefix: the token.
+    /// The fast fields of the sort prefix: `sort_<i>` per ordering column, then the token.
     fn slot_fields(&self) -> Vec<String> {
-        vec![TOKEN_FIELD.to_string()]
+        (0..self.options.order_by.columns().len())
+            .map(|slot| format!("sort_{slot}"))
+            .chain(std::iter::once(TOKEN_FIELD.to_string()))
+            .collect()
     }
 
     /// The cached columns of `segment`, opened on first sight. `opened` counts a miss, so a
@@ -501,19 +504,27 @@ fn find_partition_id(
     Ok(partition_id)
 }
 
-/// The row's place in table order: its token. None when the row's key is not known.
+/// The row's place in an ordered index: each ordering column's sort key, complemented for a
+/// `DESC` column, then the token. None when an ordering column is null or empty, which leaves the
+/// row out of the index, as a materialized view leaves out a row whose key column is null; or when
+/// the row's key is not known.
 fn read_prefix(
     table: &RwLock<impl TableSearch>,
+    options: &IndexOptionsPattern,
     key_layout: &KeyLayout,
     partition_id: PartitionId,
     primary_id: PrimaryId,
 ) -> Option<SortPrefix> {
-    let primary_key = table
-        .read()
-        .unwrap()
-        .primary_key(partition_id, primary_id)?;
+    let table = table.read().unwrap();
     let mut prefix = SortPrefix::default();
-    prefix.0[0] = key_layout.token_key(&primary_key)?;
+    let columns = options.order_by.columns();
+    for (slot, column) in columns.iter().enumerate() {
+        let value = table.column_value_for(partition_id, primary_id, &column.name)?;
+        let key = crate::cql_types::to_sort_key(&value)?;
+        prefix.0[slot] = if column.descending { !key } else { key };
+    }
+    let primary_key = table.primary_key(partition_id, primary_id)?;
+    prefix.0[columns.len()] = key_layout.token_key(&primary_key)?;
     Some(prefix)
 }
 
@@ -1042,14 +1053,19 @@ pub(crate) fn new(
                             document,
                             in_progress,
                         } => {
+                            // Table::upsert writes the column before it emits the operation that
+                            // got us here, so the value is already in place.
                             let prefix = read_prefix(
                                 table.as_ref(),
+                                &index.options,
                                 &index.key_layout,
                                 partition_id,
                                 primary_id,
                             );
                             if prefix.is_none() {
-                                // A row the table does not know has no place in the order.
+                                // A null ordering value leaves the row out, as a view leaves out
+                                // a row with a null key column. An update that set it to null
+                                // already removed the old document (RemoveBeforeAddValue).
                                 debug!(
                                     "pattern: {key}: row {primary_id:?} has no sort prefix, not indexed"
                                 );
@@ -1136,6 +1152,7 @@ mod tests {
     use super::*;
     use crate::AsyncInProgress;
     use crate::CaseSensitive;
+    use crate::OrderBy;
     use crate::PrimaryKey;
     use crate::memory::Allocate;
     use crate::table::IndexIdGenerator;
@@ -1143,7 +1160,6 @@ mod tests {
     use crate::table::PartitionId;
     use crate::tantivy::test_support::make_index_key;
     use crate::tantivy::test_support::make_memory_actor;
-    use crate::tantivy::test_support::make_table_with_keys;
     use crate::worker;
     use rstest::rstest;
     use scylla::value::CqlValue;
@@ -1158,12 +1174,57 @@ mod tests {
         PartitionId::global(IndexIdGenerator::new().next(true).unwrap())
     }
 
+    /// The shared fixture's table, with a value for every column: an ordering column mirrors the
+    /// primary id, so a test can assert on plain integers.
+    fn make_table_with_keys() -> Arc<RwLock<MockTableSearch>> {
+        let index_id = IndexIdGenerator::new().next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+        let mut mock = MockTableSearch::new();
+        mock.expect_index_id()
+            .returning(move |_index_key| Some(index_id));
+        mock.expect_partition_id()
+            .returning(move |_index_key, _restrictions| Some((partition_id, None)));
+        mock.expect_primary_key()
+            .returning(|_partition_id, primary_id| {
+                let id_val = u64::from(primary_id);
+                Some(PrimaryKey::from(vec![CqlValue::BigInt(id_val as i64)]))
+            });
+        mock.expect_column_value_for()
+            .returning(|_partition_id, primary_id, _column| {
+                Some(CqlValue::BigInt(u64::from(primary_id) as i64))
+            });
+        Arc::new(RwLock::new(mock))
+    }
+
     const TEST_COMMIT_INTERVAL: Duration = Duration::from_millis(50);
     const TEST_COMMIT_THRESHOLD: usize = 100;
 
     fn options(case_sensitive: bool) -> IndexOptionsPattern {
         IndexOptionsPattern {
             case_sensitive: CaseSensitive::from(case_sensitive),
+            // The matching tests run in table order and sort what they get; the order has tests
+            // of its own.
+            order_by: OrderBy::Table,
+        }
+    }
+
+    /// Options with a sort column. The mock table answers `column_value_for` with the primary id,
+    /// whatever the column is called.
+    /// The sort key the index stores for a row whose sort column holds `value`.
+    ///
+    /// Not the value itself: signed types are biased so that negatives sort below positives, and
+    /// the window bounds are in that space. A caller building a window from a CQL value has to
+    /// apply the same conversion -- see the note on `PostIndexLikeRequest`.
+    fn sort_key(value: i64) -> u64 {
+        crate::cql_types::to_sort_key(&CqlValue::BigInt(value)).unwrap()
+    }
+
+    /// Declared `DESC`, so a search that names no direction gets the highest first, as the
+    /// newest-first search box these tests stand for does.
+    fn ordered_options() -> IndexOptionsPattern {
+        IndexOptionsPattern {
+            order_by: "sort_col DESC".parse().unwrap(),
+            ..IndexOptionsPattern::default()
         }
     }
 
@@ -1344,6 +1405,24 @@ mod tests {
         (ids_of(&page.primary_keys), page.next_cursor)
     }
 
+    /// A window whose cursor is the row that sorts at `cursor`: in these fixtures the sort column
+    /// mirrors the primary id, so the row is named from the key's value.
+    fn window(cursor: Option<u64>) -> SearchWindow {
+        SearchWindow {
+            cursor: cursor.map(|sort_key| {
+                let id = (sort_key ^ (1 << 63)) as i64;
+                // Declared DESC, so the column's key is stored complemented.
+                let mut prefix = SortPrefix::default();
+                prefix.0[0] = !sort_key;
+                prefix.0[1] = token_of(id as u64);
+                Cursor {
+                    prefix,
+                    primary_key: Some(PrimaryKey::from(vec![CqlValue::BigInt(id)])),
+                }
+            }),
+        }
+    }
+
     /// The window that resumes after a page.
     fn resume(cursor: Cursor) -> SearchWindow {
         SearchWindow {
@@ -1493,13 +1572,29 @@ mod tests {
         assert_eq!(stats, Default::default());
     }
 
+    /// An index with a sort column returns the highest sort keys first. The matching helpers sort
+    /// their results, so only `search_ordered` can see this.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_ordered_index_returns_the_highest_sort_keys_first() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, _) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
+        let mut descending = ids.clone();
+        descending.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(ids, descending, "not ordered by the sort column");
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+
     /// `Stats` prices the searches served so far and describes the segments the pruning sees: an
     /// ordered index reports each segment's sort bounds, and the walk's tally grows per search.
     #[rstest]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
     async fn stats_count_the_walk_and_describe_the_segments() {
-        let sender = make_sender_with_options(IndexOptionsPattern::default());
+        let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
         let before = sender.stats(make_index_key()).await.unwrap();
@@ -1529,6 +1624,117 @@ mod tests {
         assert_eq!(walk.store_reads, 0, "{walk:?}");
     }
 
+    /// With the cap set, an index built from many small commits ends with segments that hold
+    /// contiguous slices of the sort range, none past the cap, and still answers correctly.
+    #[rstest]
+    #[timeout(Duration::from_secs(30))]
+    #[tokio::test]
+    async fn the_range_policy_keeps_segments_narrow_and_capped() {
+        // A commit of TEST_COMMIT_THRESHOLD rows lands as one segment per writer thread; the cap
+        // lets the pieces of a commit merge and stops a run growing past two commits' worth.
+        let cap = 120u32;
+        let sender = make_sender_with_options(IndexOptionsPattern {
+            ..ordered_options()
+        });
+        // 400 rows in sort order, sort key = primary id, sent as one batch: `add_doc` waits for
+        // the commit that carries its row, and one wait per row would be 400 commit ticks.
+        let mut acks = Vec::with_capacity(400);
+        for primary in 1..=400u64 {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    format!("user{primary}将军"),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        // Merges finish on their own thread and become visible on the actor's idle reloads.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            if stats.tantivy.segment_count <= 6 || Instant::now() > deadline {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            stats.segments.iter().all(|s| s.docs <= cap),
+            "a segment grew past the cap: {:?}",
+            stats.segments
+        );
+        let mut spans: Vec<(u64, u64)> = stats
+            .segments
+            .iter()
+            .map(|s| (s.sort_min.unwrap(), s.sort_max.unwrap()))
+            .collect();
+        spans.sort_unstable();
+        assert!(
+            stats.tantivy.segment_count <= 6,
+            "{} segments: {spans:?}",
+            stats.tantivy.segment_count
+        );
+        // Sorted by low bound, each segment ends before the next one begins: contiguous slices.
+        for pair in spans.windows(2) {
+            assert!(pair[0].1 < pair[1].0, "segments overlap: {spans:?}");
+        }
+
+        let (ids, _) = search_ordered(&sender, "将军", 5, SearchWindow::default()).await;
+        assert_eq!(ids, vec![400, 399, 398, 397, 396]);
+    }
+
+    #[tokio::test]
+    async fn a_verified_search_reads_the_store_for_the_page_only() {
+        let sender = make_sender_with_options(ordered_options());
+        // Sort key = primary id; "abcd" is past max_gram (3) and every row contains it.
+        // Sent as one batch so they share a commit and land in a few segments together; one
+        // segment per row would make every segment a single candidate and prove nothing.
+        let mut acks = Vec::new();
+        for n in 1..=30u64 {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    n.into(),
+                    format!("x{n}abcdx"),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        let segments = sender
+            .stats(make_index_key())
+            .await
+            .unwrap()
+            .tantivy
+            .segment_count;
+        assert!(
+            segments < 30,
+            "expected the rows to share segments, got {segments}"
+        );
+
+        let (ids, _) = search_ordered(&sender, "abcd", 5, SearchWindow::default()).await;
+        assert_eq!(ids, vec![30, 29, 28, 27, 26]);
+
+        // The candidates the walk scanned (the top segment's, at least; a lower segment may be
+        // pruned by its bounds) versus the 5 it read to verify; the page's ids come from the id
+        // column the walk reads anyway.
+        let walk = sender.stats(make_index_key()).await.unwrap().walk;
+        assert!(walk.postings_scanned >= 5, "{walk:?}");
+        assert_eq!(walk.heap_entrants, 5, "{walk:?}");
+        assert_eq!(walk.store_reads, 5, "{walk:?}");
+    }
+
     /// The columns are opened once per segment: by the commit tick after the reload that made the
     /// segment searchable, or by a search that comes first, and never again -- and the time
     /// before the first posting is part of the walk time.
@@ -1536,7 +1742,7 @@ mod tests {
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
     async fn columns_are_opened_once_per_segment() {
-        let sender = make_sender_with_options(IndexOptionsPattern::default());
+        let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
         // A merge makes a new segment, whose columns are opened once too, so only readings
@@ -1566,17 +1772,220 @@ mod tests {
         }
     }
 
+    /// Paging by cursor: the pages are disjoint, in order, and together cover every match.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn cursor_pages_are_disjoint_and_cover_every_match() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (first, cursor) = search_ordered(&sender, "将军", 2, SearchWindow::default()).await;
+        assert_eq!(first, vec![3, 2]);
+        let cursor = cursor.expect("a full page leaves a cursor");
+
+        let (second, cursor) = search_ordered(&sender, "将军", 2, resume(cursor)).await;
+        assert_eq!(second, vec![1]);
+        assert_eq!(
+            cursor, None,
+            "a page the walk could not fill is the last one"
+        );
+
+        let seen: Vec<i64> = first.into_iter().chain(second).collect();
+        assert_eq!(seen, vec![3, 2, 1]);
+    }
+
+    /// A cursor is an invitation to ask again, so it is only offered when the walk filled the page.
+    /// Offering one after an exhausted walk costs the caller a round trip that returns nothing, and
+    /// tells a client there are more pages when there are not.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn an_unfilled_page_offers_no_cursor() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        // Three matches, asked for ten.
+        let (ids, cursor) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
+        assert_eq!(ids, vec![3, 2, 1]);
+        assert_eq!(
+            cursor, None,
+            "the walk ran out, so there is nothing to resume from"
+        );
+
+        // Exactly as many as there are: the walk stopped because the page was full, not because it
+        // ran out, so it cannot tell that the next page would be empty and says so with a cursor.
+        let (ids, cursor) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
+        assert_eq!(ids, vec![3, 2, 1]);
+        assert!(cursor.is_some(), "a filled page leaves a cursor");
+    }
+
     /// No match at all is not a page to resume either.
     #[rstest]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
     async fn an_empty_page_offers_no_cursor() {
-        let sender = make_sender_with_options(IndexOptionsPattern::default());
+        let sender = make_sender_with_options(ordered_options());
         add_docs(&sender, NICKNAMES).await;
 
         let (ids, cursor) = search_ordered(&sender, "没有人", 10, SearchWindow::default()).await;
         assert!(ids.is_empty(), "got {ids:?}");
         assert_eq!(cursor, None);
+    }
+
+    /// A keyword longer than `max_gram` takes the verification path, where the sort key is read
+    /// before the document store rather than after. The answer must be the same.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn ordering_holds_for_a_keyword_past_max_gram() {
+        let sender = make_sender_with_options(IndexOptionsPattern {
+            order_by: "sort_col".parse().unwrap(),
+            ..options(true)
+        });
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, _) = search_ordered(&sender, "将军来了", 10, SearchWindow::default()).await;
+        assert_eq!(ids, vec![3]);
+    }
+
+    /// Reading past the end yields an empty page rather than an error.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn paging_past_the_last_match_is_empty() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, _) = search_ordered(&sender, "将军", 10, window(Some(sort_key(1)))).await;
+        assert!(ids.is_empty(), "got {ids:?}");
+    }
+
+    /// A table whose sort column has ties: rows 1..=n share a sort key in pairs (1 and 2 sort
+    /// as 1, 3 and 4 as 2, ...), so a page boundary can fall between two rows with one key.
+    fn make_table_with_ties() -> Arc<RwLock<MockTableSearch>> {
+        let index_id = IndexIdGenerator::new().next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+        let mut mock = MockTableSearch::new();
+        mock.expect_index_id()
+            .returning(move |_index_key| Some(index_id));
+        mock.expect_partition_id()
+            .returning(move |_index_key, _restrictions| Some((partition_id, None)));
+        mock.expect_primary_key()
+            .returning(|_partition_id, primary_id| {
+                Some(PrimaryKey::from(vec![CqlValue::BigInt(
+                    u64::from(primary_id) as i64,
+                )]))
+            });
+        mock.expect_column_value_for()
+            .returning(|_partition_id, primary_id, _column| {
+                Some(CqlValue::BigInt((u64::from(primary_id) as i64 + 1) / 2))
+            });
+        mock.expect_is_valid_for().returning(|_, _, _| true);
+        mock.expect_target_column().returning(|_| None);
+        Arc::new(RwLock::new(mock))
+    }
+
+    fn make_sender_with_ties(options: IndexOptionsPattern) -> mpsc::Sender<PatternIndex> {
+        new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options,
+                key_layout: test_layout(),
+            },
+            make_table_with_ties(),
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            TEST_COMMIT_INTERVAL,
+            TEST_COMMIT_THRESHOLD,
+            None,
+        )
+    }
+
+    /// Every page is followed from its cursor until none is offered; the pages concatenated.
+    async fn all_pages(
+        sender: &mpsc::Sender<PatternIndex>,
+        query: &str,
+        page: usize,
+    ) -> (Vec<i64>, usize) {
+        let mut seen = Vec::new();
+        let mut pages = 0;
+        let mut window = SearchWindow::default();
+        loop {
+            let (ids, cursor) = search_ordered(sender, query, page, window).await;
+            pages += 1;
+            seen.extend(ids);
+            match cursor {
+                Some(cursor) => window = resume(cursor),
+                None => return (seen, pages),
+            }
+        }
+    }
+
+    /// Rows sharing a sort key are neither skipped nor repeated across a page boundary, whatever
+    /// the page size: the cursor names the last row, and the tie is broken on it.
+    #[rstest]
+    #[case::pages_split_every_tie(3)]
+    #[case::pages_of_one(1)]
+    #[case::pages_align_with_the_ties(2)]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn ties_are_paged_without_gaps_or_repeats(#[case] page: usize) {
+        let sender = make_sender_with_ties(ordered_options());
+        let docs: Vec<(u64, String)> = (1..=7).map(|i| (i, format!("user{i}将军"))).collect();
+        let docs: Vec<(u64, &str)> = docs.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        add_docs(&sender, &docs).await;
+
+        // Sort keys 1,1,2,2,3,3,4 for ids 1..=7. Declared DESC: highest key first, and rows
+        // sharing a key in table order, i.e. by token.
+        let mut expected: Vec<i64> = (1..=7).collect();
+        expected.sort_by_key(|id| (Reverse((id + 1) / 2), token_of(*id as u64)));
+        let (seen, _) = all_pages(&sender, "将军", page).await;
+        assert_eq!(seen, expected);
+    }
+
+    /// A cursor resumes strictly after its row, found by key, so a row deleted since resumes
+    /// exactly too. One that names no row resumes at its prefix inclusive: the rows sharing it come
+    /// again, which a client can dedupe, rather than being lost, which it cannot repair.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_cursor_resumes_after_its_row_and_without_one_takes_its_prefix_again() {
+        let sender = make_sender_with_ties(ordered_options());
+        let docs: Vec<(u64, String)> = (1..=6).map(|i| (i, format!("user{i}将军"))).collect();
+        let docs: Vec<(u64, &str)> = docs.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        add_docs(&sender, &docs).await;
+        let mut expected: Vec<i64> = (1..=6).collect();
+        expected.sort_by_key(|id| (Reverse((id + 1) / 2), token_of(*id as u64)));
+
+        let (first, cursor) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
+        assert_eq!(first, expected[..3]);
+        let cursor = cursor.unwrap();
+        assert_eq!(
+            cursor.primary_key,
+            Some(PrimaryKey::from(vec![CqlValue::BigInt(expected[2])]))
+        );
+
+        // With the row: strictly after it.
+        let (second, _) = search_ordered(&sender, "将军", 3, resume(cursor.clone())).await;
+        assert_eq!(second, expected[3..]);
+        // The row deleted since: still exactly after it.
+        rm_doc(&sender, expected[2] as u64).await;
+        let (second, _) = search_ordered(&sender, "将军", 3, resume(cursor.clone())).await;
+        assert_eq!(second, expected[3..]);
+        add_doc(
+            &sender,
+            expected[2] as u64,
+            &format!("user{}将军", expected[2]),
+        )
+        .await;
+        // Without a key: the row with the cursor's prefix comes again, nothing is lost.
+        let unknown = Cursor {
+            prefix: cursor.prefix,
+            primary_key: None,
+        };
+        let (second, _) = search_ordered(&sender, "将军", 3, resume(unknown)).await;
+        assert_eq!(second, expected[2..5]);
     }
 
     /// A pattern tied to the start or the end of the value takes the same walk: it is ordered and
@@ -1739,6 +2148,72 @@ mod tests {
             }
             assert_eq!(seen, expected, "page {page}");
         }
+    }
+
+    /// Several ordering columns with their own directions: the first decides, the second breaks
+    /// its ties, and table order breaks theirs. Naming the first column's other direction walks
+    /// the exact reverse.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn several_ordering_columns_order_with_their_own_directions() {
+        // a = id % 3 (few values, many ties), b = id % 5.
+        let value_of = |id: u64, column: &str| match column {
+            "a" => Some(CqlValue::Int((id % 3) as i32)),
+            "b" => Some(CqlValue::Int((id % 5) as i32)),
+            _ => None,
+        };
+        let sender = make_sender_for(
+            IndexOptionsPattern {
+                order_by: "a DESC, b ASC".parse().unwrap(),
+                ..IndexOptionsPattern::default()
+            },
+            make_table(bigint_key, value_of),
+            test_layout(),
+        );
+        let docs: Vec<(u64, String)> = (1..=30).map(|i| (i, format!("user{i}将军"))).collect();
+        let docs: Vec<(u64, &str)> = docs.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        add_docs(&sender, &docs).await;
+        let mut expected: Vec<i64> = (1..=30).collect();
+        expected.sort_by_key(|id| (Reverse(id % 3), id % 5, token_of(*id as u64)));
+
+        assert_eq!(every_page(&sender, "将军", 4).await, expected);
+        assert_eq!(every_page(&sender, "将军", 7).await, expected);
+    }
+
+    /// A row whose ordering column is null or empty is not in an ordered index -- not in the
+    /// order, and not in a range below every value, where a null used to land as sort key 0 --
+    /// and a later value brings it in.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_row_without_an_ordering_value_is_left_out() {
+        // Ids up to 3 have no value (1 null, 2 empty); the rest sort by their id.
+        let value_of = |id: u64, _: &str| match id {
+            1 => None,
+            2 | 3 => Some(CqlValue::Empty),
+            _ => Some(CqlValue::BigInt(id as i64)),
+        };
+        let sender = make_sender_for(
+            ordered_options(),
+            make_table(bigint_key, value_of),
+            test_layout(),
+        );
+        add_docs(
+            &sender,
+            &[
+                (1, "a将军"),
+                (2, "b将军"),
+                (3, "c将军"),
+                (4, "d将军"),
+                (5, "e将军"),
+            ],
+        )
+        .await;
+
+        let (ids, _) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
+        assert_eq!(ids, vec![5, 4]);
+        assert_eq!(sender.count(make_index_key()).await.unwrap(), 2);
     }
 
     /// A segment holding the last tokens of one value and the first of the next spans what its

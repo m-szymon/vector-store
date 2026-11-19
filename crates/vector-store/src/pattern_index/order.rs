@@ -13,6 +13,7 @@
 //! of a scan of the table -- is token, then partition key, then clustering key in the schema's
 //! clustering order; this module reproduces ScyllaDB's comparators for the key types it supports.
 
+use crate::MAX_ORDER_COLUMNS;
 use crate::PrimaryKey;
 use scylla::cluster::metadata::ColumnType;
 use scylla::cluster::metadata::NativeType;
@@ -24,8 +25,8 @@ use std::cmp::Ordering;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-/// Slots in a [`SortPrefix`]: the token, and one more, as a layout key is two slots wide.
-pub(crate) const PREFIX_SLOTS: usize = 2;
+/// Slots in a [`SortPrefix`]: every ordering column, and the token.
+pub(crate) const PREFIX_SLOTS: usize = MAX_ORDER_COLUMNS + 1;
 
 /// The integer part of a row's place in its index's order: the ordering columns, then the token,
 /// in the index's own (ascending) space. Slots past the index's columns are zero for every row,
@@ -628,8 +629,8 @@ mod tests {
 
     #[test]
     fn a_prefix_reverses_by_complement_and_lays_out_by_its_first_two_slots() {
-        let a = SortPrefix([1, 5]);
-        let b = SortPrefix([1, 6]);
+        let a = SortPrefix([1, 5, 0, 0, 0]);
+        let b = SortPrefix([1, 6, 0, 0, 0]);
         assert!(a < b && a.complement() > b.complement());
         assert_eq!(a.layout_key(), (1u128 << 64) | 5);
     }

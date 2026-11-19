@@ -1245,6 +1245,7 @@ mod tests {
     async fn get_indexes_returns_pattern_index() {
         let options = IndexOptionsPattern {
             case_sensitive: false.into(),
+            ..Default::default()
         };
         let db = db::tests::new(mock_db_with_pattern_index(Some(options.clone())));
 

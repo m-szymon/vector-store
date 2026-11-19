@@ -17,6 +17,7 @@ use crate::Metrics;
 use crate::NonRetryable;
 use crate::NonemptyArc;
 use crate::NonemptyBox;
+use crate::OrderBy;
 use crate::Percentage;
 use crate::PrimaryKey;
 use crate::Progress;
@@ -470,7 +471,7 @@ impl<T: DbDriver> Statements<T> {
         );
 
         let target_columns = metadata.target_columns.clone();
-        let filtering_columns: Arc<[_]> = metadata.nonpk_filtering_columns().cloned().collect();
+        let filtering_columns: Arc<[_]> = metadata.ingested_value_columns().cloned().collect();
 
         let is_alternator = KeyspaceIdentifier::from(&metadata.keyspace_name).is_alternator();
         let real_columns: HashMap<ColumnName, NativeType> = db_driver
@@ -491,6 +492,7 @@ impl<T: DbDriver> Statements<T> {
                 .map(|(name, typ)| (name.clone(), typ.clone())),
             is_alternator,
         ));
+        validate_order(&metadata, &table_columns)?;
         // Checked against the driver's table now: the query for the clustering order below must
         // not hold on to it.
         let needs_clustering_order = check_key_for_order(&db_driver, table, &metadata)?;
@@ -821,6 +823,50 @@ fn range_length(begin: Token, end: Token) -> u64 {
     end.value().abs_diff(begin.value() - 1)
 }
 
+/// Refuses a pattern index whose `order_by` did not parse or names a column that cannot be
+/// ordered.
+///
+/// Checked here rather than where the option is parsed, because `get_pattern_index_params` sees
+/// only names and an options map, while by this point the table's columns are resolved.
+///
+/// Refusing is deliberate. An unparsable scalar option falls back to its default, which is harmless
+/// -- a different gram size still answers correctly. An order quietly dropped would leave
+/// `ORDER BY` answering in another order, which looks like a plausible result and is wrong.
+/// Better to have no index than one that silently misorders.
+fn validate_order(
+    metadata: &IndexMetadata,
+    table_columns: &HashMap<ColumnName, NativeType>,
+) -> anyhow::Result<()> {
+    let Some(options) = metadata.kind.as_pattern() else {
+        return Ok(());
+    };
+    if let OrderBy::Invalid(value) = &options.order_by {
+        anyhow::bail!(
+            "pattern index {}.{} has an order_by option that does not parse: '{value}'",
+            metadata.keyspace_name,
+            metadata.index_name,
+        );
+    }
+    for column in options.order_by.columns() {
+        let order_by = &column.name;
+        let Some(native_type) = table_columns.get(order_by) else {
+            anyhow::bail!(
+                "pattern index {}.{} orders by column {order_by}, which the table does not have",
+                metadata.keyspace_name,
+                metadata.index_name,
+            );
+        };
+        anyhow::ensure!(
+            crate::cql_types::is_orderable(native_type),
+            "pattern index {}.{} orders by column {order_by} of type {native_type:?}, \
+             which has no ordering the index can use",
+            metadata.keyspace_name,
+            metadata.index_name,
+        );
+    }
+    Ok(())
+}
+
 /// Refuses a pattern index -- every one keeps table order, after its declared columns if any --
 /// on a table whose tokens are not Murmur3 hashes or whose key has a column of a type table order does not support,
 /// rather than answering in a wrong order. Returns whether the index needs the clustering order.
@@ -829,7 +875,11 @@ fn check_key_for_order<T: DbDriver>(
     table: &T::Table,
     metadata: &IndexMetadata,
 ) -> anyhow::Result<bool> {
-    if metadata.kind.as_pattern().is_none() {
+    let ordered = metadata
+        .kind
+        .as_pattern()
+        .is_some_and(|options| !matches!(options.order_by, crate::OrderBy::Invalid(_)));
+    if !ordered {
         return Ok(false);
     }
     anyhow::ensure!(

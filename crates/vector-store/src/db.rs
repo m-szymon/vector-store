@@ -28,6 +28,7 @@ use crate::KeyspaceName;
 use crate::Metrics;
 use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
+use crate::OrderBy;
 use crate::Positions;
 use crate::Quantization;
 use crate::SpaceType;
@@ -600,7 +601,19 @@ async fn process<T: DbDriver>(
 /// The options of a pattern index.
 fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPattern {
     let case_sensitive: CaseSensitive = parse_index_option(options, "case_sensitive");
-    IndexOptionsPattern { case_sensitive }
+    // Only the syntax; that the columns exist and can be ordered is checked later, where the
+    // table's schema is in hand. A value that does not parse is kept as `Invalid`, not replaced
+    // by the default, so that the index is refused rather than answering in another order.
+    let order_by: OrderBy = options.get("order_by").map_or(OrderBy::Table, |value| {
+        value.parse().unwrap_or_else(|err| {
+            warn!("invalid value '{value}' of the index option 'order_by': {err}");
+            OrderBy::Invalid(value.as_str().into())
+        })
+    });
+    IndexOptionsPattern {
+        case_sensitive,
+        order_by,
+    }
 }
 
 /// Parses a single value of an index `options` map, falling back to its default
@@ -1660,6 +1673,27 @@ pub(crate) mod tests {
             Some(DbIndexKind::FullTextSearch)
         );
         assert!(!options.contains_key("class_name"));
+    }
+
+    #[test]
+    fn pattern_index_options_are_read_with_their_defaults() {
+        let options = |pairs: &[(&str, &str)]| {
+            pattern_index_options(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
+        };
+        // No order_by is table order.
+        let table_order = options(&[]);
+        assert_eq!(table_order.order_by, OrderBy::Table);
+
+        // A value that does not parse is kept, to be refused, rather than read as table order.
+        assert!(matches!(
+            options(&[("order_by", "a b")]).order_by,
+            OrderBy::Invalid(_)
+        ));
     }
 
     #[test]

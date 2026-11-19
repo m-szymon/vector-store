@@ -183,6 +183,7 @@ async fn pattern_index_visible_in_indexes() {
         2,
         IndexOptionsPattern {
             case_sensitive: false.into(),
+            ..Default::default()
         },
     )
     .await;
@@ -194,7 +195,8 @@ async fn pattern_index_visible_in_indexes() {
     assert_eq!(
         indexes[0].options,
         IndexOptions::Pattern(PatternIndexOptions {
-            case_sensitive: false
+            order_by: None,
+            case_sensitive: false,
         })
     );
 }
@@ -333,6 +335,7 @@ async fn pattern_like_search_ignores_letter_case_when_not_case_sensitive() {
         2,
         IndexOptionsPattern {
             case_sensitive: false.into(),
+            ..Default::default()
         },
     )
     .await;

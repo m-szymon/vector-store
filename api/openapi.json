@@ -954,6 +954,13 @@
           "case_sensitive": {
             "type": "boolean",
             "description": "Whether matching distinguishes letter case."
+          },
+          "order_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The column results are ordered by, or absent for unspecified order."
           }
         }
       },
