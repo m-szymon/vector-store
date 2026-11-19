@@ -36,6 +36,7 @@ use crate::pattern_index::Cursor;
 use crate::pattern_index::PatternIndex;
 use crate::pattern_index::PatternIndexExt;
 use crate::pattern_index::SearchWindow;
+use crate::pattern_index::SortOrder;
 use crate::perf;
 use crate::vector;
 use crate::vs_index;
@@ -1355,7 +1356,9 @@ Returns primary keys of the documents matched to the provided pattern. \
 The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, \
 '\\' is the escape character, and matching is case-sensitive unless the index was created \
 with 'case_sensitive' set to false. \
-The rows come in table order (by token, then partition key, then clustering key), a page at a time: \
+The rows come in the index's order, a page at a time: an index created without 'order_by' keeps table order \
+(by token, then partition key, then clustering key), one with 'order_by' columns keeps the order of those columns \
+and then table order, and 'order' names the direction along the first of them. \
 the optional 'limit' parameter in the payload is the size of a page, and a response that filled its page \
 carries 'next_cursor', which the next request passes back as 'cursor' to read the following page. \
 If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
@@ -1479,7 +1482,13 @@ async fn post_index_like(
             index_key.clone(),
             request.pattern,
             request.limit.into(),
-            SearchWindow { cursor },
+            SearchWindow {
+                order: request.order.map(|order| match order {
+                    httpapi::SortOrder::Desc => SortOrder::Desc,
+                    httpapi::SortOrder::Asc => SortOrder::Asc,
+                }),
+                cursor,
+            },
         )
         .await;
 

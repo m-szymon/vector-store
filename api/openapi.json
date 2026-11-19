@@ -467,7 +467,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Performs a LIKE 'pattern' search query against the specified index. Returns primary keys of the documents matched to the provided pattern. The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, '\\' is the escape character, and matching is case-sensitive unless the index was created with 'case_sensitive' set to false. The rows come in table order (by token, then partition key, then clustering key), a page at a time: the optional 'limit' parameter in the payload is the size of a page, and a response that filled its page carries 'next_cursor', which the next request passes back as 'cursor' to read the following page. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+        "description": "Performs a LIKE 'pattern' search query against the specified index. Returns primary keys of the documents matched to the provided pattern. The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, '\\' is the escape character, and matching is case-sensitive unless the index was created with 'case_sensitive' set to false. The rows come in the index's order, a page at a time: an index created without 'order_by' keeps table order (by token, then partition key, then clustering key), one with 'order_by' columns keeps the order of those columns and then table order, and 'order' names the direction along the first of them. the optional 'limit' parameter in the payload is the size of a page, and a response that filled its page carries 'next_cursor', which the next request passes back as 'cursor' to read the following page. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
         "operationId": "post_index_like",
         "parameters": [
           {
@@ -1453,6 +1453,17 @@
             "$ref": "#/components/schemas/Limit",
             "description": "The maximum number of primary keys to return: the size of a page."
           },
+          "order": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SortOrder",
+                "description": "The direction along the index's first ordering column: the declared order when it matches the column's declared direction, its exact reverse otherwise. The declared order when absent; for an index in table order, that is ascending."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "pattern": {
             "type": "string",
             "description": "The text pattern to search for."
@@ -1475,7 +1486,7 @@
           },
           "primary_keys": {
             "type": "object",
-            "description": "Primary keys of the matching rows, one array of values per primary key column, in table order.",
+            "description": "Primary keys of the matching rows, one array of values per primary key column, in the index's order: its `order_by` columns, then table order; table order alone without `order_by`.",
             "additionalProperties": {
               "type": "array",
               "items": {}
@@ -1501,6 +1512,14 @@
         "type": "number",
         "format": "float",
         "description": "Similarity score between vectors derived from the distance. Higher score means more similar."
+      },
+      "SortOrder": {
+        "type": "string",
+        "description": "The direction of an ordered pattern search along its first ordering column.",
+        "enum": [
+          "desc",
+          "asc"
+        ]
       },
       "Vector": {
         "type": "array",

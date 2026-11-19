@@ -19,6 +19,7 @@ pub(crate) use actor::Cursor;
 pub(crate) use actor::PatternIndex;
 pub(crate) use actor::PatternIndexExt;
 pub(crate) use actor::SearchWindow;
+pub(crate) use actor::SortOrder;
 pub(crate) use factory::PatternIndexConfiguration;
 pub(crate) use factory::PatternIndexFactory;
 pub use order::KeyLayout;

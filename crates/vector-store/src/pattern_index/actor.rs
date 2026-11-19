@@ -15,6 +15,15 @@ use crate::vs_index::CountR;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+/// The direction an ordered search asks for, on the index's first ordering column. The node turns
+/// it into "the declared order" or "its reverse"; a search that names none gets the declared order,
+/// which for an index in table order is ascending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SortOrder {
+    Desc,
+    Asc,
+}
+
 /// Where a page ended: the sort prefix of its last row and that row's primary key, so that the
 /// next page resumes among the rows sharing that prefix instead of skipping them. The primary key
 /// is `None` when the row was gone by the time the page was assembled; a resume from such a cursor
@@ -25,9 +34,10 @@ pub(crate) struct Cursor {
     pub(crate) primary_key: Option<PrimaryKey>,
 }
 
-/// What a search may return: what comes after the cursor of the previous page.
+/// What an ordered search may return: a direction, and the cursor of the previous page.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SearchWindow {
+    pub(crate) order: Option<SortOrder>,
     pub(crate) cursor: Option<Cursor>,
 }
 

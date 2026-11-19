@@ -528,6 +528,27 @@ pub struct PostIndexHighlightResponse {
     pub highlights: Vec<Option<String>>,
 }
 
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Deserialize,
+    serde::Serialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+/// The direction of an ordered pattern search along its first ordering column.
+pub enum SortOrder {
+    /// Highest sort key first; for a timestamp, newest first.
+    #[default]
+    Desc,
+    /// Lowest sort key first.
+    Asc,
+}
+
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Request body for LIKE search.
 pub struct PostIndexLikeRequest {
@@ -539,12 +560,15 @@ pub struct PostIndexLikeRequest {
     /// Resume a search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's place in the index's order and its primary key).
     #[serde(default)]
     pub cursor: Option<String>,
+    /// The direction along the index's first ordering column: the declared order when it matches the column's declared direction, its exact reverse otherwise. The declared order when absent; for an index in table order, that is ascending.
+    #[serde(default)]
+    pub order: Option<SortOrder>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Response for LIKE search.
 pub struct PostIndexLikeResponse {
-    /// Primary keys of the matching rows, one array of values per primary key column, in table order.
+    /// Primary keys of the matching rows, one array of values per primary key column, in the index's order: its `order_by` columns, then table order; table order alone without `order_by`.
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
     /// Pass as the next request's `cursor`, unchanged, to read the following page. Absent when this page exhausted the matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]

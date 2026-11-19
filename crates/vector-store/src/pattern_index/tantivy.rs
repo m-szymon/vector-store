@@ -89,6 +89,7 @@ use super::actor::PatternIndex;
 use super::actor::PatternLikeR;
 use super::actor::PatternPage;
 use super::actor::SearchWindow;
+use super::actor::SortOrder;
 use super::factory::PatternIndexConfiguration;
 use super::factory::PatternIndexFactory;
 use super::gram;
@@ -990,10 +991,19 @@ fn handle_like(
     let limit: usize = (*limit.as_ref()).into();
     let partition_id = find_partition_id(table.read().unwrap().deref(), index_key)?;
     let (primary_ids, next_cursor) = {
+        let columns = state.backend().options.order_by.columns();
+        // The request names a direction for the first ordering column; the walk needs to know
+        // whether that is the declared order or its reverse. None is the declared order, and an
+        // index in table order declares ascending.
+        let first_descending = columns.first().is_some_and(|column| column.descending);
+        let forward = match window.order {
+            None => true,
+            Some(SortOrder::Asc) => !first_descending,
+            Some(SortOrder::Desc) => first_descending,
+        };
         let key_of =
             |primary_id: PrimaryId| table.read().unwrap().primary_key(partition_id, primary_id);
-        // The index's declared order, from its start.
-        let sort_window = SortWindow::new(true, window.cursor);
+        let sort_window = SortWindow::new(forward, window.cursor);
         collect_matches_ordered(state, &like, limit, sort_window, &key_of)?
     };
 
@@ -1409,6 +1419,7 @@ mod tests {
     /// mirrors the primary id, so the row is named from the key's value.
     fn window(cursor: Option<u64>) -> SearchWindow {
         SearchWindow {
+            order: Some(SortOrder::Desc),
             cursor: cursor.map(|sort_key| {
                 let id = (sort_key ^ (1 << 63)) as i64;
                 // Declared DESC, so the column's key is stored complemented.
@@ -1423,10 +1434,18 @@ mod tests {
         }
     }
 
-    /// The window that resumes after a page.
-    fn resume(cursor: Cursor) -> SearchWindow {
+    /// The window that resumes after a page, in the given direction.
+    fn resume(order: SortOrder, cursor: Cursor) -> SearchWindow {
         SearchWindow {
+            order: Some(order),
             cursor: Some(cursor),
+        }
+    }
+
+    fn ascending() -> SearchWindow {
+        SearchWindow {
+            order: Some(SortOrder::Asc),
+            cursor: None,
         }
     }
 
@@ -1784,7 +1803,8 @@ mod tests {
         assert_eq!(first, vec![3, 2]);
         let cursor = cursor.expect("a full page leaves a cursor");
 
-        let (second, cursor) = search_ordered(&sender, "将军", 2, resume(cursor)).await;
+        let (second, cursor) =
+            search_ordered(&sender, "将军", 2, resume(SortOrder::Desc, cursor)).await;
         assert_eq!(second, vec![1]);
         assert_eq!(
             cursor, None,
@@ -1907,16 +1927,20 @@ mod tests {
         sender: &mpsc::Sender<PatternIndex>,
         query: &str,
         page: usize,
+        order: SortOrder,
     ) -> (Vec<i64>, usize) {
         let mut seen = Vec::new();
         let mut pages = 0;
-        let mut window = SearchWindow::default();
+        let mut window = SearchWindow {
+            order: Some(order),
+            cursor: None,
+        };
         loop {
             let (ids, cursor) = search_ordered(sender, query, page, window).await;
             pages += 1;
             seen.extend(ids);
             match cursor {
-                Some(cursor) => window = resume(cursor),
+                Some(cursor) => window = resume(order, cursor),
                 None => return (seen, pages),
             }
         }
@@ -1937,10 +1961,14 @@ mod tests {
         add_docs(&sender, &docs).await;
 
         // Sort keys 1,1,2,2,3,3,4 for ids 1..=7. Declared DESC: highest key first, and rows
-        // sharing a key in table order, i.e. by token.
+        // sharing a key in table order, i.e. by token. Ascending is the exact reverse.
         let mut expected: Vec<i64> = (1..=7).collect();
         expected.sort_by_key(|id| (Reverse((id + 1) / 2), token_of(*id as u64)));
-        let (seen, _) = all_pages(&sender, "将军", page).await;
+        let (seen, _) = all_pages(&sender, "将军", page, SortOrder::Desc).await;
+        assert_eq!(seen, expected);
+
+        let (seen, _) = all_pages(&sender, "将军", page, SortOrder::Asc).await;
+        expected.reverse();
         assert_eq!(seen, expected);
     }
 
@@ -1967,11 +1995,13 @@ mod tests {
         );
 
         // With the row: strictly after it.
-        let (second, _) = search_ordered(&sender, "将军", 3, resume(cursor.clone())).await;
+        let (second, _) =
+            search_ordered(&sender, "将军", 3, resume(SortOrder::Desc, cursor.clone())).await;
         assert_eq!(second, expected[3..]);
         // The row deleted since: still exactly after it.
         rm_doc(&sender, expected[2] as u64).await;
-        let (second, _) = search_ordered(&sender, "将军", 3, resume(cursor.clone())).await;
+        let (second, _) =
+            search_ordered(&sender, "将军", 3, resume(SortOrder::Desc, cursor.clone())).await;
         assert_eq!(second, expected[3..]);
         add_doc(
             &sender,
@@ -1984,8 +2014,34 @@ mod tests {
             prefix: cursor.prefix,
             primary_key: None,
         };
-        let (second, _) = search_ordered(&sender, "将军", 3, resume(unknown)).await;
+        let (second, _) =
+            search_ordered(&sender, "将军", 3, resume(SortOrder::Desc, unknown)).await;
         assert_eq!(second, expected[2..5]);
+    }
+
+    /// Ascending is the same walk the other way: lowest sort key first, a range honoured, the
+    /// cursor resuming above the last row, and no cursor once the walk ran out.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn ascending_order_walks_the_other_way() {
+        let sender = make_sender_with_options(ordered_options());
+        add_docs(&sender, NICKNAMES).await;
+
+        let (ids, cursor) = search_ordered(&sender, "将军", 2, ascending()).await;
+        assert_eq!(ids, vec![1, 2]);
+        let cursor = cursor.expect("a full page leaves a cursor");
+        // The page ended on the row with key 2; declared DESC, the column is stored complemented.
+        assert_eq!(cursor.prefix.0[0], !sort_key(2));
+
+        let (ids, cursor) =
+            search_ordered(&sender, "将军", 2, resume(SortOrder::Asc, cursor)).await;
+        assert_eq!(ids, vec![3]);
+        assert_eq!(cursor, None);
+
+        // Past max_gram too: the verified path orders the same way.
+        let (ids, _) = search_ordered(&sender, "将军来了", 10, ascending()).await;
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
     }
 
     /// A pattern tied to the start or the end of the value takes the same walk: it is ordered and
@@ -2002,11 +2058,11 @@ mod tests {
         let page = like(&sender, "%将军", 1, SearchWindow::default()).await;
         assert_eq!(ids_of(&page.primary_keys), expected[..1]);
         let cursor = page.next_cursor.expect("a full page leaves a cursor");
-        let page = like(&sender, "%将军", 1, resume(cursor)).await;
+        let page = like(&sender, "%将军", 1, resume(SortOrder::Asc, cursor)).await;
         assert_eq!(ids_of(&page.primary_keys), expected[1..]);
         // A filled page always leaves a cursor; the page after it is empty and leaves none.
         let cursor = page.next_cursor.expect("a full page leaves a cursor");
-        let page = like(&sender, "%将军", 1, resume(cursor)).await;
+        let page = like(&sender, "%将军", 1, resume(SortOrder::Asc, cursor)).await;
         assert!(page.primary_keys.is_empty());
         assert_eq!(page.next_cursor, None);
     }
@@ -2058,14 +2114,27 @@ mod tests {
     }
 
     /// Every page of a search, followed from its cursor; the pages concatenated.
-    async fn every_page(sender: &mpsc::Sender<PatternIndex>, query: &str, page: usize) -> Vec<i64> {
+    async fn every_page(
+        sender: &mpsc::Sender<PatternIndex>,
+        query: &str,
+        page: usize,
+        order: Option<SortOrder>,
+    ) -> Vec<i64> {
         let mut seen = Vec::new();
-        let mut window = SearchWindow::default();
+        let mut window = SearchWindow {
+            order,
+            cursor: None,
+        };
         loop {
             let (ids, cursor) = search_ordered(sender, query, page, window).await;
             seen.extend(ids);
             match cursor {
-                Some(cursor) => window = resume(cursor),
+                Some(cursor) => {
+                    window = SearchWindow {
+                        order,
+                        cursor: Some(cursor),
+                    }
+                }
                 None => return seen,
             }
         }
@@ -2094,7 +2163,14 @@ mod tests {
         assert!(cursor.is_some());
         let (ten, _) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         assert_eq!(ten, expected[..10]);
-        assert_eq!(every_page(&sender, "将军", 5).await, expected);
+        assert_eq!(every_page(&sender, "将军", 5, None).await, expected);
+        // Asked for descending, it is the exact reverse.
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        assert_eq!(
+            every_page(&sender, "将军", 5, Some(SortOrder::Desc)).await,
+            reversed
+        );
     }
 
     /// Rows of one partition come in clustering order, honouring a `DESC` clustering column, and
@@ -2140,6 +2216,7 @@ mod tests {
                 match found.next_cursor {
                     Some(cursor) => {
                         window = SearchWindow {
+                            order: None,
                             cursor: Some(cursor),
                         }
                     }
@@ -2177,8 +2254,16 @@ mod tests {
         let mut expected: Vec<i64> = (1..=30).collect();
         expected.sort_by_key(|id| (Reverse(id % 3), id % 5, token_of(*id as u64)));
 
-        assert_eq!(every_page(&sender, "将军", 4).await, expected);
-        assert_eq!(every_page(&sender, "将军", 7).await, expected);
+        assert_eq!(
+            every_page(&sender, "将军", 4, Some(SortOrder::Desc)).await,
+            expected
+        );
+        assert_eq!(every_page(&sender, "将军", 7, None).await, expected);
+        expected.reverse();
+        assert_eq!(
+            every_page(&sender, "将军", 4, Some(SortOrder::Asc)).await,
+            expected
+        );
     }
 
     /// A row whose ordering column is null or empty is not in an ordered index -- not in the
@@ -2213,6 +2298,8 @@ mod tests {
 
         let (ids, _) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
         assert_eq!(ids, vec![5, 4]);
+        let (ids, _) = search_ordered(&sender, "将军", 10, ascending()).await;
+        assert_eq!(ids, vec![4, 5]);
         assert_eq!(sender.count(make_index_key()).await.unwrap(), 2);
     }
 

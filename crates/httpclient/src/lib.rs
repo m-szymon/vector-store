@@ -227,6 +227,7 @@ impl HttpClient {
             pattern,
             limit,
             cursor,
+            order: None,
         };
         self.client
             .post(format!(
