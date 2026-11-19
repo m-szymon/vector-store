@@ -229,6 +229,9 @@ const LOAD_FRESH_ROWS: u64 = 400_000;
 /// lock wait for one range at a time whatever the cap. At a 1M cap a split moved up to two caps
 /// of rows in one hold.
 const REPAIR_LOCK_ROWS: usize = 50_000;
+/// How long a repair step lets the writes that waited through one of its holds go on before it
+/// takes the next: until none waits, or this long under a stream of them.
+const REPAIR_HANDOVER_LIMIT: Duration = Duration::from_millis(100);
 /// Ticks without a row of a full scan before the scan counts as ended.
 const SCAN_QUIET_TICKS: u32 = 5;
 /// Ticks without a CDC change before a stream of lagging ones counts as ended. A stream that
@@ -1560,6 +1563,10 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
         state
             .commit_and_reload(&mut writer)
             .map_err(|e| anyhow!("pattern: failed to commit a repair: {e}"))?;
+        // The writes that waited through this hold go before the next one.
+        drop(searcher);
+        drop(writer);
+        state.let_writes_in(REPAIR_HANDOVER_LIMIT);
     }
     let part_count = ranges.len();
 
