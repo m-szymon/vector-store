@@ -54,6 +54,9 @@ struct CdcConsumerData<T: DbDriver> {
     tx: mpsc::Sender<(DbIndexedRow, AsyncInProgress)>,
     metrics: Arc<Metrics>,
     semaphore: Arc<Semaphore>,
+    /// The CDC reader feeding this consumer, labelling its indexing lag: the fine reader's is how
+    /// long a change takes to become searchable, the wide one's is its delayed re-read.
+    reader: &'static str,
 }
 
 impl<T: DbDriver> CdcConsumerData<T> {
@@ -72,6 +75,7 @@ impl<T: DbDriver> CdcConsumerData<T> {
             self.metrics.indexing_lag.with_label_values(&[
                 self.index_key.keyspace().as_ref(),
                 self.index_key.index().as_ref(),
+                self.reader,
             ]),
             timestamp,
         );
@@ -171,6 +175,7 @@ impl<T: DbDriver> CdcConsumer<T> {
                     self.consumer_data.metrics.indexing_lag.with_label_values(&[
                         self.consumer_data.index_key.keyspace().as_ref(),
                         self.consumer_data.index_key.index().as_ref(),
+                        self.consumer_data.reader,
                     ]),
                     self.timestamp,
                 ),
@@ -259,6 +264,7 @@ impl<T: DbDriver> CdcConsumerFactory<T> {
         metrics: Arc<Metrics>,
         tx: mpsc::Sender<(DbIndexedRow, AsyncInProgress)>,
         semaphore: Arc<Semaphore>,
+        reader: &'static str,
     ) -> anyhow::Result<Self> {
         let cluster = db_driver.cluster(&session);
         let table = db_driver
@@ -317,6 +323,7 @@ impl<T: DbDriver> CdcConsumerFactory<T> {
             tx,
             metrics,
             semaphore,
+            reader,
         })))
     }
 }
