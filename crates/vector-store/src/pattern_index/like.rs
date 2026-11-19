@@ -196,6 +196,23 @@ impl LikeQuery {
         }
     }
 
+    /// At most this many rows of the segment last opened match, `scorer` being its candidates.
+    ///
+    /// For grams, the rows of the rarest one, not the intersection's own estimate: that takes the
+    /// grams for independent, and the grams of a pattern the values do hold come together, so it
+    /// falls short by the frequency of each gram past the first.
+    pub(super) fn matches_bound(&self, scorer: &dyn Scorer) -> u32 {
+        match &self.candidates {
+            Candidates::All(_) => scorer.size_hint(),
+            Candidates::Grams(probe) => probe
+                .found
+                .iter()
+                .map(|info| info.doc_freq)
+                .min()
+                .unwrap_or(0),
+        }
+    }
+
     /// Whether the stored value of a candidate matches the pattern. No value is read when the
     /// grams already prove the match.
     pub(super) fn value_matches(&self, store: &StoreReader, doc_id: DocId) -> anyhow::Result<bool> {

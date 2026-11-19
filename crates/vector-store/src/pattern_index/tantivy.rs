@@ -646,6 +646,205 @@ pub(crate) struct RewriteTotals {
     pub(crate) pending: bool,
 }
 
+/// The most runs a segment may be cut into for the walk to take it run by run: what they take
+/// in memory, a few dozen bytes each, is bounded by it.
+const MAX_RUNS: usize = 65_536;
+
+/// The doc ids of one block of a coarse run.
+const BLOCK_DOCS: u32 = 256;
+
+/// The fewest doc ids over which the layout key never decreases for the walk to take them as a
+/// sorted run, a row at a time from either end: a block's worth. Shorter ones are taken in
+/// blocks (see [`Run`]), which are as many to look at and coarser to read.
+const SORTED_RUN_DOCS: u32 = BLOCK_DOCS;
+
+/// A stretch of a segment's doc ids in the order of the layout key, for the walk to read from
+/// the end a page needs and no further than the page needs. Of two kinds:
+///
+/// - sorted: the key never decreases from a row to the next, or never increases. What a
+///   repair step writes, what an ordered merge of such pieces keeps, and what each of the
+///   writer's threads makes of rows that arrive in the index's order.
+/// - coarse: the rows between sorted runs, in blocks of `BLOCK_DOCS`, each with two bounds: the
+///   lowest key from it to the end of the run, and the highest from the start of the run to
+///   it (start and end by position: the run is reversed when its keys go down on the whole).
+///   Neither ever decreases from a block to the next, so the walk reads the blocks from
+///   either end as it does the rows of a sorted run, a block whole or not at all, and stops
+///   where the bound says the rest cannot enter the page. Rows that arrive in the index's
+///   order in commits too small for a thread's share to make a sorted run come out in
+///   blocks whose bounds follow one another closely, and a page reads the few at the end it
+///   is read from.
+///
+/// Rows in no order at all make a coarse run whose every block's bounds are about the run's
+/// own: the walk reads all of it, as it would the segment whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    start: u32,
+    end: u32,
+    /// The lowest and the highest key of its rows.
+    min: u128,
+    max: u128,
+    /// For a coarse run, where its blocks start among the segment's.
+    blocks: Option<u32>,
+    /// Whether the key goes down as the doc ids go up: rows that arrived in ascending order
+    /// in an index declared descending, whose keys are the complement of the values. The walk
+    /// counts a run's rows from the end its keys are lowest at, its *positions*, so a reversed
+    /// run reads like any other, from the other end of its doc ids.
+    reversed: bool,
+}
+
+impl Run {
+    fn len(&self) -> u32 {
+        self.end - self.start
+    }
+
+    /// The doc id of the row at `position`.
+    fn doc_at(&self, position: u32) -> u32 {
+        if self.reversed {
+            self.end - 1 - position
+        } else {
+            self.start + position
+        }
+    }
+
+    /// The doc ids of the rows at positions `from..to`.
+    fn docs(&self, from: u32, to: u32) -> (u32, u32) {
+        if self.reversed {
+            (self.end - to, self.end - from)
+        } else {
+            (self.start + from, self.start + to)
+        }
+    }
+
+    /// The positions of the rows with doc ids `from..to`.
+    fn positions(&self, from: u32, to: u32) -> (u32, u32) {
+        if self.reversed {
+            (self.end - to, self.end - from)
+        } else {
+            (from - self.start, to - self.start)
+        }
+    }
+
+    /// The block of a coarse run that holds `doc_id`, counted by position.
+    fn block_of(&self, doc_id: u32) -> u32 {
+        self.positions(doc_id, doc_id + 1).0 / BLOCK_DOCS
+    }
+
+    /// The lowest doc id at or over `doc_id` at which a block starts or ends; `doc_id` for a
+    /// sorted run, which is read by the row.
+    fn edge_up(&self, doc_id: u32) -> u32 {
+        match (self.blocks, self.reversed) {
+            (None, _) => doc_id,
+            (Some(_), false) => {
+                (self.start + (doc_id - self.start).div_ceil(BLOCK_DOCS) * BLOCK_DOCS).min(self.end)
+            }
+            (Some(_), true) => self.end - (self.end - doc_id) / BLOCK_DOCS * BLOCK_DOCS,
+        }
+    }
+}
+
+/// Doc ids `from..to` of a run for a pass of the walk to read.
+#[derive(Debug, Clone, Copy)]
+struct Region {
+    from: u32,
+    to: u32,
+    /// Which of the segment's runs; None for a segment read whole.
+    run: Option<u32>,
+}
+
+/// The runs of a segment and the bounds of the blocks of its coarse ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Runs {
+    runs: Vec<Run>,
+    /// Per block: the lowest key from it on, and the highest up to it, in its run.
+    blocks: Vec<(u128, u128)>,
+    /// Per block: the lowest and the highest key of its own rows. A block the walk comes to
+    /// that cannot enter the page by these is not read: of rows in no order, most blocks hold
+    /// none of the highest few.
+    own: Vec<(u128, u128)>,
+}
+
+/// The runs of the rows with layout keys `keys`, by doc id: the stretches where the key never
+/// decreases, or never increases, as sorted runs when at least `SORTED_RUN_DOCS` long, and what
+/// lies between them as coarse runs. None for no rows, or past `MAX_RUNS`.
+fn layout_runs(keys: &[u128]) -> Option<Runs> {
+    let mut found = Runs::default();
+    // Makes `from..to`, rows of sorted stretches too short to walk, a coarse run.
+    let coarse = |found: &mut Runs, from: usize, to: usize| {
+        if from == to {
+            return;
+        }
+        let mut run = Run {
+            start: from as u32,
+            end: to as u32,
+            min: 0,
+            max: 0,
+            blocks: Some(found.blocks.len() as u32),
+            reversed: keys[to - 1] < keys[from],
+        };
+        let first = found.blocks.len();
+        found
+            .blocks
+            .extend((0..run.len()).step_by(BLOCK_DOCS as usize).map(|position| {
+                let (from, to) = run.docs(position, run.len().min(position + BLOCK_DOCS));
+                let rows = &keys[from as usize..to as usize];
+                (
+                    rows.iter().copied().min().unwrap(),
+                    rows.iter().copied().max().unwrap(),
+                )
+            }));
+        found.own.extend_from_slice(&found.blocks[first..]);
+        let blocks = &mut found.blocks[first..];
+        // The bounds the walk reads by: no row from a block on is under its first, no row up
+        // to a block is over its second.
+        for block in 1..blocks.len() {
+            blocks[block].1 = blocks[block].1.max(blocks[block - 1].1);
+        }
+        for block in (1..blocks.len()).rev() {
+            blocks[block - 1].0 = blocks[block - 1].0.min(blocks[block].0);
+        }
+        run.min = blocks[0].0;
+        run.max = blocks[blocks.len() - 1].1;
+        found.runs.push(run);
+    };
+    // Where the rows not yet in a run start, the sorted stretch being read, and which way its
+    // keys go once two of them differ.
+    let mut pending = 0;
+    let mut start = 0;
+    let mut direction = std::cmp::Ordering::Equal;
+    for doc_id in 1..=keys.len() {
+        if doc_id < keys.len() {
+            let step = keys[doc_id].cmp(&keys[doc_id - 1]);
+            if step.is_eq() || step == direction {
+                continue;
+            }
+            if direction.is_eq() {
+                direction = step;
+                continue;
+            }
+        }
+        if doc_id - start >= SORTED_RUN_DOCS as usize {
+            coarse(&mut found, pending, start);
+            let (first, last) = (keys[start], keys[doc_id - 1]);
+            found.runs.push(Run {
+                start: start as u32,
+                end: doc_id as u32,
+                min: first.min(last),
+                max: first.max(last),
+                blocks: None,
+                reversed: direction.is_lt(),
+            });
+            pending = doc_id;
+        }
+        start = doc_id;
+        direction = std::cmp::Ordering::Equal;
+        if found.runs.len() > MAX_RUNS {
+            return None;
+        }
+    }
+    coarse(&mut found, pending, keys.len());
+    (!found.runs.is_empty() && found.runs.len() <= MAX_RUNS).then_some(found)
+}
+
 /// One segment's columnar handles and the layout bounds the pruning reads from them.
 #[derive(Clone)]
 struct SegmentColumns {
@@ -660,6 +859,11 @@ struct SegmentColumns {
     primary_id: Column<u64>,
     /// Whether a repair step placed every row: see `REPAIRED_FIELD`.
     repaired: bool,
+    /// The segment's doc ids cut into runs in the order of the layout key (see [`Run`]), so
+    /// that the walk can start a run at the end its page needs and stop once the run can no
+    /// longer enter it, rather than read every posting of the segment. None for a segment of
+    /// too many, which the walk reads whole.
+    runs: Option<Arc<Runs>>,
 }
 
 impl SegmentColumns {
@@ -763,13 +967,57 @@ impl PatternBackend {
             .fast_fields()
             .u64(REPAIRED_FIELD)
             .is_ok_and(|column| segment.max_doc() > 0 && column.min_value() == 1);
-        let columns = SegmentColumns {
+        let mut columns = SegmentColumns {
             slots,
             layout_min,
             layout_max,
             primary_id,
             repaired,
+            runs: None,
         };
+        // Deleted rows count: their keys sit where they sat.
+        let keys: Vec<u128> = (0..segment.max_doc())
+            .map(|doc_id| columns.layout_key(doc_id))
+            .collect();
+        columns.runs = layout_runs(&keys).map(Arc::new);
+        // What a page costs in a segment follows from its runs: a few long sorted ones where a
+        // repair wrote it, one coarse one where rows arrived in order and were adopted as they
+        // lay.
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && segment.max_doc() >= 20_000
+            && let Some(runs) = &columns.runs
+        {
+            let mut sorted: Vec<u32> = Vec::new();
+            let mut coarse: Vec<u32> = Vec::new();
+            for run in &runs.runs {
+                if run.blocks.is_some() {
+                    coarse.push(run.end - run.start);
+                } else {
+                    sorted.push(run.end - run.start);
+                }
+            }
+            sorted.sort_unstable();
+            coarse.sort_unstable();
+            let shape = |lengths: &[u32]| {
+                format!(
+                    "{} of {} rows (shortest {}, median {}, longest {})",
+                    lengths.len(),
+                    lengths.iter().sum::<u32>(),
+                    lengths.first().copied().unwrap_or(0),
+                    lengths.get(lengths.len() / 2).copied().unwrap_or(0),
+                    lengths.last().copied().unwrap_or(0)
+                )
+            };
+            debug!(
+                "pattern: segment of {} rows, repaired {}, keys {:x}..{:x}: sorted runs {}, coarse {}",
+                segment.max_doc(),
+                columns.repaired,
+                columns.layout_min >> 64,
+                columns.layout_max >> 64,
+                shape(&sorted),
+                shape(&coarse)
+            );
+        }
         *opened += 1;
         self.columns.write().unwrap().insert(id, columns.clone());
         Ok(columns)
@@ -1778,6 +2026,22 @@ impl SortWindow {
         }
     }
 
+    /// The highest oriented layout key the window lets in: the lower of the range's top and the
+    /// cursor's. None when neither bounds it.
+    fn top_layout_key(&self) -> Option<u128> {
+        let upper = self.upper.map(|upper| upper.layout_key());
+        let cursor = self.cursor.as_ref().map(|(cursor, _)| cursor.layout_key());
+        match (upper, cursor) {
+            (Some(upper), Some(cursor)) => Some(upper.min(cursor)),
+            (upper, cursor) => upper.or(cursor),
+        }
+    }
+
+    /// Whether rows at an oriented layout key of `key` or below may still be in the range.
+    fn reaches(&self, key: u128) -> bool {
+        self.lower.is_none_or(|lower| key >= lower.layout_key())
+    }
+
     /// Whether a segment spanning `[min, max]` (oriented layout keys) can hold anything in the
     /// window. Answered from the bounds alone, so a segment ruled out here is never opened. The
     /// layout key is only the first two slots, so a bound equal to it may still hold rows on
@@ -1881,7 +2145,9 @@ impl Page<'_> {
     }
 }
 
-/// One segment as an ordered walk reads it.
+/// One segment as an ordered walk reads it: the rows of a range of doc ids at a time, either the
+/// whole segment, or stretches of a sorted run from the end the page needs (see
+/// `SegmentColumns::runs`).
 struct RegionWalk<'a> {
     segment: &'a SegmentReader,
     segment_ord: u32,
@@ -1889,10 +2155,11 @@ struct RegionWalk<'a> {
     window: &'a SortWindow,
     ties: &'a Ties<'a>,
     key_of: &'a dyn Fn(PrimaryId) -> Option<PrimaryKey>,
-    like: &'a LikeQuery,
+    like: &'a mut LikeQuery,
     /// Opened for the first candidate to verify.
     store: Option<tantivy::store::StoreReader>,
-    /// The segment's postings for the query.
+    /// The postings, kept while the next range starts at or after where they stand: a scorer
+    /// only seeks forward.
     scorer: Option<Box<dyn Scorer>>,
 }
 
@@ -1936,22 +2203,74 @@ impl RegionWalk<'_> {
         }
     }
 
-    /// Offers the page every matching row of the segment, in one pass of the postings.
+    /// Offers the page the matching rows with doc ids in `regions`, which are disjoint and in
+    /// doc order, with one pass of the postings: opened once, or the ones left from the last
+    /// call if they stand before the first region, as postings only seek forward.
     fn scan(
         &mut self,
         page: &mut Page,
         tally: &mut WalkTally,
         candidates: &mut Vec<(SortPrefix, u32)>,
-    ) {
-        let Some(mut scorer) = self.scorer.take() else {
-            return;
+        regions: &mut [Region],
+    ) -> anyhow::Result<()> {
+        let Some(first) = regions.first().map(|region| region.from) else {
+            return Ok(());
         };
-        let mut doc_id = scorer.doc();
-        while doc_id != TERMINATED {
-            tally.postings_scanned += 1;
-            self.offer(page, tally, candidates, doc_id);
-            doc_id = scorer.advance();
+        let mut scorer = match self.scorer.take() {
+            Some(scorer) if scorer.doc() <= first => scorer,
+            _ => match self.like.candidates(self.segment)? {
+                Some(scorer) => scorer,
+                None => return Ok(()),
+            },
+        };
+        let forward = self.window.complement;
+        for region in regions {
+            let runs = region.run.and(self.columns.runs.as_deref());
+            let run = runs
+                .zip(region.run)
+                .map(|(runs, run)| &runs.runs[run as usize]);
+            let mut doc_id = if scorer.doc() < region.from {
+                scorer.seek(region.from)
+            } else {
+                scorer.doc()
+            };
+            // The posting to read at or after `doc_id`: past the blocks of a coarse run that
+            // cannot enter the page or the window by the keys of their own rows.
+            let mut block_end = 0;
+            let window = self.window;
+            let end = region.to;
+            let mut enter = |doc_id: u32, scorer: &mut Box<dyn Scorer>, page: &Page| {
+                let (Some(runs), Some(run)) = (runs, run) else {
+                    return doc_id;
+                };
+                let Some(first) = run.blocks else {
+                    return doc_id;
+                };
+                let mut doc_id = doc_id;
+                while doc_id >= block_end && doc_id < end {
+                    block_end = run.edge_up(doc_id + 1);
+                    let (min, max) = runs.own[(first + run.block_of(doc_id)) as usize];
+                    let best = if forward { !min } else { max };
+                    if !window.reaches(best)
+                        || page
+                            .weakest()
+                            .is_some_and(|weakest| best < weakest.prefix.layout_key())
+                    {
+                        doc_id = scorer.seek(block_end);
+                    }
+                }
+                doc_id
+            };
+            doc_id = enter(doc_id, &mut scorer, page);
+            while doc_id < region.to {
+                tally.postings_scanned += 1;
+                self.offer(page, tally, candidates, doc_id);
+                doc_id = scorer.advance();
+                doc_id = enter(doc_id, &mut scorer, page);
+            }
         }
+        self.scorer = Some(scorer);
+        Ok(())
     }
 
     /// Verifies `candidates` against the stored text, from the highest prefix down, and offers
@@ -1994,6 +2313,219 @@ impl RegionWalk<'_> {
         }
         *candidates = highest.into_vec();
         Ok(())
+    }
+
+    /// Walks the segment's `runs` from the end the page needs -- the highest layout keys, or,
+    /// for a walk over the complement, the lowest -- as a merge of them by key, a pass at a time,
+    /// each pass one pass of the postings.
+    ///
+    /// A pass has a floor, a key: every run reads its rows from the floor up and no further. The
+    /// floor is the highest of the keys the runs would reach by reading a stretch of `width` doc
+    /// ids each, so no run reads more than that, the run that sets the floor reads all of it, and
+    /// a run whose rows all lie under the floor reads nothing. After the pass every row over the
+    /// highest key left unread has been read, whichever run holds it: what the page then holds
+    /// over that key is final. So a page costs the runs that overlap at the end it is read from
+    /// a stretch each, not every run of the segment. The candidates of a pass are verified after
+    /// it, from the highest down.
+    ///
+    /// A coarse run is read by the block: its stretch ends at a block's edge, and a block is
+    /// read when its bounds reach the floor.
+    ///
+    /// The first stretch is as wide as the page needs at the segment's density of matches
+    /// (`matches` of `max_doc`, the postings' own bound), twice over, so that a page usually
+    /// fills in one pass whatever the keyword; each later one is four times wider. The walk ends
+    /// when the highest key left unread can no longer enter the page or the window.
+    fn walk_runs(
+        &mut self,
+        page: &mut Page,
+        tally: &mut WalkTally,
+        candidates: &mut Vec<(SortPrefix, u32)>,
+        runs: &Runs,
+        matches: u32,
+    ) -> anyhow::Result<()> {
+        let columns = self.columns;
+        let window = self.window;
+        let forward = window.complement;
+        let blocks = &runs.blocks;
+        let runs = &runs.runs;
+        // The key in walk orientation: the walk always takes the highest first.
+        let oriented = |key: u128| if forward { !key } else { key };
+        // A run's rows are counted from the end its keys are lowest at: positions, 0 to its
+        // length. The first position in `from..to` whose key fails `before`, keys being
+        // non-decreasing by position.
+        let first_not = |run: &Run, from: u32, to: u32, before: &dyn Fn(u128) -> bool| {
+            let (mut low, mut high) = (from, to);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if before(columns.layout_key(run.doc_at(mid))) {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            low
+        };
+        // The blocks of a coarse run that hold its positions `from..to`.
+        let blocks_of = |first: u32, from: u32, to: u32| {
+            &blocks
+                [(first + from / BLOCK_DOCS) as usize..(first + to.div_ceil(BLOCK_DOCS)) as usize]
+        };
+        // The oriented key of the next row of a run whose unread part ends (going down) or
+        // starts (going up) at position `next`: for a coarse run, the bound of its next block.
+        let best = |run: &Run, next: u32| match (run.blocks, forward) {
+            (None, true) => !columns.layout_key(run.doc_at(next)),
+            (None, false) => columns.layout_key(run.doc_at(next - 1)),
+            (Some(first), true) => !blocks[(first + next / BLOCK_DOCS) as usize].0,
+            (Some(first), false) => blocks[(first + (next - 1) / BLOCK_DOCS) as usize].1,
+        };
+        // Whether the run has rows left to read.
+        let unread_at = |run: &Run, next: u32| {
+            if forward { next < run.len() } else { next > 0 }
+        };
+        let top = window.top_layout_key();
+        // Per run, the position its unread part ends at (going down) or starts at (going up),
+        // and the runs with something unread by the oriented key of their next row. The bounds
+        // of a run tell whether the window's top cuts it: only then is it searched.
+        let mut next: Vec<u32> = Vec::with_capacity(runs.len());
+        let mut unread: Vec<(u128, u32)> = Vec::with_capacity(runs.len());
+        for (index, run) in runs.iter().enumerate() {
+            let at = match (top, forward) {
+                (None, false) => run.len(),
+                (None, true) => 0,
+                (Some(top), false) if run.max <= top => run.len(),
+                (Some(top), false) if run.min > top => 0,
+                (Some(top), true) if run.min >= !top => 0,
+                (Some(top), true) if run.max < !top => run.len(),
+                (Some(top), forward) => match (run.blocks, forward) {
+                    (None, false) => first_not(run, 0, run.len(), &|key| key <= top),
+                    (None, true) => first_not(run, 0, run.len(), &|key| key < !top),
+                    // Up to the first block all over the top, going down; from the first block
+                    // reaching it, going up. The rows of a block past the top are left out one
+                    // by one, by the window.
+                    (Some(first), false) => {
+                        let held = blocks_of(first, 0, run.len());
+                        let over = held.partition_point(|&(min, _)| min <= top) as u32;
+                        (over * BLOCK_DOCS).min(run.len())
+                    }
+                    (Some(first), true) => {
+                        let held = blocks_of(first, 0, run.len());
+                        let under = held.partition_point(|&(_, max)| max < !top) as u32;
+                        (under * BLOCK_DOCS).min(run.len())
+                    }
+                },
+            };
+            next.push(at);
+            if unread_at(run, at) {
+                unread.push((best(run, at), index as u32));
+            }
+        }
+        let mut unread = BinaryHeap::from(unread);
+        let density = f64::from(matches.max(1)) / f64::from(self.segment.max_doc().max(1));
+        let mut width = ((2 * page.limit) as f64 / density.min(1.0))
+            .ceil()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
+        let mut regions: Vec<Region> = Vec::new();
+        let mut reading: Vec<u32> = Vec::new();
+        // What a run reads of a stretch of `width`: positions `from..to`, going down or up
+        // from `next`, to a block's edge in a coarse run.
+        let stretch = |run: &Run, next: u32, width: u32| {
+            let edge = |position: u32, up: bool| match run.blocks {
+                None => position,
+                Some(_) if up => (position.div_ceil(BLOCK_DOCS) * BLOCK_DOCS).min(run.len()),
+                Some(_) => position / BLOCK_DOCS * BLOCK_DOCS,
+            };
+            if forward {
+                (next, edge(next.saturating_add(width).min(run.len()), true))
+            } else {
+                (edge(next.saturating_sub(width), false), next)
+            }
+        };
+        while let Some(&(highest, _)) = unread.peek() {
+            // The rows left start at this key: worth a pass only if it can still enter the page
+            // and the window.
+            if !window.reaches(highest)
+                || page
+                    .weakest()
+                    .is_some_and(|weakest| highest < weakest.prefix.layout_key())
+            {
+                break;
+            }
+            // The runs with rows at the floor or over it, and the floor: the highest key a run
+            // among them has left, or ends at, once its stretch is read.
+            regions.clear();
+            {
+                reading.clear();
+                let mut floor = 0u128;
+                while let Some(&(key, index)) = unread.peek() {
+                    if key < floor {
+                        break;
+                    }
+                    unread.pop();
+                    let run = &runs[index as usize];
+                    let (from, to) = stretch(run, next[index as usize], width);
+                    let reached = match run.blocks {
+                        None => oriented(columns.layout_key(run.doc_at(if forward {
+                            to - 1
+                        } else {
+                            from
+                        }))),
+                        Some(_) if unread_at(run, if forward { to } else { from }) => {
+                            best(run, if forward { to } else { from })
+                        }
+                        Some(_) => oriented(if forward { run.max } else { run.min }),
+                    };
+                    floor = floor.max(reached);
+                    reading.push(index);
+                }
+                // Back in the heap once the pass has read.
+                for &index in &reading {
+                    let run = &runs[index as usize];
+                    let (from, to) = stretch(run, next[index as usize], width);
+                    // Within the stretch, the rows at the floor or over it, or the blocks
+                    // reaching it.
+                    let (from, to) = match (run.blocks, forward) {
+                        (None, true) => (from, first_not(run, from, to, &|key| !key >= floor)),
+                        (None, false) => (first_not(run, from, to, &|key| key < floor), to),
+                        (Some(first), true) => {
+                            let reach = blocks_of(first, from, to)
+                                .partition_point(|&(min, _)| !min >= floor)
+                                as u32;
+                            (from, (from + reach * BLOCK_DOCS).min(to))
+                        }
+                        (Some(first), false) => {
+                            let held = blocks_of(first, from, to);
+                            let under = held.partition_point(|&(_, max)| max < floor) as u32;
+                            ((from + under * BLOCK_DOCS).min(to), to)
+                        }
+                    };
+                    let (from, to) = run.docs(from, to);
+                    regions.push(Region {
+                        from,
+                        to,
+                        run: Some(index),
+                    });
+                }
+            }
+            regions.sort_unstable_by_key(|region| region.from);
+            self.scan(page, tally, candidates, &mut regions)?;
+            // Each run goes on from where its stretch ended.
+            for region in &regions {
+                let index = region.run.unwrap();
+                let run = &runs[index as usize];
+                let (from, to) = run.positions(region.from, region.to);
+                let at = if forward { to } else { from };
+                next[index as usize] = at;
+                if unread_at(run, at) {
+                    unread.push((best(run, at), index));
+                }
+            }
+            if unread.is_empty() {
+                break;
+            }
+            self.verify(page, tally, candidates)?;
+            width = width.saturating_mul(4);
+        }
+        self.verify(page, tally, candidates)
     }
 }
 
@@ -2061,6 +2593,11 @@ fn collect_matches_ordered(
             continue;
         };
         tally.segments_opened += 1;
+        if scorer.doc() == TERMINATED {
+            // Nothing matches here: no run to look for an end in.
+            continue;
+        }
+        let matches_bound = like.matches_bound(scorer.as_ref());
         candidates.clear();
         let mut walk = RegionWalk {
             segment,
@@ -2069,12 +2606,28 @@ fn collect_matches_ordered(
             window: &window,
             ties: &ties,
             key_of,
-            like,
+            like: &mut *like,
             store: None,
             scorer: Some(scorer),
         };
-        walk.scan(&mut page, &mut tally, &mut candidates);
-        walk.verify(&mut page, &mut tally, &mut candidates)?;
+        match columns.runs.clone() {
+            Some(runs) => {
+                walk.walk_runs(&mut page, &mut tally, &mut candidates, &runs, matches_bound)?
+            }
+            None => {
+                walk.scan(
+                    &mut page,
+                    &mut tally,
+                    &mut candidates,
+                    &mut [Region {
+                        from: 0,
+                        to: segment.max_doc(),
+                        run: None,
+                    }],
+                )?;
+                walk.verify(&mut page, &mut tally, &mut candidates)?
+            }
+        }
     }
 
     // A cursor says there may be more below this point. That is only true if the page filled: a
@@ -3301,6 +3854,94 @@ mod tests {
         let range = plan_repair(&pieces, &[], 1, 100).unwrap();
         assert_eq!((range.low, range.high), (0, 150));
         assert_eq!(range.cluster.unwrap().docs, 140);
+    }
+
+    /// Runs of keys that never decrease; too many, or too short on average, and the segment is
+    /// read whole.
+    #[test]
+    fn runs_are_sorted_where_long_and_coarse_between() {
+        let keys = |runs: &[std::ops::Range<u128>]| -> Vec<u128> {
+            runs.iter().flat_map(|run| run.clone()).collect()
+        };
+        let sorted = |start, end, min, max| Run {
+            start,
+            end,
+            min,
+            max,
+            blocks: None,
+            reversed: false,
+        };
+        // Two long stretches in order: a sorted run each.
+        let two = layout_runs(&keys(&[0..1500, 10..1200])).unwrap();
+        assert_eq!(
+            two.runs,
+            vec![sorted(0, 1500, 0, 1499), sorted(1500, 2690, 10, 1199)]
+        );
+        assert!(two.blocks.is_empty());
+        // Equal keys stay in one run.
+        assert_eq!(
+            layout_runs(&[7; 2000]).unwrap().runs,
+            vec![sorted(0, 2000, 7, 7)]
+        );
+        // Rows in order but for their neighbours, as a stream leaves them: one coarse run after
+        // the sorted one, its blocks in order.
+        let mut stream: Vec<u128> = (0..2000).collect();
+        stream.extend((2000..3000u128).map(|key| key ^ 1));
+        let runs = layout_runs(&stream).unwrap();
+        assert_eq!(
+            runs.runs,
+            vec![
+                // The first row of the pair after it is still in order.
+                sorted(0, 2001, 0, 2001),
+                Run {
+                    start: 2001,
+                    end: 3000,
+                    min: 2000,
+                    max: 2999,
+                    blocks: Some(0),
+                    reversed: false,
+                }
+            ]
+        );
+        assert_eq!(runs.blocks.len(), 4);
+        assert_eq!(runs.blocks[1], (2256, 2513));
+        // Rows in no order: one coarse run, every block bounded by about the whole of it.
+        let shuffled: Vec<u128> = (0..1024u128).map(|i| (i * 389) % 1024).collect();
+        let runs = layout_runs(&shuffled).unwrap();
+        assert_eq!(runs.runs.len(), 1, "{runs:?}");
+        assert_eq!(runs.runs[0].blocks, Some(0));
+        assert_eq!((runs.runs[0].min, runs.runs[0].max), (0, 1023));
+        assert_eq!(runs.blocks.len(), 4);
+        assert!(runs.blocks.is_sorted_by_key(|&(min, _)| min));
+        assert!(runs.blocks.is_sorted_by_key(|&(_, max)| max));
+        assert!(runs.blocks[3].0 < 256 && runs.blocks[0].1 > 768, "{runs:?}");
+        // Keys going down: a sorted run read from its other end, and a coarse one whose
+        // blocks are counted from its last doc ids.
+        let mut down: Vec<u128> = (0..2000u128).rev().map(|key| key + 5000).collect();
+        down.extend((0..1000u128).rev().map(|key| (key ^ 1) + 10_000));
+        let runs = layout_runs(&down).unwrap();
+        assert_eq!(runs.runs.len(), 2, "{runs:?}");
+        assert_eq!(
+            runs.runs[0],
+            Run {
+                reversed: true,
+                ..sorted(0, 2000, 5000, 6999)
+            }
+        );
+        assert_eq!(runs.runs[0].doc_at(0), 1999);
+        assert_eq!(runs.runs[0].docs(0, 10), (1990, 2000));
+        assert_eq!(runs.runs[0].positions(1990, 2000), (0, 10));
+        let coarse = runs.runs[1];
+        assert!(coarse.reversed && coarse.blocks == Some(0), "{coarse:?}");
+        assert_eq!((coarse.min, coarse.max), (10_000, 10_999));
+        assert_eq!(runs.blocks[0].0, 10_000);
+        assert!(runs.blocks.is_sorted_by_key(|&(min, _)| min));
+        assert!(runs.blocks.is_sorted_by_key(|&(_, max)| max));
+        // Its first block by position is its last 256 doc ids.
+        assert_eq!(coarse.block_of(2999), 0);
+        assert_eq!(coarse.edge_up(2900), 3000);
+        assert_eq!(coarse.edge_up(2001), 3000 - 3 * 256);
+        assert_eq!(layout_runs(&[]), None);
     }
 
     /// A repair step's key ranges hold half a cap, as a split's parts do, and never more than
@@ -4995,6 +5636,179 @@ mod tests {
         );
         let expected: Vec<i64> = (4..=2000).rev().step_by(4).collect();
         assert_eq!(first_page(&sender, "将军", 1000).await, expected);
+    }
+
+    /// A segment a repair leaves is a few runs in key order, and a page is read from the end of
+    /// each run it needs rather than the whole segment: newest first, ascending, after a cursor
+    /// either way, within a range, and verified past max_gram, all as a full read would answer.
+    #[rstest]
+    #[timeout(Duration::from_secs(90))]
+    #[tokio::test]
+    async fn a_sorted_segment_is_read_from_the_end_the_page_needs() {
+        let rows = 20_000u64;
+        let sender = make_sender_with_threshold(capped_options(10_000), rows as usize);
+        add_batch(&sender, shuffled(rows), named).await;
+        let stats = settled(&sender, 75, |stats| stats.overlap.fresh_rows == 0).await;
+        assert_eq!(stats.tantivy.num_docs, rows);
+        let largest = stats.segments.iter().map(|s| s.docs).max().unwrap();
+        assert!(largest >= 4_000, "{:?}", stats.segments);
+
+        let ids = |range: std::ops::RangeInclusive<u64>, descending: bool| -> Vec<i64> {
+            let ids = range.map(|id| id as i64);
+            if descending {
+                ids.rev().collect()
+            } else {
+                ids.collect()
+            }
+        };
+        let before = sender.stats(make_index_key()).await.unwrap().walk;
+        let (page, cursor) = search_ordered(&sender, "将军", 10, SearchWindow::default()).await;
+        assert_eq!(page, ids(rows - 9..=rows, true));
+        let after = sender.stats(make_index_key()).await.unwrap().walk;
+        // A full read of the top segment would scan every one of its rows, thousands; a run is
+        // read from its end, a stretch as wide as the page needs at the segment's density.
+        let scanned = after.postings_scanned - before.postings_scanned;
+        assert!(
+            scanned <= 1_024,
+            "{scanned} postings for a page of 10: {:?}",
+            stats.segments
+        );
+
+        let (next, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            resume(SortOrder::Desc, cursor.unwrap()),
+        )
+        .await;
+        assert_eq!(next, ids(rows - 19..=rows - 10, true));
+
+        let (first, cursor) = search_ordered(&sender, "将军", 10, ascending()).await;
+        assert_eq!(first, ids(1..=10, false));
+        let (next, _) =
+            search_ordered(&sender, "将军", 10, resume(SortOrder::Asc, cursor.unwrap())).await;
+        assert_eq!(next, ids(11..=20, false));
+
+        let (ranged, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            window(None, Some(sort_key(5_000)), Some(sort_key(6_000))),
+        )
+        .await;
+        assert_eq!(ranged, ids(5_991..=6_000, true));
+
+        // Past max_gram (3): candidates by grams, verified against the stored value. Ids whose
+        // decimal form starts with 1, newest first.
+        let (verified, _) = search_ordered(&sender, "ser1", 10, SearchWindow::default()).await;
+        assert_eq!(verified, ids(19_990..=19_999, true));
+    }
+
+    fn third_named(primary: u64) -> String {
+        let mut name = format!("user{primary}将军");
+        if primary.is_multiple_of(3) {
+            name += "逢三之数";
+        }
+        if (5_000..9_000).contains(&primary) {
+            name += "中段之人";
+        }
+        name
+    }
+
+    /// Every page of a search, followed from its cursor in either direction, holds the rows a
+    /// full read would give, in order, whatever the segments' rows are laid out as: sorted runs
+    /// a repair wrote, coarse runs rows arriving in order leave, and rows in no order at all.
+    /// For a keyword every row holds, one a third of them hold, one past max_gram, verified, and
+    /// ones the rows of one stretch of the order hold, far from either end.
+    #[rstest]
+    #[case::repaired("repaired")]
+    #[case::in_order("stream")]
+    #[case::in_order_in_large_commits("stream of 4000")]
+    #[case::in_no_order("unrepaired")]
+    #[timeout(Duration::from_secs(120))]
+    #[tokio::test]
+    async fn pages_hold_the_same_rows_whatever_the_runs(#[case] layout: &str) {
+        let rows = 24_000u64;
+        let options = IndexOptionsPattern {
+            rewrite_wide_segments: RewriteWideSegments::from(layout == "repaired"),
+            ..capped_options(8_000)
+        };
+        let sender = make_sender_with_threshold(options, rows as usize);
+        if layout.starts_with("stream") {
+            // The index is declared descending, so rows in ascending order lie with their
+            // keys going down: in commits of 500 as a coarse run, each thread's share being
+            // short, in commits of 4000 as sorted ones.
+            let commit = if layout == "stream" { 500 } else { 4000 };
+            for batch in (1..=rows).collect::<Vec<_>>().chunks(commit) {
+                add_batch(&sender, batch.iter().copied(), third_named).await;
+            }
+        } else {
+            add_batch(&sender, shuffled(rows), third_named).await;
+        }
+        if layout == "repaired" {
+            settled(&sender, 90, |stats| stats.overlap.fresh_rows == 0).await;
+        }
+        let mut merging = 0;
+        while merging < 5 {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            merging = if stats.merges.running == 0 {
+                merging + 1
+            } else {
+                0
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stats = sender.stats(make_index_key()).await.unwrap();
+        assert_eq!(stats.tantivy.num_docs, rows);
+
+        if layout.starts_with("stream") {
+            // The newest rows are in the last blocks of the newest segment: a page reads those,
+            // not the segment.
+            let before = stats.walk;
+            let page = first_page(&sender, "将军", 20).await;
+            assert_eq!(
+                page,
+                (rows as i64 - 19..=rows as i64).rev().collect::<Vec<_>>()
+            );
+            let after = sender.stats(make_index_key()).await.unwrap().walk;
+            let scanned = after.postings_scanned - before.postings_scanned;
+            assert!(scanned <= 2_048, "{scanned} postings: {:?}", stats.segments);
+        }
+        type Holds = fn(&i64) -> bool;
+        let keywords: [(&str, Holds); 5] = [
+            ("将军", |_| true),
+            ("逢三之", |id| id % 3 == 0),
+            ("逢三之数", |id| id % 3 == 0),
+            ("中段", |id| (5_000..9_000).contains(id)),
+            ("中段之人", |id| (5_000..9_000).contains(id)),
+        ];
+        for (keyword, holds) in keywords {
+            let expected: Vec<i64> = (1..=rows as i64).filter(holds).collect();
+            for page in [20, 100] {
+                let (ascending, _) = all_pages(&sender, keyword, page, SortOrder::Asc).await;
+                assert!(ascending == expected, "{keyword} ascending by {page}");
+                let (descending, _) = all_pages(&sender, keyword, page, SortOrder::Desc).await;
+                assert!(
+                    descending.iter().rev().eq(expected.iter()),
+                    "{keyword} descending by {page}"
+                );
+            }
+            let (ranged, _) = search_ordered(
+                &sender,
+                keyword,
+                50,
+                window(None, Some(sort_key(9_000)), Some(sort_key(15_000))),
+            )
+            .await;
+            let within: Vec<i64> = expected
+                .iter()
+                .copied()
+                .filter(|id| (9_000..=15_000).contains(id))
+                .rev()
+                .take(50)
+                .collect();
+            assert_eq!(ranged, within, "{keyword} in a range");
+        }
     }
 
     /// CDC changes that lag behind the table hold the repair back while they arrive, however
