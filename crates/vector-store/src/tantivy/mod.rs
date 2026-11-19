@@ -192,7 +192,7 @@ impl ReaderInner {
         let (done_tx, done_rx) = oneshot::channel();
         let inner = Arc::clone(self);
         self.worker
-            .spawn_blocking(move || {
+            .spawn_indexing_blocking(move || {
                 _ = inner.reload();
                 _ = done_tx.send(());
             })
@@ -476,7 +476,7 @@ where
         let key = self.key.clone();
         let commit_threshold = self.commit_threshold;
         self.worker
-            .spawn_blocking(move || {
+            .spawn_indexing_blocking(move || {
                 let doc = make_doc(&index);
                 let pending = add_document(&index, primary_id, doc, in_progress);
                 if pending >= commit_threshold {
@@ -497,7 +497,7 @@ where
         let key = self.key.clone();
         let commit_threshold = self.commit_threshold;
         self.worker
-            .spawn_blocking(move || {
+            .spawn_indexing_blocking(move || {
                 let pending = remove_document(&index, primary_id, in_progress);
                 if pending >= commit_threshold {
                     commit(&index, &key);
@@ -538,7 +538,7 @@ where
                 let index = Arc::clone(index);
                 let key = self.key.clone();
                 self.worker
-                    .spawn_blocking(move || commit(&index, &key))
+                    .spawn_indexing_blocking(move || commit(&index, &key))
                     .await;
             } else if index.reader.needs_reload() {
                 index.reader.request_reload();

@@ -663,6 +663,7 @@ async fn get_metrics(
     State(state): State<RoutesInnerState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    state.metrics.set_worker_totals();
     let metric_families = state.metrics.registry.gather();
 
     // Decide which encoder and content-type to use
