@@ -133,8 +133,17 @@ impl AsyncInProgress {
         matches!(self._state, State::None)
     }
 
-    #[cfg(test)]
+    /// Whether the change this stands for is a row of a full scan.
     pub(crate) fn is_fullscan(&self) -> bool {
         matches!(self._state, State::Fullscan(_))
+    }
+
+    /// How long ago the change this stands for was written to the table, for a change read
+    /// from CDC: what its indexing lags behind. None for a row of a full scan.
+    pub(crate) fn lag(&self) -> Option<std::time::Duration> {
+        match &self._state {
+            State::Cdc(cdc) => Some(cdc.timestamp.elapsed()),
+            _ => None,
+        }
     }
 }

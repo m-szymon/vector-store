@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Relaxed;
@@ -178,6 +179,18 @@ struct PatternBackend {
     /// were found (see `ordered_tier`), or merged from ordered segments. In memory only, as the
     /// index is; a segment a merge retired is dropped from it by `prune_columns`.
     adopted: Mutex<HashSet<SegmentId>>,
+    /// Set when a row of a full scan is added, and taken by the next tick: the repair waits for
+    /// the scan to end (see `maybe_repair`).
+    scan_rows: AtomicBool,
+    /// Ticks since one last took `scan_rows` set.
+    ticks_since_scan: AtomicU32,
+    /// The lag of the CDC changes taken in since the last tick, summed in milliseconds, and how
+    /// many: see `maybe_repair`.
+    cdc_lag_millis: AtomicU64,
+    cdc_changes: AtomicU64,
+    /// Ticks since one last found the CDC changes lagging; back at `LAG_QUIET_TICKS` on a tick
+    /// whose changes kept up.
+    ticks_since_lag: AtomicU32,
     /// Set while a tick's work on this index -- learning the layout, a step of the rewrite -- is
     /// running, so that the next tick does not queue more behind it. See `TickWork`.
     tick_running: AtomicBool,
@@ -213,6 +226,16 @@ const LOAD_FRESH_ROWS: u64 = 400_000;
 /// lock wait for one range at a time whatever the cap. At a 1M cap a split moved up to two caps
 /// of rows in one hold.
 const REPAIR_LOCK_ROWS: usize = 50_000;
+/// Ticks without a row of a full scan before the scan counts as ended.
+const SCAN_QUIET_TICKS: u32 = 5;
+/// Ticks without a CDC change before a stream of lagging ones counts as ended. A stream that
+/// lags comes in bursts with gaps between them, and one tick without a change is not its end.
+const LAG_QUIET_TICKS: u32 = 5;
+/// The mean lag of the CDC changes taken in since the last tick -- from the write to the table to
+/// the index taking the change in -- under which a repair step may run while the index ingests.
+/// An index keeping up lags about a second (AWS run 5df052ac, 1.3 s with a writer at 2000 rows a
+/// second), one falling behind tens of seconds.
+const REPAIR_LAG_LIMIT: Duration = Duration::from_secs(3);
 
 /// How full a merge of ordered neighbours may make a segment: three quarters of the cap, so that
 /// fresh rows repaired into its stretch later fit beside it, and merge into it, before it has to
@@ -1173,9 +1196,20 @@ fn live_segments(searcher: &tantivy::Searcher) -> HashSet<SegmentId> {
 
 impl PatternBackend {
     /// Whether the layout has anything to repair, recorded for `Stats`, and a repair step when
-    /// it does and the moment allows (see `repair_due`): on an idle tick always, so that an idle
-    /// index converges to an empty fresh tier and a disjoint ordered one; while the index
-    /// ingests, once the fresh tier holds `LOAD_FRESH_ROWS` rows.
+    /// it does and the moment allows (see `repair_due`). Two policies, by what brings the rows:
+    ///
+    /// - A full scan, building the index: no step until it ends, `SCAN_QUIET_TICKS` ticks after
+    ///   its last row. The scan goes at the node's pace, and the repair then works from every row
+    ///   at once rather than placing the first ones only to split their stretches again as the
+    ///   rest arrive: a 10M-row build repaired during its scan took 124 s instead of 67, and
+    ///   moved 1.5 rows for each one.
+    /// - CDC changes lagging behind the table (those since the last tick, over
+    ///   `REPAIR_LAG_LIMIT` on average): no step either, idle tick or not, until changes that
+    ///   keep up arrive or `LAG_QUIET_TICKS` ticks pass without any, so that a bulk load
+    ///   through CDC is repaired once the index has caught up, as a full scan is.
+    /// - Writes the index keeps up with: on an idle tick always, so that an idle index converges
+    ///   to an empty fresh tier and a disjoint ordered one; while the index ingests, once the
+    ///   fresh tier holds `LOAD_FRESH_ROWS` rows.
     fn maybe_repair(&self, state: &PatternIndexState, key: &IndexKey, idle: bool) {
         if !*self.options.rewrite_wide_segments.as_ref() {
             return;
@@ -1184,6 +1218,23 @@ impl PatternBackend {
             return;
         };
         let cap = u64::from(cap.get());
+        let since_scan = if self.scan_rows.swap(false, Relaxed) {
+            0
+        } else {
+            self.ticks_since_scan.load(Relaxed).saturating_add(1)
+        };
+        self.ticks_since_scan.store(since_scan, Relaxed);
+        let scanning = since_scan < SCAN_QUIET_TICKS;
+        let changes = self.cdc_changes.swap(0, Relaxed);
+        let lag_millis = self.cdc_lag_millis.swap(0, Relaxed);
+        let since_lag = match lag_millis.checked_div(changes) {
+            Some(mean) if mean > REPAIR_LAG_LIMIT.as_millis() as u64 => 0,
+            // Changes that keep up: the index has caught up.
+            Some(_) => LAG_QUIET_TICKS,
+            None => self.ticks_since_lag.load(Relaxed).saturating_add(1),
+        };
+        self.ticks_since_lag.store(since_lag, Relaxed);
+        let lagging = since_lag < LAG_QUIET_TICKS;
         let pieces = self.geometry(&state.reader.searcher());
         let ordered = ordered_tier(&pieces);
         let fresh_rows: u64 = pieces
@@ -1200,12 +1251,21 @@ impl PatternBackend {
         if !pending {
             return;
         }
-        if !repair_due(idle, fresh_rows, overfull) {
+        // Lagging holds the repair on an idle tick too: a commit at the row threshold just before
+        // the tick leaves nothing to commit in the middle of a stream of changes.
+        if !repair_due(idle, scanning || lagging, fresh_rows, overfull) {
             return;
         }
         if let Err(err) = repair_step(state) {
             error!("pattern: repair of {key} failed: {err}");
         }
+    }
+
+    /// Counts a CDC change taken in, `lag` after its write to the table.
+    fn note_cdc_lag(&self, lag: Duration) {
+        self.cdc_lag_millis
+            .fetch_add(lag.as_millis().try_into().unwrap_or(u64::MAX), Relaxed);
+        self.cdc_changes.fetch_add(1, Relaxed);
     }
 
     fn rewrite_totals(&self) -> RewriteTotals {
@@ -1217,11 +1277,13 @@ impl PatternBackend {
     }
 }
 
-/// Whether a repair step may run now, given what there is to repair: on an idle tick always;
-/// while the index ingests, once the fresh tier holds `LOAD_FRESH_ROWS` rows or an ordered
-/// stretch is past the cap. Pure, so it can be tested without an index.
-fn repair_due(idle: bool, fresh_rows: u64, overfull: bool) -> bool {
-    if fresh_rows == 0 && !overfull {
+/// Whether a repair step may run now, given what there is to repair: never while the index is
+/// `catching_up` -- a full scan going on, or CDC changes lagging behind the table; on an idle
+/// tick always; while the index ingests, once the fresh tier holds
+/// `LOAD_FRESH_ROWS` rows or an ordered stretch is past the cap. Pure, so it can be tested
+/// without an index.
+fn repair_due(idle: bool, catching_up: bool, fresh_rows: u64, overfull: bool) -> bool {
+    if (fresh_rows == 0 && !overfull) || catching_up {
         return false;
     }
     idle || fresh_rows >= LOAD_FRESH_ROWS || overfull
@@ -1520,6 +1582,11 @@ fn new_index(
         columns: RwLock::new(HashMap::new()),
         repair: RepairCounters::default(),
         adopted: Mutex::new(HashSet::new()),
+        scan_rows: AtomicBool::new(false),
+        ticks_since_scan: AtomicU32::new(SCAN_QUIET_TICKS),
+        cdc_lag_millis: AtomicU64::new(0),
+        cdc_changes: AtomicU64::new(0),
+        ticks_since_lag: AtomicU32::new(LAG_QUIET_TICKS),
         tick_running: AtomicBool::new(false),
         merging: Mutex::new(MergesInFlight::default()),
         options: options.clone(),
@@ -2187,8 +2254,16 @@ pub(crate) fn new(
                                 );
                                 continue;
                             }
+                            let scanned = in_progress.is_fullscan();
+                            let lag = in_progress.lag();
                             indexes
                                 .add_document_with(primary_id, in_progress, move |index| {
+                                    if scanned {
+                                        index.backend().scan_rows.store(true, Relaxed);
+                                    }
+                                    if let Some(lag) = lag {
+                                        index.backend().note_cdc_lag(lag);
+                                    }
                                     index.backend().create_doc(
                                         &index.schema,
                                         primary_id,
@@ -4894,17 +4969,69 @@ mod tests {
         assert_eq!(first_page(&sender, "将军", 1000).await, expected);
     }
 
-    /// An idle tick repairs whatever there is; while the index ingests, the repair waits for
-    /// the fresh tier to grow past two caps, or a stretch past the cap.
+    /// CDC changes that lag behind the table hold the repair back while they arrive, however
+    /// many fresh rows pile up; once they stop, the idle ticks repair everything. AWS run 7a300b9d
+    /// repaired while its indexes ingested a load minutes behind, and caught up 2.8x later.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn cdc_changes_lagging_behind_hold_the_repair() {
+        let cap = 100;
+        let sender = make_sender_with_options(capped_options(cap));
+        let written = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            - Duration::from_secs(60);
+        let histogram =
+            prometheus::Histogram::with_opts(prometheus::HistogramOpts::new("lag", "lag")).unwrap();
+        let rows: Vec<u64> = shuffled(3000).collect();
+        for (n, chunk) in rows.chunks(5).enumerate() {
+            for &primary in chunk {
+                sender
+                    .add_document(
+                        test_partition_id(),
+                        primary.into(),
+                        named(primary),
+                        AsyncInProgress::cdc(
+                            histogram.clone(),
+                            crate::Timestamp::from_millis(written.as_millis() as u64),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // A steady stream, so that no tick finds the index idle.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if n % 100 == 99 {
+                let stats = sender.stats(make_index_key()).await.unwrap();
+                assert_eq!(
+                    stats.rewrite.steps, 0,
+                    "repaired while lagging: {:?} {:?}",
+                    stats.rewrite, stats.overlap
+                );
+            }
+        }
+        let stats = settled(&sender, 45, |stats| {
+            stats.tantivy.num_docs == 3000 && stats.overlap.fresh_rows == 0
+        })
+        .await;
+        assert_eq!(stats.overlap.depth_max, 1, "{:?}", stats.overlap);
+    }
+
+    /// Nothing is repaired while a full scan goes on, idle tick or not. After it, an idle tick
+    /// repairs whatever there is; while the index ingests, the repair waits for the fresh tier
+    /// to grow past two caps, or a stretch past the cap.
     #[test]
-    fn the_repair_waits_for_enough_fresh_rows_while_the_index_ingests() {
+    fn the_repair_waits_for_the_scan() {
         let under = LOAD_FRESH_ROWS - 1;
-        // (idle, fresh rows, overfull)
-        assert!(!repair_due(true, 0, false));
-        assert!(repair_due(true, 1, false));
-        assert!(!repair_due(false, under, false));
-        assert!(repair_due(false, LOAD_FRESH_ROWS, false));
-        assert!(repair_due(false, 0, true));
+        // (idle, catching up, fresh rows, overfull)
+        assert!(!repair_due(true, false, 0, false));
+        assert!(repair_due(true, false, 1, false));
+        assert!(!repair_due(true, true, LOAD_FRESH_ROWS, true));
+        assert!(!repair_due(false, true, LOAD_FRESH_ROWS, true));
+        assert!(!repair_due(false, false, under, false));
+        assert!(repair_due(false, false, LOAD_FRESH_ROWS, false));
+        assert!(repair_due(false, false, 0, true));
     }
 
     /// A segment holding the last tokens of one value and the first of the next spans what its
