@@ -658,6 +658,15 @@ const BLOCK_DOCS: u32 = 256;
 /// blocks (see [`Run`]), which are as many to look at and coarser to read.
 const SORTED_RUN_DOCS: u32 = BLOCK_DOCS;
 
+/// A segment with no more matches than this, and this many pages of them, is read whole, runs or
+/// not: a block's worth of matches costs about what a pass of the postings does.
+const WHOLE_READ_MATCHES: usize = BLOCK_DOCS as usize;
+const WHOLE_READ_PAGES: usize = 4;
+/// And this many more for each run the walk would read together (see [`Runs::overlap`]): rows
+/// that arrived in no order leave hundreds of runs lying among one another, a look at each of
+/// which costs about what eight matches read in a pass do.
+const WHOLE_READ_PER_RUN: usize = 8;
+
 /// A stretch of a segment's doc ids in the order of the layout key, for the walk to read from
 /// the end a page needs and no further than the page needs. Of two kinds:
 ///
@@ -761,6 +770,23 @@ struct Runs {
     /// that cannot enter the page by these is not read: of rows in no order, most blocks hold
     /// none of the highest few.
     own: Vec<(u128, u128)>,
+}
+
+impl Runs {
+    /// How many runs lie among the rows of the run at either end of the order, the more of the
+    /// two: what a walk from that end reads a stretch of in its first pass. One where the runs
+    /// follow one another, every run where each holds a commit of rows in no order.
+    fn overlap(&self) -> usize {
+        let top = self.runs.iter().max_by_key(|run| run.max);
+        let bottom = self.runs.iter().min_by_key(|run| run.min);
+        let among_top = top.map_or(0, |top| {
+            self.runs.iter().filter(|run| run.max >= top.min).count()
+        });
+        let among_bottom = bottom.map_or(0, |bottom| {
+            self.runs.iter().filter(|run| run.min <= bottom.max).count()
+        });
+        among_top.max(among_bottom)
+    }
 }
 
 /// The runs of the rows with layout keys `keys`, by doc id: the stretches where the key never
@@ -2713,7 +2739,16 @@ fn collect_matches_ordered(
             store: None,
             scorer: Some(scorer),
         };
-        match columns.runs.clone() {
+        // The runs cost the walk a look at each it reads together and a pass or more of the
+        // postings; the segment read whole costs it every match, in one pass. So few matches
+        // are read whole.
+        let runs = columns.runs.clone().filter(|runs| {
+            matches_bound as usize
+                > WHOLE_READ_MATCHES
+                    + WHOLE_READ_PAGES * page.limit
+                    + WHOLE_READ_PER_RUN * runs.overlap()
+        });
+        match runs {
             Some(runs) => {
                 walk.walk_runs(&mut page, &mut tally, &mut candidates, &runs, matches_bound)?
             }
