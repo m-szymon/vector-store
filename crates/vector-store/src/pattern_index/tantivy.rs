@@ -42,9 +42,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::Ordering::Release;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -55,6 +59,8 @@ use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
 use tantivy::columnar::Column;
 use tantivy::index::SegmentId;
+use tantivy::index::SegmentMeta;
+use tantivy::indexer::MergePolicy;
 use tantivy::query::Scorer;
 use tantivy::schema::FAST;
 use tantivy::schema::INDEXED;
@@ -65,6 +71,8 @@ use tantivy::schema::TextFieldIndexing;
 use tantivy::schema::TextOptions;
 use tokio::sync::mpsc;
 use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 use crate::IndexKey;
 use crate::IndexOptionsPattern;
@@ -157,6 +165,302 @@ struct PatternBackend {
     columns: RwLock<HashMap<SegmentId, SegmentColumns>>,
     /// The table's primary-key layout: tokens and table order.
     key_layout: KeyLayout,
+    /// The segments of the ordered tier: adopted where they
+    /// were found (see `ordered_tier`), or merged from ordered segments. In memory only, as the
+    /// index is; a segment a merge retired is dropped from it by `prune_columns`.
+    adopted: Mutex<HashSet<SegmentId>>,
+    /// Set while a tick's work on this index -- learning the layout, a step of the rewrite -- is
+    /// running, so that the next tick does not queue more behind it. See `TickWork`.
+    tick_running: AtomicBool,
+    /// The merges `after_reload` asked for that are still running; their segments are left out
+    /// of the next ones it asks for, and the merges of ordered segments say what they produced.
+    merging: Mutex<MergesInFlight<tantivy::FutureResult<Option<SegmentMeta>>>>,
+}
+
+/// Holds an index's `tick_running` for one tick's work and clears it however that work ends.
+struct TickWork(Arc<PatternIndexState>);
+
+impl TickWork {
+    /// None while the previous tick's work on this index is still running.
+    fn start(state: &Arc<PatternIndexState>) -> Option<Self> {
+        (!state.backend().tick_running.swap(true, AcqRel)).then(|| Self(Arc::clone(state)))
+    }
+}
+
+impl Drop for TickWork {
+    fn drop(&mut self) {
+        self.0.backend().tick_running.store(false, Release);
+    }
+}
+
+/// How full a merge of ordered neighbours may make a segment: three quarters of the cap, so that
+/// fresh rows repaired into its stretch later fit beside it, and merge into it, before it has to
+/// be split.
+fn ordered_fill(cap: u32) -> u64 {
+    u64::from(cap - cap / 4)
+}
+
+/// A live segment as the layout policy sees it: its live and deleted rows, its layout-key bounds
+/// (inclusive; deleted rows count, as they do in the columns' own bounds), and whether it is
+/// known to be in the ordered tier.
+///
+/// The ordered tier holds the segments that are where they belong in sort order: disjoint from
+/// one another. The fresh tier is everything else -- the pieces commits leave, each spanning as
+/// much of the range as the rows it took in. A fresh row never reaches an ordered segment by a
+/// merge: a merge takes segments of one tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Piece {
+    docs: u32,
+    deleted: u32,
+    min: u128,
+    max: u128,
+    id: SegmentId,
+    /// Adopted: see `ordered_tier`.
+    ordered: bool,
+}
+
+/// Which of `pieces` are in the ordered tier: the ones known to be, and the ones that overlap no
+/// other piece. Those are where they belong whoever placed them -- the pieces rows inserted in
+/// sort order leave once merged, a build by full scan in table order -- and the caller adopts
+/// them: once in the ordered tier, a segment stays there, as fresh pieces arriving over its
+/// stretch later are rows to repair into it, not a reason to rewrite it. Empty pieces are in
+/// neither tier; Tantivy drops them at the next commit.
+fn ordered_tier(pieces: &[Piece]) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..pieces.len()).filter(|&i| pieces[i].docs > 0).collect();
+    order.sort_by_key(|&i| (pieces[i].min, pieces[i].max));
+    let mut ordered = vec![false; pieces.len()];
+    let mut reach: Option<u128> = None;
+    for (k, &i) in order.iter().enumerate() {
+        let piece = &pieces[i];
+        let left = reach.is_some_and(|reach| reach >= piece.min);
+        let right = order
+            .get(k + 1)
+            .is_some_and(|&next| pieces[next].min <= piece.max);
+        ordered[i] = piece.ordered || (!left && !right);
+        reach = Some(reach.map_or(piece.max, |reach| reach.max(piece.max)));
+    }
+    ordered
+}
+
+/// Ordered pieces that overlap, transitively: the pieces of one repair step before the merge
+/// that folds them, or a segment with the rows later repaired into its stretch. A merge takes a
+/// cluster whole or not at all -- merging part of one would leave a segment overlapping the rest
+/// for good -- and a cluster past the cap is split by a repair step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cluster {
+    min: u128,
+    max: u128,
+    docs: u64,
+    deleted: u64,
+    ids: Vec<SegmentId>,
+}
+
+/// The clusters of the ordered pieces, ascending and disjoint.
+fn clusters(pieces: &[Piece], ordered: &[bool]) -> Vec<Cluster> {
+    let mut members: Vec<&Piece> = pieces
+        .iter()
+        .zip(ordered)
+        .filter(|&(_, &ordered)| ordered)
+        .map(|(piece, _)| piece)
+        .collect();
+    members.sort_by_key(|piece| (piece.min, piece.max));
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for piece in members {
+        match clusters.last_mut() {
+            Some(cluster) if piece.min <= cluster.max => {
+                cluster.max = cluster.max.max(piece.max);
+                cluster.docs += u64::from(piece.docs);
+                cluster.deleted += u64::from(piece.deleted);
+                cluster.ids.push(piece.id);
+            }
+            _ => clusters.push(Cluster {
+                min: piece.min,
+                max: piece.max,
+                docs: u64::from(piece.docs),
+                deleted: u64::from(piece.deleted),
+                ids: vec![piece.id],
+            }),
+        }
+    }
+    clusters
+}
+
+/// What one tier's run is worth merging for: two segments or more, or one whose deleted rows
+/// outnumber its live ones, which a merge of it alone drops.
+fn worth_merging(segments: usize, docs: u64, deleted: u64) -> bool {
+    segments >= 2 || (segments == 1 && deleted >= docs.max(1))
+}
+
+/// The merges worth asking for, each a run of one tier's segments. Pure, so it can be tested
+/// without a writer.
+///
+/// - Ordered: runs of neighbouring clusters, each taken whole, while the run stays within
+///   `ordered_fill`; a cluster alone may reach the cap, which is what lets the rows a repair step
+///   adds to a segment's stretch merge into it. Neighbours have no ordered segment between them,
+///   so the merged segment overlaps none. A cluster past the cap is left to the repair.
+/// - Fresh: runs of neighbours by lowest key under the cap, whatever they span, a full segment
+///   left out rather than ending a run. Their rows go to the ordered tier by repair anyway; until
+///   then fewer segments are fewer for a search to open, and rows inserted in sort order merge
+///   into contiguous segments the tier adopts as they are.
+fn merge_runs(pieces: &[Piece], cap: u32) -> Vec<(Vec<SegmentId>, bool)> {
+    let ordered = ordered_tier(pieces);
+    let cap = u64::from(cap);
+    let fill = ordered_fill(cap as u32);
+    let mut runs = Vec::new();
+
+    let mut run: Vec<SegmentId> = Vec::new();
+    let (mut run_docs, mut run_deleted) = (0u64, 0u64);
+    let mut flush = |run: &mut Vec<SegmentId>, docs: &mut u64, deleted: &mut u64, tier: bool| {
+        if worth_merging(run.len(), *docs, *deleted) {
+            runs.push((std::mem::take(run), tier));
+        } else {
+            run.clear();
+        }
+        (*docs, *deleted) = (0, 0);
+    };
+    for cluster in clusters(pieces, &ordered) {
+        if cluster.docs > cap {
+            flush(&mut run, &mut run_docs, &mut run_deleted, true);
+            continue;
+        }
+        if !run.is_empty() && run_docs + cluster.docs > fill {
+            flush(&mut run, &mut run_docs, &mut run_deleted, true);
+        }
+        run.extend(cluster.ids);
+        run_docs += cluster.docs;
+        run_deleted += cluster.deleted;
+    }
+    flush(&mut run, &mut run_docs, &mut run_deleted, true);
+
+    let mut fresh: Vec<&Piece> = pieces
+        .iter()
+        .zip(&ordered)
+        .filter(|&(piece, &ordered)| !ordered && piece.docs > 0)
+        .map(|(piece, _)| piece)
+        .collect();
+    fresh.sort_by_key(|piece| (piece.min, piece.max));
+    let mut alone = Vec::new();
+    for piece in fresh {
+        let docs = u64::from(piece.docs);
+        if docs >= cap {
+            // Full already, with nothing to merge with. Unlike an ordered one it does not keep
+            // its neighbours apart: fresh segments overlap whatever lies between them anyway.
+            if worth_merging(1, docs, u64::from(piece.deleted)) {
+                alone.push((vec![piece.id], false));
+            }
+            continue;
+        }
+        if run_docs + docs > cap {
+            flush(&mut run, &mut run_docs, &mut run_deleted, false);
+        }
+        run.push(piece.id);
+        run_docs += docs;
+        run_deleted += u64::from(piece.deleted);
+    }
+    flush(&mut run, &mut run_docs, &mut run_deleted, false);
+    runs.extend(alone);
+    runs
+}
+
+/// The merges `after_reload` has asked the writer for and that have not finished, with the
+/// segments each one reads and the tier it merges. Tantivy keeps a merge's segments out of the
+/// merges its own policy picks, but not out of an explicit `IndexWriter::merge`: asked again for
+/// segments already being merged, it queues another full merge of them. `after_reload` asks on
+/// every tick, so a merge that outlasted a tick was queued again on the next one, and the
+/// duplicates slowed every merge down until each was queued many times over. On AWS (run
+/// a0e51aa9, a 10M-row table-order index) the same merge was started 60 times a minute, 24,832
+/// merges were started against 1,703 finished, the queued ones held their segments in memory, and
+/// they went on running after the index was dropped, until the node ran out of memory.
+///
+/// Generic over the merge's handle so that a test can stand in for a merge it holds back.
+struct MergesInFlight<F> {
+    merges: Vec<(Vec<SegmentId>, bool, F)>,
+    /// Merges asked for, and merges seen to have ended, since the index was created.
+    started: u64,
+    ended: u64,
+}
+
+impl<F> Default for MergesInFlight<F> {
+    fn default() -> Self {
+        Self {
+            merges: Vec::new(),
+            started: 0,
+            ended: 0,
+        }
+    }
+}
+
+/// The segment a finished merge produced, if it produced one.
+trait MergeOutput {
+    fn segment(&self) -> Option<SegmentId>;
+}
+
+impl MergeOutput for tantivy::Result<Option<SegmentMeta>> {
+    fn segment(&self) -> Option<SegmentId> {
+        self.as_ref().ok()?.as_ref().map(SegmentMeta::id)
+    }
+}
+
+impl<F> MergesInFlight<F>
+where
+    F: std::future::Future + Unpin,
+    F::Output: MergeOutput,
+{
+    /// The segments of the merges still running. Forgets the ones that ended, whether they
+    /// succeeded or not, so that the segments of a failed merge can be asked for again, and adds
+    /// what a merge of ordered segments produced to `adopted`: a merged segment is a new one,
+    /// and nothing else says which tier it is in.
+    fn busy(&mut self, adopted: &mut HashSet<SegmentId>) -> HashSet<SegmentId> {
+        let before = self.merges.len();
+        self.merges.retain_mut(|(_, ordered, merge)| {
+            match futures::FutureExt::now_or_never(&mut *merge) {
+                None => true,
+                Some(output) => {
+                    if *ordered && let Some(segment) = output.segment() {
+                        adopted.insert(segment);
+                    }
+                    false
+                }
+            }
+        });
+        self.ended += (before - self.merges.len()) as u64;
+        self.merges
+            .iter()
+            .flat_map(|(segments, _, _)| segments.iter().copied())
+            .collect()
+    }
+
+    /// Whether a merge still running has replaced its segments in `live` already: its output is
+    /// there, and not yet known to be ordered if it is, so the layout cannot be judged until it
+    /// reports its end.
+    fn unsettled(&self, live: &HashSet<SegmentId>) -> bool {
+        self.merges
+            .iter()
+            .any(|(segments, _, _)| segments.iter().any(|id| !live.contains(id)))
+    }
+
+    fn started(&mut self, segments: Vec<SegmentId>, ordered: bool, merge: F) {
+        self.merges.push((segments, ordered, merge));
+        self.started += 1;
+    }
+
+    /// As of the last tick: a merge that ended since is still counted as running.
+    fn totals(&self) -> MergeTotals {
+        MergeTotals {
+            started: self.started,
+            ended: self.ended,
+            running: self.merges.len() as u64,
+        }
+    }
+}
+
+/// The merges a pattern index's ticks asked for, as `Stats` reports them. Only these: the merges
+/// Tantivy's own policy starts after a commit are not counted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MergeTotals {
+    pub(crate) started: u64,
+    pub(crate) ended: u64,
+    pub(crate) running: u64,
 }
 
 /// One segment's columnar handles and the layout bounds the pruning reads from them.
@@ -271,13 +575,52 @@ impl PatternBackend {
         Ok(columns)
     }
 
-    /// Drops cache entries for segments a merge has retired, once they outnumber the live ones.
+    /// Every live segment as a [`Piece`], from the cached columns; a segment whose sort columns
+    /// cannot be opened is left out, with a warning.
+    fn geometry(&self, searcher: &tantivy::Searcher) -> Vec<Piece> {
+        let mut opened = 0;
+        // A copy: `columns_for` takes the column cache's lock, which `prune_columns` holds while
+        // it would take this one.
+        let adopted = self.adopted.lock().unwrap().clone();
+        searcher
+            .segment_readers()
+            .iter()
+            .filter_map(|segment| match self.columns_for(segment, &mut opened) {
+                Ok(columns) => Some(Piece {
+                    docs: segment.num_docs(),
+                    deleted: segment.num_deleted_docs(),
+                    min: columns.layout_min,
+                    max: columns.layout_max,
+                    id: segment.segment_id(),
+                    ordered: adopted.contains(&segment.segment_id()),
+                }),
+                Err(err) => {
+                    warn!(
+                        "pattern: no bounds for segment {}: {err}",
+                        segment.segment_id().short_uuid_string()
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Drops cache entries, and adoptions, for segments a merge has retired, once they
+    /// outnumber the live ones.
     fn prune_columns(&self, live: &[SegmentReader]) {
-        let mut cache = self.columns.write().unwrap();
-        if cache.len() > 2 * live.len().max(1) {
-            let keep: HashSet<SegmentId> =
-                live.iter().map(|segment| segment.segment_id()).collect();
-            cache.retain(|id, _| keep.contains(id));
+        let keep =
+            || -> HashSet<SegmentId> { live.iter().map(|segment| segment.segment_id()).collect() };
+        {
+            let mut cache = self.columns.write().unwrap();
+            if cache.len() > 2 * live.len().max(1) {
+                let keep = keep();
+                cache.retain(|id, _| keep.contains(id));
+            }
+        }
+        let mut adopted = self.adopted.lock().unwrap();
+        if adopted.len() > 2 * live.len().max(1) {
+            let keep = keep();
+            adopted.retain(|id| keep.contains(id));
         }
     }
 }
@@ -408,7 +751,80 @@ pub(crate) struct TantivyStats {
 pub(crate) struct PatternStats {
     pub(crate) tantivy: TantivyStats,
     pub(crate) walk: WalkTotals,
+    pub(crate) merges: MergeTotals,
+    pub(crate) overlap: LayoutOverlap,
     pub(crate) segments: Vec<SegmentLayout>,
+}
+
+/// How many segments may cover one key before the rows there count as misplaced: a value that
+/// fills more than a segment, or a boundary two neighbours share, puts a key in two segments
+/// even when the layout is as good as it gets.
+const OVERLAP_TOLERANCE: u32 = 2;
+
+/// How far an ordered index's segments are from disjoint, by their layout-key bounds. A
+/// segment's depth is the most segments covering any one key within its bounds: what an ordered
+/// walk through that stretch has to open where one would do. 1 everywhere is a disjoint layout;
+/// the wide pieces a commit leaves over the whole range give every segment the depth of their
+/// count.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayoutOverlap {
+    /// The deepest any key is covered.
+    pub(crate) depth_max: u32,
+    /// Live rows summed over segments, each segment's weighted by its depth: over `rows`, the
+    /// depth a row sits at on average.
+    pub(crate) depth_rows: u64,
+    /// Live rows in the segments with bounds.
+    pub(crate) rows: u64,
+    /// Live rows in segments deeper than `OVERLAP_TOLERANCE`.
+    pub(crate) rows_over_tolerance: u64,
+    /// Deleted rows not yet merged away: a search still reads their postings.
+    pub(crate) rows_deleted: u64,
+    /// Live rows and segments in the fresh tier, which a repair has yet to place (see
+    /// [`Piece`]).
+    pub(crate) fresh_rows: u64,
+    pub(crate) fresh_segments: u64,
+}
+
+/// [`LayoutOverlap`] of `pieces`, but for the deleted rows. Empty segments are left out.
+fn layout_overlap(pieces: &[Piece]) -> LayoutOverlap {
+    let mut overlap = LayoutOverlap::default();
+    for (piece, ordered) in pieces.iter().zip(ordered_tier(pieces)) {
+        if !ordered && piece.docs > 0 {
+            overlap.fresh_rows += u64::from(piece.docs);
+            overlap.fresh_segments += 1;
+        }
+    }
+    let segments: Vec<_> = pieces
+        .iter()
+        .filter(|piece| piece.docs > 0)
+        .map(|piece| (piece.docs, piece.min, piece.max))
+        .collect();
+    let mut starts: Vec<u128> = segments.iter().map(|s| s.1).collect();
+    let mut ends: Vec<u128> = segments.iter().map(|s| s.2).collect();
+    starts.sort_unstable();
+    ends.sort_unstable();
+    // The depth at a key is the segments starting at or before it less those ending before it.
+    // Within any span it peaks at some segment's start, so the starts are the keys to look at.
+    let depths: Vec<u32> = starts
+        .iter()
+        .map(|&key| {
+            (starts.partition_point(|&start| start <= key) - ends.partition_point(|&end| end < key))
+                as u32
+        })
+        .collect();
+    for &(docs, min, max) in &segments {
+        let from = starts.partition_point(|&start| start < min);
+        let to = starts.partition_point(|&start| start <= max);
+        let depth = depths[from..to].iter().copied().max().unwrap_or(1);
+        let docs = u64::from(docs);
+        overlap.depth_max = overlap.depth_max.max(depth);
+        overlap.depth_rows += docs * u64::from(depth);
+        overlap.rows += docs;
+        if depth > OVERLAP_TOLERANCE {
+            overlap.rows_over_tolerance += docs;
+        }
+    }
+    overlap
 }
 
 pub(crate) type PatternStatsR = anyhow::Result<PatternStats>;
@@ -482,6 +898,101 @@ impl PatternBackend {
         }
         doc
     }
+
+    /// The layout policy of an ordered index with a segment cap: two tiers, merged apart (see
+    /// [`Piece`] and `merge_runs`), and the rows of the fresh one repaired into the ordered one
+    /// (see `repair_step`).
+    ///
+    /// Tantivy's default policy merges segments of similar size whatever they hold, which is how an
+    /// index ends up with 1.3M-row segments spanning a quarter of the range each and a tail of small
+    /// ones that all reach the top: a page-1 query opens every tail segment and a deep page scans
+    /// whichever big segment its cursor lands in. Here no merge mixes the tiers, and an ordered
+    /// merge only takes neighbours in sort order, never past the cap, so the ordered tier stays
+    /// disjoint. Segments whose bounds are not known yet (committed but not reloaded) wait for
+    /// the next tick.
+    ///
+    /// All of it is done by `after_reload`, on every tick; the policy the writer holds merges
+    /// nothing, beyond keeping Tantivy's default one out. Two deciders picked the same runs: Tantivy
+    /// hands its policy only the segments no merge is reading, but `after_reload` cut its runs from
+    /// every live segment and knew of its own merges only, so it asked again for each run the policy
+    /// had just started -- in a local run of local_orders_config.yaml, 3,772 merges of 10,810, each
+    /// ending in "couldn't find segment in SegmentManager". With one decider, `MergesInFlight` sees
+    /// every merge. A merge starts up to a tick after the commit that made it possible.
+    fn merge_policy(&self) -> Option<Box<dyn MergePolicy>> {
+        self.options.segment_max_docs.as_ref().as_ref()?;
+        Some(Box::new(tantivy::indexer::NoMergePolicy))
+    }
+
+    /// Learns every live segment's bounds (which also warms the column cache), drops the retired
+    /// ones, adopts the segments found where they belong, and asks the writer to merge the runs
+    /// `merge_runs` cuts (see `merge_policy`). Not left to Tantivy, which evaluates merges after a
+    /// commit: at that moment the bounds of the segments the commit produced are not known yet,
+    /// so the runs they belong to would wait for a commit that may never come once the writes
+    /// stop. Run on every tick, since the reader reloads on its own.
+    fn after_reload(&self, state: &PatternIndexState) {
+        let searcher = state.reader.searcher();
+        let mut pieces = self.geometry(&searcher);
+        self.prune_columns(searcher.segment_readers());
+
+        let Some(max_docs) = *self.options.segment_max_docs.as_ref() else {
+            return;
+        };
+        let mut merging = self.merging.lock().unwrap();
+        let busy = merging.busy(&mut self.adopted.lock().unwrap());
+        if merging.unsettled(&live_segments(&searcher)) {
+            return;
+        }
+        // A merge that ended since `geometry` read the adoptions may have adopted its output.
+        let adopted = self.adopted.lock().unwrap().clone();
+        for piece in &mut pieces {
+            piece.ordered |= adopted.contains(&piece.id);
+        }
+        self.adopt(&mut pieces);
+        // A run with a segment already being merged waits for that merge: see `MergesInFlight`.
+        // The runs are still cut from every live segment, not from the idle ones alone, which
+        // would make a busy segment's neighbours look adjacent and merge them across it into a
+        // segment overlapping it.
+        let runs: Vec<(Vec<SegmentId>, bool)> = merge_runs(&pieces, max_docs.get())
+            .into_iter()
+            .filter(|(run, _)| !run.iter().any(|id| busy.contains(id)))
+            .collect();
+        if !runs.is_empty() {
+            info!(
+                "pattern: asking for {} merges of {} segments ({} live, {} being merged)",
+                runs.len(),
+                runs.iter().map(|(run, _)| run.len()).sum::<usize>(),
+                searcher.segment_readers().len(),
+                busy.len()
+            );
+        }
+        for (run, ordered) in runs {
+            // The merge runs on Tantivy's own thread; the handle only reports its end, and the
+            // next reload picks the merged segment up either way.
+            let merge = state.lock_writer().merge(&run);
+            merging.started(run, ordered, merge);
+        }
+    }
+
+    /// Adopts into the ordered tier the pieces `ordered_tier` finds there that no tag says are.
+    fn adopt(&self, pieces: &mut [Piece]) {
+        let tiers = ordered_tier(pieces);
+        let mut adopted = self.adopted.lock().unwrap();
+        for (piece, ordered) in pieces.iter_mut().zip(tiers) {
+            if ordered && !piece.ordered {
+                adopted.insert(piece.id);
+                piece.ordered = true;
+            }
+        }
+    }
+}
+
+/// The ids of the searcher's segments.
+fn live_segments(searcher: &tantivy::Searcher) -> HashSet<SegmentId> {
+    searcher
+        .segment_readers()
+        .iter()
+        .map(SegmentReader::segment_id)
+        .collect()
 }
 
 type PatternIndexState = Index<PatternBackend>;
@@ -492,7 +1003,7 @@ impl PatternIndexState {
     }
 }
 
-/// A new tantivy index for `options`.
+/// A new tantivy index for `options`, with the merge policy they ask for.
 fn new_index(
     options: &IndexOptionsPattern,
     key_layout: &KeyLayout,
@@ -503,11 +1014,19 @@ fn new_index(
         key_layout: key_layout.clone(),
         walk: WalkCounters::default(),
         columns: RwLock::new(HashMap::new()),
+        adopted: Mutex::new(HashSet::new()),
+        tick_running: AtomicBool::new(false),
+        merging: Mutex::new(MergesInFlight::default()),
         options: options.clone(),
     };
     let schema = backend.build_schema();
     let analyzer = gram::build_ngram_analyzer(backend.min_gram(), backend.max_gram())?;
-    Index::with_state(schema, TOKENIZER_NAME, analyzer, key, worker, backend)
+    let policy = backend.merge_policy();
+    let index = Index::with_state(schema, TOKENIZER_NAME, analyzer, key, worker, backend)?;
+    if let Some(policy) = policy {
+        index.set_merge_policy(policy);
+    }
+    Ok(index)
 }
 
 fn find_partition_id(
@@ -1017,9 +1536,17 @@ fn handle_pattern_stats(state: &PatternIndexState) -> PatternStatsR {
             })
         })
         .collect::<anyhow::Result<_>>()?;
+    let mut overlap = layout_overlap(&state.backend().geometry(&searcher));
+    overlap.rows_deleted = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| u64::from(segment.num_deleted_docs()))
+        .sum();
     Ok(PatternStats {
         tantivy,
         walk: state.backend().walk.snapshot(),
+        merges: state.backend().merging.lock().unwrap().totals(),
+        overlap,
         segments,
     })
 }
@@ -1217,6 +1744,18 @@ pub(crate) fn new(
                 }
                 _ = indexes.commit_interval_tick() => {
                     indexes.commit_or_reload().await;
+                    for state in indexes.iter() {
+                        // Learning a large segment's bounds reads its columns, so the work runs
+                        // on tokio's blocking pool, and a tick adds none while an index's previous
+                        // work still runs.
+                        let Some(work) = TickWork::start(state) else {
+                            continue;
+                        };
+                        tokio::task::spawn_blocking(move || {
+                            let state = &work.0;
+                            state.backend().after_reload(state);
+                        });
+                    }
                     mark_dirty(&index.key);
                 }
             }
@@ -1236,6 +1775,7 @@ mod tests {
     use crate::PrimaryKey;
     use crate::QueryError;
     use crate::RarestGrams;
+    use crate::SegmentMaxDocs;
     use crate::memory::Allocate;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
@@ -1289,6 +1829,7 @@ mod tests {
             // The matching tests run in table order and sort what they get; the order has tests
             // of its own.
             order_by: OrderBy::Table,
+            segment_max_docs: SegmentMaxDocs::default(),
             rarest_grams: RarestGrams::default(),
         }
     }
@@ -1388,6 +1929,14 @@ mod tests {
             .await
             .unwrap();
         rx.recv().await;
+    }
+
+    async fn rm_doc_no_wait(sender: &mpsc::Sender<PatternIndex>, primary: u64) {
+        let (tx, _rx) = mpsc::channel(1);
+        sender
+            .remove_document(primary.into(), AsyncInProgress::fullscan(tx))
+            .await
+            .unwrap();
     }
 
     async fn rm_doc(sender: &mpsc::Sender<PatternIndex>, primary: u64) {
@@ -1779,6 +2328,10 @@ mod tests {
             let (min, max) = (segment.sort_min.unwrap(), segment.sort_max.unwrap());
             assert!(min <= max, "segment bounds inverted: {segment:?}");
         }
+        let overlap = before.overlap;
+        assert_eq!(overlap.rows, before.tantivy.num_docs);
+        assert!(overlap.depth_max >= 1, "{overlap:?}");
+        assert!(overlap.depth_rows >= overlap.rows, "{overlap:?}");
 
         search_ordered(&sender, "将军", 2, SearchWindow::default()).await;
 
@@ -1797,6 +2350,234 @@ mod tests {
         assert_eq!(walk.store_reads, 0, "{walk:?}");
     }
 
+    fn id(n: u8) -> SegmentId {
+        SegmentId::from_uuid_string(&format!("00000000-0000-0000-0000-0000000000{n:02}")).unwrap()
+    }
+
+    /// A merge held back by a test: it ends, producing `Some(segment)` or nothing, when the
+    /// sender sends, and fails when the sender is dropped.
+    impl MergeOutput for Result<Option<SegmentId>, futures::channel::oneshot::Canceled> {
+        fn segment(&self) -> Option<SegmentId> {
+            *self.as_ref().ok()?
+        }
+    }
+
+    /// A merge that outlasts a tick keeps its segments out of the next tick's merges: asked for
+    /// them again, Tantivy would queue a second full merge (run a0e51aa9 queued each one up to
+    /// 60 times a minute).
+    #[test]
+    fn segments_being_merged_are_not_merged_again() {
+        let mut merging = MergesInFlight::default();
+        let mut adopted = HashSet::new();
+        let (finish, merge) = futures::channel::oneshot::channel::<Option<SegmentId>>();
+        merging.started(vec![id(1), id(2)], false, merge);
+        let (_still_running, other) = futures::channel::oneshot::channel();
+        merging.started(vec![id(3)], false, other);
+        assert_eq!(merging.busy(&mut adopted), [id(1), id(2), id(3)].into());
+        // Still running at the next tick: still busy.
+        assert_eq!(merging.busy(&mut adopted), [id(1), id(2), id(3)].into());
+        finish.send(Some(id(4))).unwrap();
+        assert_eq!(merging.busy(&mut adopted), [id(3)].into());
+        assert_eq!(
+            merging.totals(),
+            MergeTotals {
+                started: 2,
+                ended: 1,
+                running: 1
+            }
+        );
+        // A merge of fresh segments makes a fresh one.
+        assert!(adopted.is_empty());
+    }
+
+    /// A merge that failed frees its segments as one that succeeded does, so that they can be
+    /// merged on a later tick rather than never again.
+    #[test]
+    fn the_segments_of_a_failed_merge_can_be_merged_again() {
+        let mut merging = MergesInFlight::default();
+        let (failed, merge) = futures::channel::oneshot::channel::<Option<SegmentId>>();
+        merging.started(vec![id(1), id(2)], true, merge);
+        drop(failed);
+        let mut adopted = HashSet::new();
+        assert!(merging.busy(&mut adopted).is_empty());
+        assert!(adopted.is_empty());
+    }
+
+    /// What a merge of ordered segments produced is adopted when it reports its end; until then,
+    /// a searcher that no longer holds the merged segments holds its output, which the layout
+    /// cannot place yet.
+    #[test]
+    fn a_merge_of_ordered_segments_is_ordered_once_it_ends() {
+        let mut merging = MergesInFlight::default();
+        let mut adopted = HashSet::new();
+        let (finish, merge) = futures::channel::oneshot::channel::<Option<SegmentId>>();
+        merging.started(vec![id(1), id(2)], true, merge);
+        assert!(!merging.unsettled(&[id(1), id(2), id(5)].into()));
+        assert!(merging.unsettled(&[id(3), id(5)].into()));
+        finish.send(Some(id(3))).unwrap();
+        merging.busy(&mut adopted);
+        assert_eq!(adopted, [id(3)].into());
+        assert!(!merging.unsettled(&[id(3), id(5)].into()));
+    }
+
+    /// A fresh segment of `docs` rows over `min..=max`: ingested, and adopted by nobody yet.
+    fn piece(docs: u32, min: u128, max: u128, n: u8) -> Piece {
+        Piece {
+            docs,
+            deleted: 0,
+            min,
+            max,
+            id: id(n),
+            ordered: false,
+        }
+    }
+
+    /// `piece`, placed by a repair or adopted.
+    fn ordered(docs: u32, min: u128, max: u128, n: u8) -> Piece {
+        Piece {
+            ordered: true,
+            ..piece(docs, min, max, n)
+        }
+    }
+
+    /// Disjoint segments sit at depth 1, and neighbours sharing a boundary key at 2, within the
+    /// tolerance; the depth counts the segments over the deepest key of a segment's span, so a
+    /// wide one over narrow ones deepens them all, and a second wide one takes them over it.
+    #[test]
+    fn layout_overlap_counts_the_segments_over_each_key() {
+        let disjoint = [
+            piece(100, 0, 9, 1),
+            piece(100, 10, 19, 2),
+            piece(100, 20, 29, 3),
+        ];
+        assert_eq!(
+            layout_overlap(&disjoint),
+            LayoutOverlap {
+                depth_max: 1,
+                depth_rows: 300,
+                rows: 300,
+                ..LayoutOverlap::default()
+            }
+        );
+
+        // A layout key ties the sort value with the second slot, so one value filling several
+        // segments still leaves them disjoint; three meeting at one key is past the tolerance.
+        let shared = [
+            piece(100, 0, 10, 1),
+            piece(100, 10, 10, 2),
+            piece(100, 10, 29, 3),
+        ];
+        let overlap = layout_overlap(&shared);
+        assert_eq!((overlap.depth_max, overlap.rows_over_tolerance), (3, 300));
+        let neighbours = [piece(100, 0, 10, 1), piece(100, 10, 29, 2)];
+        let overlap = layout_overlap(&neighbours);
+        assert_eq!((overlap.depth_max, overlap.rows_over_tolerance), (2, 0));
+
+        let mut covered = disjoint.to_vec();
+        covered.push(piece(50, 0, 29, 4));
+        let overlap = layout_overlap(&covered);
+        assert_eq!(
+            (
+                overlap.depth_max,
+                overlap.depth_rows,
+                overlap.rows_over_tolerance
+            ),
+            (2, 2 * 350, 0)
+        );
+        // Each overlapping one, none of them known to be ordered: all fresh.
+        assert_eq!((overlap.fresh_rows, overlap.fresh_segments), (350, 4));
+        covered.push(piece(50, 5, 25, 5));
+        let overlap = layout_overlap(&covered);
+        assert_eq!(
+            (
+                overlap.depth_max,
+                overlap.depth_rows,
+                overlap.rows_over_tolerance
+            ),
+            (3, 3 * 400, 400)
+        );
+
+        // An empty segment covers nothing.
+        let emptied = [piece(100, 0, 9, 1), piece(0, 0, 9, 2)];
+        assert_eq!(layout_overlap(&emptied).depth_max, 1);
+        assert_eq!(layout_overlap(&[]), LayoutOverlap::default());
+    }
+
+    /// The ordered tier: what a tag says is, and what overlaps nothing; an empty segment is in
+    /// neither tier and keeps nothing out of the ordered one.
+    #[test]
+    fn a_segment_overlapping_nothing_is_ordered() {
+        let pieces = [
+            piece(10, 0, 9, 1),     // alone: ordered
+            piece(0, 5, 50, 2),     // empty: overlaps nothing
+            piece(10, 20, 40, 3),   // overlaps 4: fresh
+            piece(10, 30, 60, 4),   // overlaps 3: fresh
+            ordered(10, 35, 45, 5), // overlaps both, but tagged
+            piece(10, 61, 70, 6),   // touches nothing: ordered
+            piece(10, 70, 80, 7),   // shares key 70 with 6...
+        ];
+        assert_eq!(
+            ordered_tier(&pieces),
+            [true, false, false, false, true, false, false]
+        );
+        assert_eq!(
+            ordered_tier(&pieces[..6]),
+            [true, false, false, false, true, true]
+        );
+    }
+
+    /// Ordered clusters merge whole, with their neighbours while the run stays within three
+    /// quarters of the cap, and alone up to the cap; one past the cap is left to the repair.
+    /// Fresh segments merge among themselves under the cap, whatever they span; the tiers never
+    /// meet in a merge.
+    #[test]
+    fn merges_keep_to_one_tier_and_take_clusters_whole() {
+        let cap = 100;
+        let pieces = [
+            ordered(30, 0, 9, 1),
+            ordered(30, 10, 19, 2),
+            ordered(30, 20, 29, 3), // 1 + 2 = 60, + 3 = 90 > 75
+            ordered(40, 30, 39, 4), // with 3: 70
+            ordered(60, 40, 49, 5), // a cluster with 6: 90, alone
+            ordered(30, 45, 49, 6),
+            ordered(80, 50, 59, 7), // a cluster past the cap with 8
+            ordered(30, 52, 55, 8),
+            ordered(40, 60, 69, 9),      // alone, and no neighbour fits
+            piece(40, 0, 100, 10),       // fresh, overlapping all of the above
+            piece(50, 5, 100, 11),       // + 10 = 90
+            piece(30, 10, 100, 12),      // 90 + 30 > 100: a run of its own
+            piece(cap + 5, 20, 100, 13), // full: left out
+            piece(5, 30, 100, 14),       // with 12: 35
+        ];
+        assert_eq!(
+            merge_runs(&pieces, cap),
+            vec![
+                (vec![id(1), id(2)], true),
+                (vec![id(3), id(4)], true),
+                (vec![id(5), id(6)], true),
+                (vec![id(10), id(11)], false),
+                (vec![id(12), id(14)], false),
+            ]
+        );
+        assert!(merge_runs(&[], cap).is_empty());
+    }
+
+    /// A segment whose deleted rows outnumber its live ones is merged on its own, which drops
+    /// them; one with fewer is left.
+    #[test]
+    fn a_segment_mostly_deleted_is_merged_alone() {
+        let hollow = Piece {
+            deleted: 60,
+            ..ordered(40, 0, 9, 1)
+        };
+        let worn = Piece {
+            deleted: 10,
+            ..ordered(70, 20, 29, 2)
+        };
+        // 40 + 70 > 75: no run with both.
+        assert_eq!(merge_runs(&[hollow, worn], 100), vec![(vec![id(1)], true)]);
+    }
+
     /// With the cap set, an index built from many small commits ends with segments that hold
     /// contiguous slices of the sort range, none past the cap, and still answers correctly.
     #[rstest]
@@ -1807,6 +2588,7 @@ mod tests {
         // lets the pieces of a commit merge and stops a run growing past two commits' worth.
         let cap = 120u32;
         let sender = make_sender_with_options(IndexOptionsPattern {
+            segment_max_docs: cap.to_string().parse().unwrap(),
             ..ordered_options()
         });
         // 400 rows in sort order, sort key = primary id, sent as one batch: `add_doc` waits for
@@ -1860,6 +2642,78 @@ mod tests {
 
         let (ids, _) = search_ordered(&sender, "将军", 5, SearchWindow::default()).await;
         assert_eq!(ids, vec![400, 399, 398, 397, 396]);
+    }
+
+    /// A keyword past max_gram reads the store only for the page and the false positives above
+    /// it, not for every candidate: 30 rows all matching, a page of 5, and 5 verification reads
+    /// plus the 5 that resolve the page.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn the_range_policy_folds_the_tail_a_stream_of_updates_leaves() {
+        // What the docker smoke saw (2026-09-26): 3000 shuffled rows in one build, then every row
+        // delivered again as an update in small commits, as the CDC reader replays the load. The
+        // updates land as small segments spanning the whole range; once the writes stop, the
+        // idle reloads must fold them together under the cap rather than leave two dozen slivers.
+        let cap = 500u32;
+        let sender = make_sender_with_threshold(
+            IndexOptionsPattern {
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                ..ordered_options()
+            },
+            3000,
+        );
+        let ids: Vec<u64> = (0..3000u64).map(|i| (i * 1103 + 977) % 3000 + 1).collect();
+        let send = |primary: u64| {
+            let sender = sender.clone();
+            async move {
+                let (tx, rx) = mpsc::channel(1);
+                sender
+                    .add_document(
+                        test_partition_id(),
+                        primary.into(),
+                        format!("user{primary}将军"),
+                        AsyncInProgress::fullscan(tx),
+                    )
+                    .await
+                    .unwrap();
+                rx
+            }
+        };
+        let mut acks = Vec::with_capacity(3000);
+        for &primary in &ids {
+            acks.push(send(primary).await);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        // The replay: rows come back in the same order, a commit interval apart per hundred.
+        for chunk in ids.chunks(100) {
+            let mut acks = Vec::with_capacity(chunk.len());
+            for &primary in chunk {
+                rm_doc_no_wait(&sender, primary).await;
+                acks.push(send(primary).await);
+            }
+            for mut ack in acks {
+                ack.recv().await;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            if stats.tantivy.segment_count <= 8 || Instant::now() > deadline {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(stats.tantivy.num_docs, 3000);
+        assert!(
+            stats.tantivy.segment_count <= 8,
+            "{} segments: {:?}",
+            stats.tantivy.segment_count,
+            stats.segments
+        );
+        assert!(stats.segments.iter().all(|s| s.docs <= cap));
     }
 
     #[tokio::test]
@@ -2021,6 +2875,71 @@ mod tests {
         let (ids, cursor) = search_ordered(&sender, "没有人", 10, SearchWindow::default()).await;
         assert!(ids.is_empty(), "got {ids:?}");
         assert_eq!(cursor, None);
+    }
+
+    /// A long keyword that occurs in one name opens only the segment holding it: every other
+    /// segment lacks one of its grams, which one term-dictionary lookup shows, and is skipped
+    /// before any posting list is opened. The answer is what the full walk gave.
+    #[rstest]
+    #[timeout(Duration::from_secs(30))]
+    #[tokio::test]
+    async fn a_rare_long_keyword_opens_only_the_segments_that_hold_its_grams() {
+        let cap = 120u32;
+        let sender = make_sender_with_options(IndexOptionsPattern {
+            segment_max_docs: cap.to_string().parse().unwrap(),
+            ..ordered_options()
+        });
+        let mut acks = Vec::with_capacity(400);
+        for primary in 1..=400u64 {
+            let name = if primary == 250 {
+                "zqxwvkj将军".to_string()
+            } else {
+                format!("user{primary}将军")
+            };
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    name,
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let segments = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            if stats.tantivy.segment_count <= 6 || Instant::now() > deadline {
+                break stats.tantivy.segment_count;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(
+            segments >= 3,
+            "the test needs several segments, got {segments}"
+        );
+
+        let before = sender.stats(make_index_key()).await.unwrap().walk;
+        let (ids, _) = search_ordered(&sender, "qxwvkj将", 20, SearchWindow::default()).await;
+        let after = sender.stats(make_index_key()).await.unwrap().walk;
+        assert_eq!(ids, vec![250]);
+        assert_eq!(
+            after.segments_opened - before.segments_opened,
+            1,
+            "{segments} segments considered, only the one holding the name should open"
+        );
+
+        // A keyword every segment holds the grams of still opens them all and answers in full.
+        let before = sender.stats(make_index_key()).await.unwrap().walk;
+        let (ids, _) = search_ordered(&sender, "er1将军", 400, SearchWindow::default()).await;
+        let after = sender.stats(make_index_key()).await.unwrap().walk;
+        assert_eq!(ids, vec![1]);
+        assert!(after.segments_opened - before.segments_opened >= 1);
     }
 
     /// A keyword longer than `max_gram` takes the verification path, where the sort key is read
@@ -2569,7 +3488,8 @@ mod tests {
     }
 
     /// A segment holding the last tokens of one value and the first of the next spans what its
-    /// rows do, not both values whole.
+    /// rows do, not both values whole: narrow, so it neither counts as wide nor joins the spread
+    /// segments that merge whatever they span.
     #[test]
     fn a_segment_across_two_values_is_as_narrow_as_its_rows() {
         let rows = [
@@ -2582,7 +3502,21 @@ mod tests {
         let (low, high) = second_slot_at_the_ends(rows.into_iter(), 3, 4);
         assert_eq!((low, high), (u64::MAX - 40, 90));
         let layout = |first: u64, second: u64| (u128::from(first) << 64) | u128::from(second);
-        assert_eq!(layout(4, high) - layout(3, low), 131);
+        let (min, max) = (layout(3, low), layout(4, high));
+        assert_eq!(max - min, 131);
+        // Between a segment holding the end of value 3 and one holding the start of value 4, it
+        // overlaps neither: where it belongs.
+        let segments = [
+            ordered(20_000, layout(3, 0), layout(3, u64::MAX - 41), 1),
+            ordered(20_000, layout(4, 91), layout(4, u64::MAX), 2),
+            piece(500, min, max, 3),
+        ];
+        assert_eq!(ordered_tier(&segments), [true, true, true]);
+        // The bounds as they were: both values whole, over both neighbours, to be repaired again
+        // and again.
+        let widened = piece(500, layout(3, 0), layout(4, u64::MAX), 3);
+        let segments = [segments[0], segments[1], widened];
+        assert_eq!(ordered_tier(&segments), [true, true, false]);
     }
 
     #[rstest]

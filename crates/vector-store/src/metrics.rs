@@ -106,6 +106,11 @@ pub(crate) struct Metrics {
     /// index on scrape, so they are gauges that only ever grow; a client diffs two scrapes to
     /// price the queries in between. One entry per [`PATTERN_SEARCH_TOTALS`].
     pub pattern_search_totals: Vec<GaugeVec>,
+    /// The merges a pattern index's ticks ask for. One entry per [`PATTERN_MERGE_GAUGES`].
+    pub pattern_merges: Vec<GaugeVec>,
+    /// How far a pattern index's segments are from disjoint. One entry per
+    /// [`PATTERN_LAYOUT_GAUGES`].
+    pub pattern_layout: Vec<GaugeVec>,
     /// A pattern index's segments, one label set per segment ordinal: how many rows each holds
     /// and the span of sort keys its pruning is judged by. See [`PATTERN_SEGMENT_GAUGES`].
     pub pattern_segment_layout: Vec<GaugeVec>,
@@ -160,6 +165,55 @@ pub(crate) const PATTERN_SEARCH_TOTALS: &[(&str, &str)] = &[
     (
         "pattern_search_segments_wasted_total",
         "Segments an ordered pattern search opened that put no row on its page, summed over searches",
+    ),
+];
+
+/// The gauges of the merges a pattern index's ticks ask for, in the order `pattern_merges` holds
+/// them. Tantivy's own merges after a commit are not counted. A merge started again while one of
+/// the same segments still runs (run a0e51aa9) shows as `started` running far ahead of `ended`;
+/// `running` falls to 0 once an index has settled.
+pub(crate) const PATTERN_MERGE_GAUGES: &[(&str, &str)] = &[
+    (
+        "pattern_merges_started",
+        "Merges a pattern index asked its writer for since it was created",
+    ),
+    (
+        "pattern_merges_ended",
+        "Of those, the merges seen to have ended, successfully or not",
+    ),
+    (
+        "pattern_merges_running",
+        "Merges a pattern index asked for that are still running",
+    ),
+];
+
+/// The gauges of how far a pattern index's segments are from disjoint, in the order
+/// `pattern_layout` holds them (see `LayoutOverlap`). A depth of 1 is a disjoint layout, what an
+/// ordered walk prunes best.
+pub(crate) const PATTERN_LAYOUT_GAUGES: &[(&str, &str)] = &[
+    (
+        "pattern_layout_depth_max",
+        "Most segments of a pattern index covering one sort key",
+    ),
+    (
+        "pattern_layout_depth_mean",
+        "Segments covering a row's stretch of sort keys, averaged over rows",
+    ),
+    (
+        "pattern_layout_rows_over_tolerance",
+        "Rows in segments covered more than twice over",
+    ),
+    (
+        "pattern_layout_rows_deleted",
+        "Deleted rows whose postings a search still reads until a merge drops them",
+    ),
+    (
+        "pattern_layout_fresh_rows",
+        "Rows of a pattern index not yet repaired into its ordered segments",
+    ),
+    (
+        "pattern_layout_fresh_segments",
+        "Segments holding those rows",
     ),
 ];
 
@@ -341,6 +395,26 @@ impl Metrics {
                 .unwrap()
             })
             .collect::<Vec<_>>();
+        let pattern_merges = PATTERN_MERGE_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pattern_layout = PATTERN_LAYOUT_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
         let pattern_segment_layout = PATTERN_SEGMENT_GAUGES
             .iter()
             .map(|(name, help)| {
@@ -380,6 +454,8 @@ impl Metrics {
             .unwrap();
         for gauge in pattern_search_totals
             .iter()
+            .chain(pattern_merges.iter())
+            .chain(pattern_layout.iter())
             .chain(pattern_segment_layout.iter())
         {
             registry.register(Box::new(gauge.clone())).unwrap();
@@ -400,6 +476,8 @@ impl Metrics {
             pattern_index_size_bytes,
             pattern_segment_count,
             pattern_search_totals,
+            pattern_merges,
+            pattern_layout,
             pattern_segment_layout,
             dirty_indexes: Arc::default(),
             pattern_segments_exported: Arc::default(),
@@ -495,7 +573,12 @@ impl Metrics {
         let _ = self
             .pattern_segment_count
             .remove_label_values(&[keyspace, index_name]);
-        for gauge in self.pattern_search_totals.iter() {
+        for gauge in self
+            .pattern_search_totals
+            .iter()
+            .chain(self.pattern_merges.iter())
+            .chain(self.pattern_layout.iter())
+        {
             let _ = gauge.remove_label_values(&[keyspace, index_name]);
         }
         self.set_pattern_segments(keyspace, index_name, &[]);
@@ -656,6 +739,31 @@ async fn refresh_index(
                 walk.segments_wasted as f64,
             ];
             for (gauge, value) in metrics.pattern_search_totals.iter().zip(totals) {
+                gauge.with_label_values(&labels).set(value);
+            }
+            let merges = stats.merges;
+            let merges = [
+                merges.started as f64,
+                merges.ended as f64,
+                merges.running as f64,
+            ];
+            for (gauge, value) in metrics.pattern_merges.iter().zip(merges) {
+                gauge.with_label_values(&labels).set(value);
+            }
+            let overlap = stats.overlap;
+            let layout = [
+                overlap.depth_max as f64,
+                if overlap.rows == 0 {
+                    0.0
+                } else {
+                    overlap.depth_rows as f64 / overlap.rows as f64
+                },
+                overlap.rows_over_tolerance as f64,
+                overlap.rows_deleted as f64,
+                overlap.fresh_rows as f64,
+                overlap.fresh_segments as f64,
+            ];
+            for (gauge, value) in metrics.pattern_layout.iter().zip(layout) {
                 gauge.with_label_values(&labels).set(value);
             }
             // The bounds are exported as the column's own value rather than as the sort key,
@@ -1160,8 +1268,22 @@ mod tests {
             .pattern_segment_count
             .with_label_values(&["ks", "idx"])
             .set(2.0);
+        metrics.pattern_merges[2]
+            .with_label_values(&["ks", "idx"])
+            .set(1.0);
+        metrics.pattern_layout[0]
+            .with_label_values(&["ks", "idx"])
+            .set(3.0);
 
         let output = metric_families_text(&metrics);
+        assert!(
+            output.contains(r#"pattern_merges_running{index_name="idx",keyspace="ks"} 1"#),
+            "expected observed value in export:\n{output}"
+        );
+        assert!(
+            output.contains(r#"pattern_layout_depth_max{index_name="idx",keyspace="ks"} 3"#),
+            "expected observed value in export:\n{output}"
+        );
         assert!(
             output.contains("# TYPE pattern_index_size_bytes gauge"),
             "pattern_index_size_bytes gauge missing from export:\n{output}"

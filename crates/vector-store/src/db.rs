@@ -10,6 +10,7 @@ use crate::ColumnName;
 use crate::Config;
 use crate::Connectivity;
 use crate::Credentials;
+use crate::DEFAULT_SEGMENT_ROWS;
 use crate::DbCustomIndex;
 use crate::DbDriver;
 use crate::DbIndexKind;
@@ -34,6 +35,7 @@ use crate::OrderBy;
 use crate::Positions;
 use crate::Quantization;
 use crate::RarestGrams;
+use crate::SegmentMaxDocs;
 use crate::SpaceType;
 use crate::TableName;
 use crate::cql_types;
@@ -615,12 +617,24 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
             OrderBy::Invalid(value.as_str().into())
         })
     });
+    // An order that did not parse gets no defaults: the index is refused anyway.
+    let ordered = !matches!(order_by, OrderBy::Invalid(_));
+    // `segment_rows` caps segment size and switches on the range-aware merge policy. An
+    // index gets the cap unless it says otherwise ('0' turns it off): without it a deep page costs several times what the first one does.
+    let segment_max_docs: SegmentMaxDocs = if options.contains_key("segment_rows") {
+        parse_index_option(options, "segment_rows")
+    } else if ordered {
+        SegmentMaxDocs::from(Some(DEFAULT_SEGMENT_ROWS))
+    } else {
+        SegmentMaxDocs::default()
+    };
     let rarest_grams: RarestGrams = parse_index_option(options, "rarest_grams");
     IndexOptionsPattern {
         min_gram,
         max_gram,
         case_sensitive,
         order_by,
+        segment_max_docs,
         rarest_grams,
     }
     .validated()
@@ -1686,7 +1700,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pattern_index_options_are_read_with_their_defaults() {
+    fn a_pattern_index_gets_the_cap_by_default() {
         let options = |pairs: &[(&str, &str)]| {
             pattern_index_options(
                 &pairs
@@ -1695,9 +1709,13 @@ pub(crate) mod tests {
                     .collect(),
             )
         };
-        // No order_by is table order.
+        // No order_by is table order, which keeps a layout like any other order.
         let table_order = options(&[]);
         assert_eq!(table_order.order_by, OrderBy::Table);
+        assert_eq!(
+            *table_order.segment_max_docs.as_ref(),
+            Some(DEFAULT_SEGMENT_ROWS)
+        );
 
         // A value that does not parse is kept, to be refused, rather than read as table order.
         assert!(matches!(
@@ -1705,10 +1723,26 @@ pub(crate) mod tests {
             OrderBy::Invalid(_)
         ));
 
+        let ordered = options(&[("order_by", "register_time")]);
+        assert_eq!(
+            *ordered.segment_max_docs.as_ref(),
+            Some(DEFAULT_SEGMENT_ROWS)
+        );
+
+        let tuned = options(&[("order_by", "register_time"), ("segment_rows", "400000")]);
+        assert_eq!(
+            tuned.segment_max_docs.as_ref().map(|rows| rows.get()),
+            Some(400_000)
+        );
+
+        // '0' turns the cap off.
+        let uncapped = options(&[("order_by", "register_time"), ("segment_rows", "0")]);
+        assert_eq!(*uncapped.segment_max_docs.as_ref(), None);
+
         // A long keyword intersects its 4 rarest grams unless `rarest_grams` says how many; '0' is
         // all of them.
         assert_eq!(
-            *table_order.rarest_grams.as_ref(),
+            *ordered.rarest_grams.as_ref(),
             Some(crate::DEFAULT_RAREST_GRAMS)
         );
         let rarest = options(&[("rarest_grams", "2")]);

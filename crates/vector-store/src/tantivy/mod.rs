@@ -8,6 +8,7 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::RwLockWriteGuard;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -19,7 +20,10 @@ use tantivy::Searcher;
 use tantivy::TantivyDocument;
 use tantivy::directory::WatchCallback;
 use tantivy::directory::WatchHandle;
+use tantivy::index::SegmentId;
+use tantivy::index::SegmentMeta;
 use tantivy::indexer::IndexWriterOptions;
+use tantivy::indexer::MergePolicy;
 use tantivy::schema::FAST;
 use tantivy::schema::INDEXED;
 use tantivy::schema::Schema;
@@ -94,6 +98,15 @@ impl Writer {
 
     fn uncommitted_docs(&self) -> usize {
         self.uncommitted_docs_in_progress_guards.len()
+    }
+
+    /// Asks the writer to merge `segments`. The merge runs on Tantivy's own thread; the returned
+    /// future only reports its outcome and can be dropped.
+    pub(crate) fn merge(
+        &mut self,
+        segments: &[SegmentId],
+    ) -> tantivy::FutureResult<Option<SegmentMeta>> {
+        self.writer.merge(segments)
     }
 
     fn has_uncommitted_docs(&self) -> bool {
@@ -288,12 +301,23 @@ impl<E> Index<E> {
         })
     }
 
+    /// Replaces Tantivy's default merge policy.
+    pub(crate) fn set_merge_policy(&self, policy: Box<dyn MergePolicy>) {
+        self.writer.read().unwrap().writer.set_merge_policy(policy);
+    }
+
     /// Whether the writer holds uncommitted documents, or None while someone holds the writer.
     /// Never waits for the writer: the actors ask on their ticks, and a writer held for seconds --
     /// a pattern index moving rows between segments -- would stop an actor answering anything.
     pub(crate) fn has_uncommitted_docs(&self) -> Option<bool> {
         let writer = self.writer.try_read().ok()?;
         Some(writer.has_uncommitted_docs())
+    }
+
+    /// The writer, locked, for a caller that has to read the index and write what it read back
+    /// with nothing written in between, as moving rows between segments does.
+    pub(crate) fn lock_writer(&self) -> RwLockWriteGuard<'_, Writer> {
+        self.writer.write().unwrap()
     }
 }
 
@@ -466,6 +490,11 @@ where
         self.get(index_key)
             .map(|index| index.reader.searcher().num_docs() as usize)
             .unwrap_or(0)
+    }
+
+    /// Every index of the key, one per index id.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Arc<Index<E>>> {
+        self.indexes.values()
     }
 
     pub(crate) async fn commit_interval_tick(&mut self) {

@@ -91,6 +91,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -819,6 +820,26 @@ fn split_order_items(s: &str) -> anyhow::Result<Vec<(String, bool, Option<bool>)
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// The cap on a segment's size for a pattern index that merges by sort range (P3a), or none
+/// to keep Tantivy's default merge policy: the `segment_rows` option. `'0'` turns the cap off;
+/// an index with `order_by` and no `segment_rows` gets [`DEFAULT_SEGMENT_ROWS`].
+pub struct SegmentMaxDocs(Option<NonZeroU32>);
+
+impl FromStr for SegmentMaxDocs {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let docs: u32 = s
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("segment_rows must be a non-negative integer: {e}"))?;
+        Ok(Self(NonZeroU32::new(docs)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
 /// How many of a keyword's grams a pattern index intersects for a keyword past `max_gram`, the
 /// ones with the fewest documents in each segment first, or none for all of them: the
@@ -849,6 +870,10 @@ impl FromStr for RarestGrams {
         Ok(Self(NonZeroUsize::new(grams)))
     }
 }
+
+/// The segment cap of an ordered pattern index that does not set `segment_rows`: the flattest of
+/// the caps measured at 10M rows on 2026-09-30 (`docs/dev/pattern/stage-2-ordering.md`).
+pub const DEFAULT_SEGMENT_ROWS: NonZeroU32 = NonZeroU32::new(200_000).unwrap();
 
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
@@ -973,6 +998,9 @@ pub struct IndexOptionsPattern {
     pub case_sensitive: CaseSensitive,
     /// What the index answers in: table order, no order, or the declared columns.
     pub order_by: OrderBy,
+    /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
+    /// default policy. The `segment_rows` option.
+    pub segment_max_docs: SegmentMaxDocs,
     /// How many of a long keyword's rarest grams are intersected; none for all. The
     /// `rarest_grams` option.
     pub rarest_grams: RarestGrams,
@@ -994,6 +1022,7 @@ impl IndexOptionsPattern {
             // come back in the wrong order rather than failing.
             return Self {
                 order_by: self.order_by,
+                segment_max_docs: self.segment_max_docs,
                 ..Self::default()
             };
         }
@@ -1509,6 +1538,7 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            segment_max_docs: SegmentMaxDocs::default(),
             rarest_grams: RarestGrams::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsPattern::default());
@@ -1520,12 +1550,14 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: "registered_at".parse().unwrap(),
+            segment_max_docs: "250000".parse().unwrap(),
             rarest_grams: RarestGrams::default(),
         };
         assert_eq!(
             inverted_ordered.validated(),
             IndexOptionsPattern {
                 order_by: "registered_at".parse().unwrap(),
+                segment_max_docs: "250000".parse().unwrap(),
                 ..IndexOptionsPattern::default()
             }
         );
@@ -1535,9 +1567,15 @@ mod tests {
             max_gram: "2".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            segment_max_docs: SegmentMaxDocs::default(),
             rarest_grams: RarestGrams::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
+        assert_eq!(
+            "0".parse::<SegmentMaxDocs>().unwrap(),
+            SegmentMaxDocs::default()
+        );
+        assert!("many".parse::<SegmentMaxDocs>().is_err());
     }
 
     #[test]
