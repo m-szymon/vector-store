@@ -2490,6 +2490,8 @@ impl RegionWalk<'_> {
             .clamp(1.0, f64::from(u32::MAX)) as u32;
         // The matches a run offers of its stretch, which grow with it.
         let mut take = 2 * page.limit;
+        // Whether the runs holding no match have been told apart.
+        let mut swept = false;
         let mut regions: Vec<Region> = Vec::new();
         let mut reading: Vec<u32> = Vec::new();
         // What a run reads of a stretch of `width`: positions `from..to`, going down or up
@@ -2585,6 +2587,35 @@ impl RegionWalk<'_> {
                 next[index as usize] = at;
                 if unread_at(run, at) {
                     unread.push((best(run, at), index));
+                }
+            }
+            // A pass that met no match: the matches lie apart from the end the page is read
+            // from, and the runs between, read a stretch a pass, are as many passes. One pass of
+            // the postings over the runs left, in doc order, tells the ones that hold a match
+            // from the ones that hold none, which are left out from here on.
+            if !swept && tally.postings_scanned == scanned && !unread.is_empty() {
+                swept = true;
+                self.scorer = None;
+                let mut left: Vec<u32> = unread.drain().map(|(_, index)| index).collect();
+                left.sort_unstable();
+                if let Some(mut scorer) = self.like.candidates(self.segment)? {
+                    for index in left {
+                        let run = &runs[index as usize];
+                        let at = next[index as usize];
+                        let (from, to) = if forward {
+                            run.docs(at, run.len())
+                        } else {
+                            run.docs(0, at)
+                        };
+                        let doc_id = if scorer.doc() < from {
+                            scorer.seek(from)
+                        } else {
+                            scorer.doc()
+                        };
+                        if doc_id < to {
+                            unread.push((best(run, at), index));
+                        }
+                    }
                 }
             }
             if unread.is_empty() {
