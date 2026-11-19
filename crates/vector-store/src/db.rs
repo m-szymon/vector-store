@@ -35,6 +35,7 @@ use crate::OrderBy;
 use crate::Positions;
 use crate::Quantization;
 use crate::RarestGrams;
+use crate::RewriteWideSegments;
 use crate::SegmentMaxDocs;
 use crate::SpaceType;
 use crate::TableName;
@@ -628,6 +629,14 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
     } else {
         SegmentMaxDocs::default()
     };
+    // `rewrite` repairs rows out of sort order into disjoint segments, which needs the cap. On by
+    // default wherever there is a cap: an index created on a loaded table is unusable for
+    // ordered queries until it runs.
+    let rewrite_wide_segments: RewriteWideSegments = if options.contains_key("rewrite") {
+        parse_index_option(options, "rewrite")
+    } else {
+        RewriteWideSegments::from(segment_max_docs.as_ref().is_some())
+    };
     let rarest_grams: RarestGrams = parse_index_option(options, "rarest_grams");
     IndexOptionsPattern {
         min_gram,
@@ -635,6 +644,7 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
         case_sensitive,
         order_by,
         segment_max_docs,
+        rewrite_wide_segments,
         rarest_grams,
     }
     .validated()
@@ -1700,7 +1710,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_pattern_index_gets_the_cap_by_default() {
+    fn a_pattern_index_gets_the_cap_and_the_rewrite_by_default() {
         let options = |pairs: &[(&str, &str)]| {
             pattern_index_options(
                 &pairs
@@ -1716,6 +1726,7 @@ pub(crate) mod tests {
             *table_order.segment_max_docs.as_ref(),
             Some(DEFAULT_SEGMENT_ROWS)
         );
+        assert!(*table_order.rewrite_wide_segments.as_ref());
 
         // A value that does not parse is kept, to be refused, rather than read as table order.
         assert!(matches!(
@@ -1728,16 +1739,23 @@ pub(crate) mod tests {
             *ordered.segment_max_docs.as_ref(),
             Some(DEFAULT_SEGMENT_ROWS)
         );
+        assert!(*ordered.rewrite_wide_segments.as_ref());
 
-        let tuned = options(&[("order_by", "register_time"), ("segment_rows", "400000")]);
+        let tuned = options(&[
+            ("order_by", "register_time"),
+            ("segment_rows", "400000"),
+            ("rewrite", "false"),
+        ]);
         assert_eq!(
             tuned.segment_max_docs.as_ref().map(|rows| rows.get()),
             Some(400_000)
         );
+        assert!(!*tuned.rewrite_wide_segments.as_ref());
 
-        // '0' turns the cap off.
+        // '0' turns the cap off, and with it the rewrite that needs it.
         let uncapped = options(&[("order_by", "register_time"), ("segment_rows", "0")]);
         assert_eq!(*uncapped.segment_max_docs.as_ref(), None);
+        assert!(!*uncapped.rewrite_wide_segments.as_ref());
 
         // A long keyword intersects its 4 rarest grams unless `rarest_grams` says how many; '0' is
         // all of them.

@@ -100,6 +100,22 @@ impl Writer {
         self.uncommitted_docs_in_progress_guards.len()
     }
 
+    /// Re-adds `docs` under fresh opstamps after deleting whatever carried their terms: the delete
+    /// applies to documents added before it, so the new copy survives. For moving rows between
+    /// segments; nothing in progress is attached, since the rows were already indexed.
+    pub(crate) fn rewrite_documents(
+        &mut self,
+        docs: impl IntoIterator<Item = (tantivy::Term, TantivyDocument)>,
+    ) -> tantivy::Result<usize> {
+        let mut count = 0;
+        for (term, doc) in docs {
+            self.writer.delete_term(term);
+            self.writer.add_document(doc)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Asks the writer to merge `segments`. The merge runs on Tantivy's own thread; the returned
     /// future only reports its outcome and can be dropped.
     pub(crate) fn merge(
@@ -318,6 +334,15 @@ impl<E> Index<E> {
     /// with nothing written in between, as moving rows between segments does.
     pub(crate) fn lock_writer(&self) -> RwLockWriteGuard<'_, Writer> {
         self.writer.write().unwrap()
+    }
+
+    /// Commits `writer` and reloads the reader before returning, for a caller that has to read
+    /// what it has just committed rather than wait for the reload task.
+    pub(crate) fn commit_and_reload(&self, writer: &mut Writer) -> tantivy::Result<()> {
+        let (commit_opstamp, guards) = writer.commit()?;
+        self.reader
+            .drop_guards_when_searchable(commit_opstamp, guards);
+        self.reader.inner.reload()
     }
 }
 

@@ -820,6 +820,31 @@ fn split_order_items(s: &str) -> anyhow::Result<Vec<(String, bool, Option<bool>)
     }
 }
 
+/// A boolean index option, as ScyllaDB passes it through.
+fn parse_flag(name: &str, s: &str) -> anyhow::Result<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => Err(anyhow::anyhow!("Unknown {name} value: {s}")),
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
+)]
+/// Whether a pattern index repairs the rows that arrived out of sort order into segments
+/// disjoint in sort order: the `rewrite` option, on by default for an index with `order_by` and
+/// a segment cap.
+pub struct RewriteWideSegments(bool);
+
+impl FromStr for RewriteWideSegments {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_flag("rewrite", s).map(Self)
+    }
+}
+
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
 )]
@@ -1001,6 +1026,10 @@ pub struct IndexOptionsPattern {
     /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
     /// default policy. The `segment_rows` option.
     pub segment_max_docs: SegmentMaxDocs,
+    /// Repair the rows that arrived out of sort order (an index built by a full scan, a shuffled
+    /// load, writes over the range) into segments disjoint in sort order, of at most
+    /// `segment_max_docs` rows. Needs the cap. The `rewrite` option.
+    pub rewrite_wide_segments: RewriteWideSegments,
     /// How many of a long keyword's rarest grams are intersected; none for all. The
     /// `rarest_grams` option.
     pub rarest_grams: RarestGrams,
@@ -1023,6 +1052,7 @@ impl IndexOptionsPattern {
             return Self {
                 order_by: self.order_by,
                 segment_max_docs: self.segment_max_docs,
+                rewrite_wide_segments: self.rewrite_wide_segments,
                 ..Self::default()
             };
         }
@@ -1539,6 +1569,7 @@ mod tests {
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
             segment_max_docs: SegmentMaxDocs::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
             rarest_grams: RarestGrams::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsPattern::default());
@@ -1551,6 +1582,7 @@ mod tests {
             case_sensitive: CaseSensitive::from(false),
             order_by: "registered_at".parse().unwrap(),
             segment_max_docs: "250000".parse().unwrap(),
+            rewrite_wide_segments: RewriteWideSegments::from(true),
             rarest_grams: RarestGrams::default(),
         };
         assert_eq!(
@@ -1558,6 +1590,7 @@ mod tests {
             IndexOptionsPattern {
                 order_by: "registered_at".parse().unwrap(),
                 segment_max_docs: "250000".parse().unwrap(),
+                rewrite_wide_segments: RewriteWideSegments::from(true),
                 ..IndexOptionsPattern::default()
             }
         );
@@ -1568,6 +1601,7 @@ mod tests {
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
             segment_max_docs: SegmentMaxDocs::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
             rarest_grams: RarestGrams::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
@@ -1576,6 +1610,10 @@ mod tests {
             SegmentMaxDocs::default()
         );
         assert!("many".parse::<SegmentMaxDocs>().is_err());
+
+        assert!(*"TRUE".parse::<RewriteWideSegments>().unwrap().as_ref());
+        assert!(!*"off".parse::<RewriteWideSegments>().unwrap().as_ref());
+        assert!("maybe".parse::<RewriteWideSegments>().is_err());
     }
 
     #[test]

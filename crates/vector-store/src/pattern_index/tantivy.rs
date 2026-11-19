@@ -57,6 +57,7 @@ use tantivy::DocSet;
 use tantivy::SegmentReader;
 use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
+use tantivy::Term;
 use tantivy::columnar::Column;
 use tantivy::index::SegmentId;
 use tantivy::index::SegmentMeta;
@@ -69,8 +70,10 @@ use tantivy::schema::STORED;
 use tantivy::schema::Schema;
 use tantivy::schema::TextFieldIndexing;
 use tantivy::schema::TextOptions;
+use tantivy::schema::Value;
 use tokio::sync::mpsc;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -148,6 +151,10 @@ const TEXT_FIELD: &str = "text";
 /// The fast field holding a row's token, the last slot of its sort prefix. The ordering columns'
 /// slots come before it, as `sort_<i>`.
 const TOKEN_FIELD: &str = "token";
+/// The fast field saying whether a repair step placed the row (1) or a commit of ingested rows
+/// did (0): a segment whose every row says 1 is in the ordered tier however it was merged since.
+/// Ordered indexes only.
+const REPAIRED_FIELD: &str = "repaired";
 const TOKENIZER_NAME: &str = "pattern_ngram";
 /// Values are short, so a single cached store block per segment covers consecutive lookups.
 const STORE_CACHE_BLOCKS: usize = 32;
@@ -165,7 +172,9 @@ struct PatternBackend {
     columns: RwLock<HashMap<SegmentId, SegmentColumns>>,
     /// The table's primary-key layout: tokens and table order.
     key_layout: KeyLayout,
-    /// The segments of the ordered tier: adopted where they
+    /// What the repair of the layout has done so far: see `repair_step`.
+    repair: RepairCounters,
+    /// Segments in the ordered tier that no row's `REPAIRED_FIELD` says are: adopted where they
     /// were found (see `ordered_tier`), or merged from ordered segments. In memory only, as the
     /// index is; a segment a merge retired is dropped from it by `prune_columns`.
     adopted: Mutex<HashSet<SegmentId>>,
@@ -193,6 +202,18 @@ impl Drop for TickWork {
     }
 }
 
+/// Fresh-tier rows sampled to place a repair step's range.
+const REPAIR_SAMPLE_TARGET: u64 = 200_000;
+/// While an index ingests, the fresh rows it holds before a repair step competes with the writes
+/// for the node. Under that, the fresh tier waits for an idle tick. In rows rather than caps, so
+/// that a larger cap does not let more rows wait unrepaired.
+const LOAD_FRESH_ROWS: u64 = 400_000;
+/// The most rows a repair step moves under one hold of the writer lock: a step is carried out in
+/// key ranges of at most this many, each committed on its own, so that the writes waiting for the
+/// lock wait for one range at a time whatever the cap. At a 1M cap a split moved up to two caps
+/// of rows in one hold.
+const REPAIR_LOCK_ROWS: usize = 50_000;
+
 /// How full a merge of ordered neighbours may make a segment: three quarters of the cap, so that
 /// fresh rows repaired into its stretch later fit beside it, and merge into it, before it has to
 /// be split.
@@ -200,14 +221,28 @@ fn ordered_fill(cap: u32) -> u64 {
     u64::from(cap - cap / 4)
 }
 
+/// How many rows each part of a split holds at most: half the cap, the other half being the
+/// room it leaves for fresh rows and for its neighbour.
+fn split_rows(cap: u32) -> usize {
+    (cap / 2).max(1) as usize
+}
+
+/// How many rows a key range of a repair step holds at most: a part of a split, and never more
+/// than `REPAIR_LOCK_ROWS`. The ranges are disjoint, so ordered merges fold small ones back
+/// together.
+fn repair_range_rows(cap: u32) -> usize {
+    split_rows(cap).min(REPAIR_LOCK_ROWS)
+}
+
 /// A live segment as the layout policy sees it: its live and deleted rows, its layout-key bounds
 /// (inclusive; deleted rows count, as they do in the columns' own bounds), and whether it is
 /// known to be in the ordered tier.
 ///
 /// The ordered tier holds the segments that are where they belong in sort order: disjoint from
-/// one another. The fresh tier is everything else -- the pieces commits leave, each spanning as
-/// much of the range as the rows it took in. A fresh row never reaches an ordered segment by a
-/// merge: a merge takes segments of one tier.
+/// one another, but for the pieces of one repair step, which a merge folds together. The fresh
+/// tier is everything else -- the pieces commits leave, each spanning as much of the range as the
+/// rows it took in -- and a repair step moves its rows into the ordered tier range by range. A
+/// fresh row never reaches an ordered segment by a merge: a merge takes segments of one tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Piece {
     docs: u32,
@@ -215,7 +250,8 @@ struct Piece {
     min: u128,
     max: u128,
     id: SegmentId,
-    /// Adopted: see `ordered_tier`.
+    /// Placed by a repair step (every row carries `REPAIRED_FIELD`), or adopted: see
+    /// `ordered_tier`.
     ordered: bool,
 }
 
@@ -297,7 +333,9 @@ fn worth_merging(segments: usize, docs: u64, deleted: u64) -> bool {
 /// - Ordered: runs of neighbouring clusters, each taken whole, while the run stays within
 ///   `ordered_fill`; a cluster alone may reach the cap, which is what lets the rows a repair step
 ///   adds to a segment's stretch merge into it. Neighbours have no ordered segment between them,
-///   so the merged segment overlaps none. A cluster past the cap is left to the repair.
+///   so the merged segment overlaps none, and no fresh piece reaching between them: the merged
+///   segment would span the fresh rows there, and every repair step among them would split it
+///   again. A cluster past the cap is left to the repair.
 /// - Fresh: runs of neighbours by lowest key under the cap, whatever they span, a full segment
 ///   left out rather than ending a run. Their rows go to the ordered tier by repair anyway; until
 ///   then fewer segments are fewer for a search to open, and rows inserted in sort order merge
@@ -318,14 +356,25 @@ fn merge_runs(pieces: &[Piece], cap: u32) -> Vec<(Vec<SegmentId>, bool)> {
         }
         (*docs, *deleted) = (0, 0);
     };
+    // Where the last cluster of the run ends: a fresh piece reaching between it and the next
+    // may hold rows there, and a merge of the two would span them.
+    let mut run_max = 0u128;
+    let fresh_between = |low: u128, high: u128| {
+        pieces.iter().zip(&ordered).any(|(piece, &ordered)| {
+            !ordered && piece.docs > 0 && piece.max > low && piece.min < high
+        })
+    };
     for cluster in clusters(pieces, &ordered) {
         if cluster.docs > cap {
             flush(&mut run, &mut run_docs, &mut run_deleted, true);
             continue;
         }
-        if !run.is_empty() && run_docs + cluster.docs > fill {
+        if !run.is_empty()
+            && (run_docs + cluster.docs > fill || fresh_between(run_max, cluster.min))
+        {
             flush(&mut run, &mut run_docs, &mut run_deleted, true);
         }
+        run_max = cluster.max;
         run.extend(cluster.ids);
         run_docs += cluster.docs;
         run_deleted += cluster.deleted;
@@ -360,6 +409,88 @@ fn merge_runs(pieces: &[Piece], cap: u32) -> Vec<(Vec<SegmentId>, bool)> {
     flush(&mut run, &mut run_docs, &mut run_deleted, false);
     runs.extend(alone);
     runs
+}
+
+/// A repair step's work: the fresh rows with layout keys in `low..=high`, and with them the rows
+/// of `cluster` -- the ordered segments of the stretch the range is in, if any -- when those would
+/// not fit beside the cluster under the cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepairRange {
+    low: u128,
+    high: u128,
+    cluster: Option<Cluster>,
+}
+
+/// The next repair step, worst first, or None when there is nothing to repair.
+///
+/// The ordered tier's clusters cut the key space into stretches: a cluster's own, and the gaps
+/// between clusters. A stretch is as bad as the fresh rows in it -- every search through it opens
+/// the fresh segments as well as the ordered one -- estimated from `fresh_keys`, a sorted sample of
+/// the fresh tier's keys each standing for `weight` rows; a cluster past the cap counts its own
+/// rows too, as it overlaps itself until split. The worst stretch is repaired, at most a cap of its fresh rows
+/// at a time, lowest keys first. Pure, so it can be tested without an index.
+fn plan_repair(
+    pieces: &[Piece],
+    fresh_keys: &[u128],
+    weight: u64,
+    cap: u32,
+) -> Option<RepairRange> {
+    let ordered = ordered_tier(pieces);
+    let clusters = clusters(pieces, &ordered);
+    let weight = weight.max(1);
+    // Stretch 2j is the gap below cluster j (the last, j = clusters.len(), the one above them
+    // all); 2j + 1 is cluster j. The sample is sorted, so each stretch's keys are one run of it.
+    let stretch_of = |key: u128| {
+        let j = clusters.partition_point(|cluster| cluster.max < key);
+        if clusters.get(j).is_some_and(|cluster| cluster.min <= key) {
+            2 * j + 1
+        } else {
+            2 * j
+        }
+    };
+    let mut keys = vec![(0usize, 0usize); 2 * clusters.len() + 1];
+    let mut from = 0;
+    while from < fresh_keys.len() {
+        let stretch = stretch_of(fresh_keys[from]);
+        let to = from + fresh_keys[from..].partition_point(|&key| stretch_of(key) == stretch);
+        keys[stretch] = (from, to);
+        from = to;
+    }
+    let score = |stretch: usize| {
+        let (from, to) = keys[stretch];
+        let fresh = (to - from) as u64 * weight;
+        let overfull = (stretch % 2 == 1)
+            .then(|| &clusters[stretch / 2])
+            .filter(|cluster| cluster.docs > u64::from(cap))
+            .map_or(0, |cluster| cluster.docs);
+        fresh + overfull
+    };
+    // The first of the worst, so that equal stretches go in key order.
+    let worst = (0..keys.len())
+        .rev()
+        .max_by_key(|&stretch| score(stretch))?;
+    if score(worst) == 0 {
+        return None;
+    }
+    let j = worst / 2;
+    let (low, mut high, cluster) = if worst % 2 == 1 {
+        let cluster = clusters[j].clone();
+        (cluster.min, cluster.max, Some(cluster))
+    } else {
+        (
+            j.checked_sub(1).map_or(0, |below| clusters[below].max + 1),
+            clusters.get(j).map_or(u128::MAX, |above| above.min - 1),
+            None,
+        )
+    };
+    let (from, to) = keys[worst];
+    let step = (u64::from(cap) / weight).max(1) as usize;
+    if to - from > step {
+        // The lowest cap's worth: the range starts where the stretch does, so nothing below the
+        // cut is left behind in it.
+        high = fresh_keys[from + step - 1];
+    }
+    Some(RepairRange { low, high, cluster })
 }
 
 /// The merges `after_reload` has asked the writer for and that have not finished, with the
@@ -463,6 +594,26 @@ pub(crate) struct MergeTotals {
     pub(crate) running: u64,
 }
 
+#[derive(Debug, Default)]
+struct RepairCounters {
+    steps: AtomicU64,
+    docs_rewritten: AtomicU64,
+    /// Whether the last tick found rows to repair.
+    pending: AtomicBool,
+}
+
+/// [`RepairCounters`] at one moment, as `Stats` reports them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RewriteTotals {
+    /// Repair steps since the index was created.
+    pub(crate) steps: u64,
+    /// Rows those steps moved.
+    pub(crate) docs_rewritten: u64,
+    /// Whether the last tick found fresh rows, or an ordered stretch past the cap, to repair. An
+    /// index has settled once it has not and no merge runs.
+    pub(crate) pending: bool,
+}
+
 /// One segment's columnar handles and the layout bounds the pruning reads from them.
 #[derive(Clone)]
 struct SegmentColumns {
@@ -475,6 +626,8 @@ struct SegmentColumns {
     layout_max: u128,
     /// The walk reads it only to tell apart rows whose whole prefix is equal.
     primary_id: Column<u64>,
+    /// Whether a repair step placed every row: see `REPAIRED_FIELD`.
+    repaired: bool,
 }
 
 impl SegmentColumns {
@@ -485,6 +638,15 @@ impl SegmentColumns {
             prefix.0[slot] = column.first(doc_id).unwrap_or(0);
         }
         prefix
+    }
+
+    fn layout_key(&self, doc_id: u32) -> u128 {
+        let first = u128::from(self.slots[0].first(doc_id).unwrap_or(0));
+        let second = self
+            .slots
+            .get(1)
+            .map_or(0, |column| u128::from(column.first(doc_id).unwrap_or(0)));
+        (first << 64) | second
     }
 }
 
@@ -564,11 +726,17 @@ impl PatternBackend {
                 )
             }
         };
+        // A segment from before the field existed has no such column: ingested, then.
+        let repaired = segment
+            .fast_fields()
+            .u64(REPAIRED_FIELD)
+            .is_ok_and(|column| segment.max_doc() > 0 && column.min_value() == 1);
         let columns = SegmentColumns {
             slots,
             layout_min,
             layout_max,
             primary_id,
+            repaired,
         };
         *opened += 1;
         self.columns.write().unwrap().insert(id, columns.clone());
@@ -592,7 +760,7 @@ impl PatternBackend {
                     min: columns.layout_min,
                     max: columns.layout_max,
                     id: segment.segment_id(),
-                    ordered: adopted.contains(&segment.segment_id()),
+                    ordered: columns.repaired || adopted.contains(&segment.segment_id()),
                 }),
                 Err(err) => {
                     warn!(
@@ -751,6 +919,7 @@ pub(crate) struct TantivyStats {
 pub(crate) struct PatternStats {
     pub(crate) tantivy: TantivyStats,
     pub(crate) walk: WalkTotals,
+    pub(crate) rewrite: RewriteTotals,
     pub(crate) merges: MergeTotals,
     pub(crate) overlap: LayoutOverlap,
     pub(crate) segments: Vec<SegmentLayout>,
@@ -848,6 +1017,8 @@ impl PatternBackend {
 pub(crate) struct PatternRow<'a> {
     pub(crate) text: &'a str,
     pub(crate) prefix: Option<SortPrefix>,
+    /// Placed by a repair step rather than ingested: see `REPAIRED_FIELD`.
+    pub(crate) repaired: bool,
 }
 
 impl PatternBackend {
@@ -871,6 +1042,7 @@ impl PatternBackend {
         for field in self.slot_fields() {
             schema_builder.add_u64_field(&field, FAST);
         }
+        schema_builder.add_u64_field(REPAIRED_FIELD, FAST);
         schema_builder.build()
     }
 
@@ -896,6 +1068,10 @@ impl PatternBackend {
         for (slot, field) in self.slot_fields().iter().enumerate() {
             doc.add_u64(schema.get_field(field).unwrap(), prefix.0[slot]);
         }
+        doc.add_u64(
+            schema.get_field(REPAIRED_FIELD).unwrap(),
+            u64::from(row.repaired),
+        );
         doc
     }
 
@@ -995,6 +1171,334 @@ fn live_segments(searcher: &tantivy::Searcher) -> HashSet<SegmentId> {
         .collect()
 }
 
+impl PatternBackend {
+    /// Whether the layout has anything to repair, recorded for `Stats`, and a repair step when
+    /// it does and the moment allows (see `repair_due`): on an idle tick always, so that an idle
+    /// index converges to an empty fresh tier and a disjoint ordered one; while the index
+    /// ingests, once the fresh tier holds `LOAD_FRESH_ROWS` rows.
+    fn maybe_repair(&self, state: &PatternIndexState, key: &IndexKey, idle: bool) {
+        if !*self.options.rewrite_wide_segments.as_ref() {
+            return;
+        }
+        let Some(cap) = *self.options.segment_max_docs.as_ref() else {
+            return;
+        };
+        let cap = u64::from(cap.get());
+        let pieces = self.geometry(&state.reader.searcher());
+        let ordered = ordered_tier(&pieces);
+        let fresh_rows: u64 = pieces
+            .iter()
+            .zip(&ordered)
+            .filter(|&(_, &ordered)| !ordered)
+            .map(|(piece, _)| u64::from(piece.docs))
+            .sum();
+        let overfull = clusters(&pieces, &ordered)
+            .iter()
+            .any(|cluster| cluster.docs > cap);
+        let pending = fresh_rows > 0 || overfull;
+        self.repair.pending.store(pending, Relaxed);
+        if !pending {
+            return;
+        }
+        if !repair_due(idle, fresh_rows, overfull) {
+            return;
+        }
+        if let Err(err) = repair_step(state) {
+            error!("pattern: repair of {key} failed: {err}");
+        }
+    }
+
+    fn rewrite_totals(&self) -> RewriteTotals {
+        RewriteTotals {
+            steps: self.repair.steps.load(Relaxed),
+            docs_rewritten: self.repair.docs_rewritten.load(Relaxed),
+            pending: self.repair.pending.load(Relaxed),
+        }
+    }
+}
+
+/// Whether a repair step may run now, given what there is to repair: on an idle tick always;
+/// while the index ingests, once the fresh tier holds `LOAD_FRESH_ROWS` rows or an ordered
+/// stretch is past the cap. Pure, so it can be tested without an index.
+fn repair_due(idle: bool, fresh_rows: u64, overfull: bool) -> bool {
+    if fresh_rows == 0 && !overfull {
+        return false;
+    }
+    idle || fresh_rows >= LOAD_FRESH_ROWS || overfull
+}
+
+/// A row a repair step moves: its layout key, the term that deletes its current copy, and the
+/// document added in its place.
+type MovedRow = (u128, (Term, TantivyDocument));
+
+/// Appends to `rows` the live rows of `segment` whose layout key `wanted` takes, as repaired.
+fn read_rows(
+    state: &PatternIndexState,
+    segment: &SegmentReader,
+    wanted: impl Fn(u128) -> bool,
+    rows: &mut Vec<MovedRow>,
+) -> anyhow::Result<()> {
+    let backend = state.backend();
+    let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
+    let primary_id_field = state.schema.get_field(PRIMARY_ID_FIELD).unwrap();
+    let mut opened = 0;
+    let columns = backend.columns_for(segment, &mut opened)?;
+    let alive = segment.alive_bitset();
+    let store = segment
+        .get_store_reader(STORE_CACHE_BLOCKS)
+        .map_err(|e| anyhow!("pattern: failed to open the document store: {e}"))?;
+    for doc_id in 0..segment.max_doc() {
+        if alive.is_some_and(|alive| !alive.is_alive(doc_id)) {
+            continue;
+        }
+        let layout_key = columns.layout_key(doc_id);
+        if !wanted(layout_key) {
+            continue;
+        }
+        let doc: TantivyDocument = store
+            .get(doc_id)
+            .map_err(|e| anyhow!("pattern: failed to retrieve doc: {e}"))?;
+        let primary_id = doc
+            .get_first(primary_id_field)
+            .and_then(|value| value.as_u64())
+            .map(PrimaryId::from)
+            .ok_or_else(|| anyhow!("pattern: missing primary_id in doc"))?;
+        let text = doc
+            .get_first(text_field)
+            .and_then(|value| value.as_str())
+            .map(|stored| gram::unframed(stored).unwrap_or(stored))
+            .unwrap_or_default();
+        let new_doc = backend.create_doc(
+            &state.schema,
+            primary_id,
+            PatternRow {
+                text,
+                prefix: Some(columns.prefix(doc_id)),
+                repaired: true,
+            },
+        );
+        rows.push((
+            layout_key,
+            (primary_id_term(&state.schema, primary_id), new_doc),
+        ));
+    }
+    Ok(())
+}
+
+/// Appends to `keys` the layout keys of the live rows of `segment` that `wanted` takes.
+fn read_keys(
+    backend: &PatternBackend,
+    segment: &SegmentReader,
+    wanted: impl Fn(u128) -> bool,
+    keys: &mut Vec<u128>,
+) -> anyhow::Result<()> {
+    let mut opened = 0;
+    let columns = backend.columns_for(segment, &mut opened)?;
+    let alive = segment.alive_bitset();
+    keys.extend(
+        (0..segment.max_doc())
+            .filter(|&doc_id| alive.is_none_or(|alive| alive.is_alive(doc_id)))
+            .map(|doc_id| columns.layout_key(doc_id))
+            .filter(|&key| wanted(key)),
+    );
+    Ok(())
+}
+
+/// `rows`, sorted by layout key, cut into parts of about equal size and at most `size` rows,
+/// each a range of keys: a key is never cut, so the parts are disjoint, and one holding more rows
+/// than `size` is a part of its own.
+fn split_parts<T>(rows: Vec<(u128, T)>, size: usize) -> Vec<Vec<(u128, T)>> {
+    let size = size.max(1);
+    let parts = rows.len().div_ceil(size).max(1);
+    let size = rows.len().div_ceil(parts).max(1);
+    let mut split: Vec<Vec<(u128, T)>> = Vec::with_capacity(parts);
+    for row in rows {
+        match split.last_mut() {
+            Some(part) if part.len() < size || part.last().is_some_and(|last| last.0 == row.0) => {
+                part.push(row);
+            }
+            _ => split.push(vec![row]),
+        }
+    }
+    split
+}
+
+/// One repair step (see `plan_repair`): the fresh rows of the worst stretch's range are deleted
+/// by primary id and added again as repaired. A commit's rows land in pieces spanning no more than
+/// the keys they hold, so rows repaired into a cluster's stretch overlap the cluster and merge
+/// into it, and rows of a gap make a cluster of their own. Rows that would not fit beside the
+/// cluster under the cap are moved with the cluster's own, in parts of disjoint key ranges.
+///
+/// What to move is decided under the writer lock; the moving is done in key ranges of at most
+/// `repair_range_rows`, each under a hold of the lock of its own, committed before and after, its
+/// rows read again from what is committed then. The lock is what keeps a concurrent update or
+/// delete of one of those rows from being undone by the re-add: it waits, and lands with a higher
+/// opstamp; a change between two ranges is committed before the next range reads its rows.
+/// Searches take the reader, not this lock. Returns whether rows were moved.
+fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
+    let backend = state.backend();
+    let Some(cap) = *backend.options.segment_max_docs.as_ref() else {
+        return Ok(false);
+    };
+    let cap = cap.get();
+    {
+        // A merge whose output is not known to be ordered yet would read as fresh.
+        let mut merging = backend.merging.lock().unwrap();
+        merging.busy(&mut backend.adopted.lock().unwrap());
+        if merging.unsettled(&live_segments(&state.reader.searcher())) {
+            return Ok(false);
+        }
+    }
+
+    let mut writer = state.lock_writer();
+    state
+        .commit_and_reload(&mut writer)
+        .map_err(|e| anyhow!("pattern: failed to commit before a repair: {e}"))?;
+    let searcher = state.reader.searcher();
+    let pieces = backend.geometry(&searcher);
+    let ordered = ordered_tier(&pieces);
+    let fresh: HashMap<SegmentId, Piece> = pieces
+        .iter()
+        .zip(&ordered)
+        .filter(|&(piece, &ordered)| !ordered && piece.docs > 0)
+        .map(|(piece, _)| (piece.id, *piece))
+        .collect();
+    let fresh_rows: u64 = fresh.values().map(|piece| u64::from(piece.docs)).sum();
+    // Every stride-th live row, the first of each segment included, so that a segment with a
+    // few rows left is sampled too and the repair does not stop short of it.
+    let stride = (fresh_rows / REPAIR_SAMPLE_TARGET).max(1);
+    let mut sample = Vec::new();
+    let mut opened = 0;
+    for segment in searcher.segment_readers() {
+        if !fresh.contains_key(&segment.segment_id()) {
+            continue;
+        }
+        let columns = backend.columns_for(segment, &mut opened)?;
+        let alive = segment.alive_bitset();
+        let mut seen = 0u64;
+        for doc_id in 0..segment.max_doc() {
+            if alive.is_some_and(|alive| !alive.is_alive(doc_id)) {
+                continue;
+            }
+            if seen.is_multiple_of(stride) {
+                sample.push(columns.layout_key(doc_id));
+            }
+            seen += 1;
+        }
+    }
+    sample.sort_unstable();
+    let Some(range) = plan_repair(&pieces, &sample, stride, cap) else {
+        return Ok(false);
+    };
+
+    // What the step moves, by key: the fresh rows of the range, and with them the cluster's own
+    // when they would not fit beside it under the cap.
+    let in_range = |key: u128| range.low <= key && key <= range.high;
+    let mut keys = Vec::new();
+    for segment in searcher.segment_readers() {
+        let Some(piece) = fresh.get(&segment.segment_id()) else {
+            continue;
+        };
+        if piece.max < range.low || piece.min > range.high {
+            continue;
+        }
+        read_keys(backend, segment, in_range, &mut keys)?;
+    }
+    let split = match &range.cluster {
+        Some(cluster) => cluster.docs + keys.len() as u64 > u64::from(cap),
+        None => keys.len() > cap as usize,
+    };
+    if split && let Some(cluster) = &range.cluster {
+        for segment in searcher.segment_readers() {
+            if cluster.ids.contains(&segment.segment_id()) {
+                read_keys(backend, segment, |_| true, &mut keys)?;
+            }
+        }
+    }
+    drop(searcher);
+    drop(writer);
+    if keys.is_empty() {
+        return Ok(false);
+    }
+    keys.sort_unstable();
+    let ranges: Vec<(u128, u128)> = split_parts(
+        keys.into_iter().map(|key| (key, ())).collect(),
+        repair_range_rows(cap),
+    )
+    .iter()
+    .map(|part| (part[0].0, part[part.len() - 1].0))
+    .collect();
+
+    // Each key range under a hold of the lock of its own, its rows read again from what is
+    // committed now: a change to one of them since is already in, and a change after lands on
+    // the copy added here. The writes waiting for the lock go in between ranges.
+    let mut count = 0;
+    for &(low, high) in &ranges {
+        let mut writer = state.lock_writer();
+        state
+            .commit_and_reload(&mut writer)
+            .map_err(|e| anyhow!("pattern: failed to commit before a repair: {e}"))?;
+        let searcher = state.reader.searcher();
+        let pieces = backend.geometry(&searcher);
+        let ordered = ordered_tier(&pieces);
+        let by_id: HashMap<SegmentId, (Piece, bool)> = pieces
+            .iter()
+            .zip(ordered)
+            .map(|(piece, ordered)| (piece.id, (*piece, ordered)))
+            .collect();
+        let mut moved = Vec::new();
+        for segment in searcher.segment_readers() {
+            let Some(&(piece, ordered)) = by_id.get(&segment.segment_id()) else {
+                continue;
+            };
+            // The range lies in the cluster's stretch when it splits it, and the ordered pieces
+            // over it are the cluster's: those of the ranges already moved lie below it.
+            if piece.docs == 0 || piece.max < low || piece.min > high || (ordered && !split) {
+                continue;
+            }
+            // A fresh row only where the plan counted them: a cluster's keys may reach past the
+            // step's range, and a part that does spans fresh rows the plan left for later steps,
+            // any number of them.
+            read_rows(
+                state,
+                segment,
+                |key| low <= key && key <= high && (ordered || in_range(key)),
+                &mut moved,
+            )?;
+        }
+        // In key order: the writer's threads each take an ordered share of what is added, so
+        // the pieces are sorted runs, which the walk takes from the end it needs (see
+        // `SegmentColumns::runs`), and an ordered merge, given its segments in key order, keeps
+        // them so.
+        moved.sort_by_key(|row| row.0);
+        count += moved.len();
+        writer
+            .rewrite_documents(moved.into_iter().map(|(_, row)| row))
+            .map_err(|e| anyhow!("pattern: failed to repair a range: {e}"))?;
+        state
+            .commit_and_reload(&mut writer)
+            .map_err(|e| anyhow!("pattern: failed to commit a repair: {e}"))?;
+    }
+    let part_count = ranges.len();
+
+    backend.repair.steps.fetch_add(1, Relaxed);
+    backend
+        .repair
+        .docs_rewritten
+        .fetch_add(count as u64, Relaxed);
+    debug!(
+        "pattern: repaired {count} rows into {part_count} parts{}, {fresh_rows} fresh rows before",
+        if range.cluster.is_some() {
+            " of an ordered stretch"
+        } else {
+            ""
+        }
+    );
+    // Learn the new segments' bounds and let the policy fold the pieces together.
+    backend.after_reload(state);
+    Ok(true)
+}
+
 type PatternIndexState = Index<PatternBackend>;
 
 impl PatternIndexState {
@@ -1014,6 +1518,7 @@ fn new_index(
         key_layout: key_layout.clone(),
         walk: WalkCounters::default(),
         columns: RwLock::new(HashMap::new()),
+        repair: RepairCounters::default(),
         adopted: Mutex::new(HashSet::new()),
         tick_running: AtomicBool::new(false),
         merging: Mutex::new(MergesInFlight::default()),
@@ -1027,6 +1532,11 @@ fn new_index(
         index.set_merge_policy(policy);
     }
     Ok(index)
+}
+
+fn primary_id_term(schema: &Schema, primary_id: PrimaryId) -> Term {
+    let primary_id_field = schema.get_field(PRIMARY_ID_FIELD).unwrap();
+    Term::from_field_u64(primary_id_field, u64::from(primary_id))
 }
 
 fn find_partition_id(
@@ -1545,6 +2055,7 @@ fn handle_pattern_stats(state: &PatternIndexState) -> PatternStatsR {
     Ok(PatternStats {
         tantivy,
         walk: state.backend().walk.snapshot(),
+        rewrite: state.backend().rewrite_totals(),
         merges: state.backend().merging.lock().unwrap().totals(),
         overlap,
         segments,
@@ -1684,6 +2195,7 @@ pub(crate) fn new(
                                         PatternRow {
                                             text: &document,
                                             prefix,
+                                            repaired: false,
                                         },
                                     )
                                 })
@@ -1743,17 +2255,31 @@ pub(crate) fn new(
                     }
                 }
                 _ = indexes.commit_interval_tick() => {
+                    // An index with nothing to commit is idle: the repair runs freely then, a step
+                    // per tick at most, so it paces itself to the ticks. While it ingests the
+                    // repair holds back (see `maybe_repair`). One whose writer is held right now
+                    // is not idle.
+                    let idle: Vec<bool> = indexes
+                        .iter()
+                        .map(|index| index.has_uncommitted_docs() == Some(false))
+                        .collect();
                     indexes.commit_or_reload().await;
-                    for state in indexes.iter() {
-                        // Learning a large segment's bounds reads its columns, so the work runs
+                    for (state, idle) in indexes.iter().zip(idle) {
+                        // A repair step at 10M rows takes seconds under the writer lock.
+                        // Run on the worker, it took a runtime thread, and the steps the next ticks
+                        // queued behind it took the others, waiting for the lock, until the node
+                        // stopped answering HTTP (AWS runs eb0023ac and 1c3ae034). So the work runs
                         // on tokio's blocking pool, and a tick adds none while an index's previous
                         // work still runs.
                         let Some(work) = TickWork::start(state) else {
                             continue;
                         };
+                        let key = key.clone();
                         tokio::task::spawn_blocking(move || {
                             let state = &work.0;
-                            state.backend().after_reload(state);
+                            let backend = state.backend();
+                            backend.after_reload(state);
+                            backend.maybe_repair(state, &key, idle);
                         });
                     }
                     mark_dirty(&index.key);
@@ -1769,12 +2295,14 @@ mod tests {
     use super::*;
     use crate::AsyncInProgress;
     use crate::CaseSensitive;
+    use crate::DEFAULT_SEGMENT_ROWS;
     use crate::MaxGram;
     use crate::MinGram;
     use crate::OrderBy;
     use crate::PrimaryKey;
     use crate::QueryError;
     use crate::RarestGrams;
+    use crate::RewriteWideSegments;
     use crate::SegmentMaxDocs;
     use crate::memory::Allocate;
     use crate::table::IndexIdGenerator;
@@ -1830,6 +2358,7 @@ mod tests {
             // of its own.
             order_by: OrderBy::Table,
             segment_max_docs: SegmentMaxDocs::default(),
+            rewrite_wide_segments: RewriteWideSegments::default(),
             rarest_grams: RarestGrams::default(),
         }
     }
@@ -2542,12 +3071,12 @@ mod tests {
             ordered(30, 45, 49, 6),
             ordered(80, 50, 59, 7), // a cluster past the cap with 8
             ordered(30, 52, 55, 8),
-            ordered(40, 60, 69, 9),      // alone, and no neighbour fits
-            piece(40, 0, 100, 10),       // fresh, overlapping all of the above
-            piece(50, 5, 100, 11),       // + 10 = 90
-            piece(30, 10, 100, 12),      // 90 + 30 > 100: a run of its own
-            piece(cap + 5, 20, 100, 13), // full: left out
-            piece(5, 30, 100, 14),       // with 12: 35
+            ordered(40, 60, 69, 9),       // alone, and no neighbour fits
+            piece(40, 200, 300, 10),      // fresh, past all of the above
+            piece(50, 205, 300, 11),      // + 10 = 90
+            piece(30, 210, 300, 12),      // 90 + 30 > 100: a run of its own
+            piece(cap + 5, 220, 300, 13), // full: left out
+            piece(5, 230, 300, 14),       // with 12: 35
         ];
         assert_eq!(
             merge_runs(&pieces, cap),
@@ -2560,6 +3089,43 @@ mod tests {
             ]
         );
         assert!(merge_runs(&[], cap).is_empty());
+    }
+
+    /// Ordered neighbours are not merged while a fresh piece reaches between them: the merged
+    /// segment would span the fresh rows there, and each repair step among them would split it
+    /// again. A row committed alone at one end of the order and the first stretch repaired at the
+    /// other were merged so in a 10M-row load, which then moved 15M rows for 10M. A cluster
+    /// still merges whole under fresh pieces, and neighbours with none between them do.
+    #[test]
+    fn ordered_neighbours_are_not_merged_across_fresh_pieces() {
+        let far_apart = [
+            ordered(30, 0, 9, 1),
+            ordered(1, 90, 90, 2),
+            piece(40, 5, 60, 3),
+            piece(40, 8, 70, 4),
+        ];
+        assert_eq!(
+            merge_runs(&far_apart, 100),
+            vec![(vec![id(3), id(4)], false)]
+        );
+        // The two pieces of a repaired stretch under the same fresh pieces, and a neighbour
+        // the fresh pieces end before.
+        let together = [
+            ordered(30, 0, 9, 1),
+            ordered(20, 5, 9, 2),
+            ordered(10, 80, 89, 3),
+            ordered(10, 90, 99, 4),
+            piece(40, 5, 60, 5),
+            piece(40, 8, 70, 6),
+        ];
+        assert_eq!(
+            merge_runs(&together, 100),
+            vec![
+                (vec![id(1), id(2)], true),
+                (vec![id(3), id(4)], true),
+                (vec![id(5), id(6)], false),
+            ]
+        );
     }
 
     /// A segment whose deleted rows outnumber its live ones is merged on its own, which drops
@@ -2576,6 +3142,90 @@ mod tests {
         };
         // 40 + 70 > 75: no run with both.
         assert_eq!(merge_runs(&[hollow, worn], 100), vec![(vec![id(1)], true)]);
+    }
+
+    /// The repair takes the stretch with the most fresh rows first, a cap's worth at a time from
+    /// its lowest keys; with the ordered tier empty, the whole range is one gap.
+    #[test]
+    fn the_repair_takes_the_worst_stretch_first() {
+        let cap = 100;
+        assert_eq!(plan_repair(&[], &[], 1, cap), None);
+        // Nothing fresh, nothing past the cap: nothing to do.
+        let settled = [ordered(50, 0, 99, 1), ordered(50, 100, 199, 2)];
+        assert_eq!(plan_repair(&settled, &[], 1, cap), None);
+
+        // Everything fresh: one gap; 300 sampled keys a row each, so the first 100.
+        let fresh = [piece(150, 0, 299, 1), piece(150, 0, 299, 2)];
+        let keys: Vec<u128> = (0..300).collect();
+        assert_eq!(
+            plan_repair(&fresh, &keys, 1, cap),
+            Some(RepairRange {
+                low: 0,
+                high: 99,
+                cluster: None,
+            })
+        );
+        // Each sampled key standing for 10 rows: 10 keys make a cap.
+        assert_eq!(
+            plan_repair(&fresh, &keys, 10, cap).map(|range| (range.low, range.high)),
+            Some((0, 9))
+        );
+
+        // Ordered clusters at 100..=199 and 300..=399; most fresh rows over the second.
+        let pieces = [
+            ordered(50, 100, 199, 1),
+            ordered(50, 300, 399, 2),
+            piece(40, 0, 500, 3),
+        ];
+        let keys = [10, 150, 310, 320, 330, 450];
+        let range = plan_repair(&pieces, &keys, 1, cap).unwrap();
+        assert_eq!((range.low, range.high), (300, 399));
+        assert_eq!(range.cluster.map(|cluster| cluster.ids), Some(vec![id(2)]));
+        // Most of them in the gap between: the range is the gap's.
+        let keys = [150, 210, 220, 230, 310];
+        let range = plan_repair(&pieces, &keys, 1, cap).unwrap();
+        assert_eq!((range.low, range.high, range.cluster), (200, 299, None));
+        // Above everything: up to the top of the key space.
+        let keys = [410, 420];
+        let range = plan_repair(&pieces, &keys, 1, cap).unwrap();
+        assert_eq!((range.low, range.high), (400, u128::MAX));
+    }
+
+    /// An ordered cluster past the cap is repaired even with no fresh rows over it.
+    #[test]
+    fn an_ordered_stretch_past_the_cap_is_repaired() {
+        let pieces = [ordered(80, 0, 99, 1), ordered(60, 50, 150, 2)];
+        let range = plan_repair(&pieces, &[], 1, 100).unwrap();
+        assert_eq!((range.low, range.high), (0, 150));
+        assert_eq!(range.cluster.unwrap().docs, 140);
+    }
+
+    /// A repair step's key ranges hold half a cap, as a split's parts do, and never more than
+    /// one hold of the lock may move, whatever the cap.
+    #[test]
+    fn a_repair_range_is_bounded_whatever_the_cap() {
+        assert_eq!(repair_range_rows(100), 50);
+        assert_eq!(repair_range_rows(200_000), REPAIR_LOCK_ROWS);
+        assert_eq!(repair_range_rows(1_000_000), REPAIR_LOCK_ROWS);
+    }
+
+    /// Parts of about equal size, never cutting a key: the parts are disjoint ranges.
+    #[test]
+    fn split_parts_are_even_and_never_cut_a_key() {
+        let rows: Vec<(u128, ())> = (0..130).map(|key| (key, ())).collect();
+        let sizes: Vec<usize> = split_parts(rows, 50).iter().map(Vec::len).collect();
+        assert_eq!(sizes, [44, 44, 42]);
+
+        let tied: Vec<(u128, ())> = [1, 2, 2, 2, 3, 4]
+            .into_iter()
+            .map(|key| (key, ()))
+            .collect();
+        let parts: Vec<Vec<u128>> = split_parts(tied, 2)
+            .into_iter()
+            .map(|part| part.into_iter().map(|(key, _)| key).collect())
+            .collect();
+        assert_eq!(parts, [vec![1, 2, 2, 2], vec![3, 4]]);
+        assert!(split_parts(Vec::<(u128, ())>::new(), 50).is_empty());
     }
 
     /// With the cap set, an index built from many small commits ends with segments that hold
@@ -2716,6 +3366,78 @@ mod tests {
         assert!(stats.segments.iter().all(|s| s.docs <= cap));
     }
 
+    /// The docker smoke's case: thirty caps' worth of shuffled rows, built in one commit or in
+    /// commits of a few caps as a full scan would, must end narrow and capped after the rewrite,
+    /// with every row exactly once.
+    #[rstest]
+    #[case::one_commit(3000)]
+    #[case::scan_commits(500)]
+    #[timeout(Duration::from_secs(90))]
+    #[tokio::test]
+    async fn many_caps_of_shuffled_rows_end_narrow_and_capped(#[case] threshold: usize) {
+        let rows = 3000u64;
+        let cap = 100u32;
+        let sender = make_sender_with_threshold(
+            IndexOptionsPattern {
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: RewriteWideSegments::from(true),
+                ..ordered_options()
+            },
+            threshold,
+        );
+        let mut acks = Vec::new();
+        for i in 0..rows {
+            let primary = (i * 1103 + 977) % rows + 1;
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    format!("user{primary}将军"),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let idle = !stats.rewrite.pending && stats.merges.running == 0;
+            let capped = stats.segments.iter().all(|s| s.docs <= cap);
+            let narrow = stats
+                .segments
+                .iter()
+                .all(|s| s.sort_max.unwrap() - s.sort_min.unwrap() <= 2 * u64::from(cap));
+            if (idle && capped && narrow && stats.rewrite.docs_rewritten > 0)
+                || Instant::now() > deadline
+            {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let layout: Vec<(u32, u64, u64)> = stats
+            .segments
+            .iter()
+            .map(|s| (s.docs, s.sort_min.unwrap(), s.sort_max.unwrap()))
+            .collect();
+        assert_eq!(stats.tantivy.num_docs, rows, "{layout:?}");
+        assert!(!stats.rewrite.pending, "{:?}", stats.rewrite);
+        assert!(
+            layout
+                .iter()
+                .all(|&(docs, low, high)| docs <= cap && high - low <= 2 * u64::from(cap)),
+            "{} segments, rewrite {:?}: {layout:?}",
+            layout.len(),
+            stats.rewrite
+        );
+        let (ids, _) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
+        assert_eq!(ids, vec![3000, 2999, 2998]);
+    }
+
     #[tokio::test]
     async fn a_verified_search_reads_the_store_for_the_page_only() {
         let sender = make_sender_with_options(ordered_options());
@@ -2760,6 +3482,93 @@ mod tests {
         assert!(walk.postings_scanned >= 5, "{walk:?}");
         assert_eq!(walk.heap_entrants, 5, "{walk:?}");
         assert_eq!(walk.store_reads, 5, "{walk:?}");
+    }
+
+    /// The whole of P3b: rows arriving in shuffled sort order make wide segments; with the
+    /// rewrite on they end up in narrow, contiguous, capped segments, and the search still
+    /// answers correctly throughout.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn wide_segments_are_rewritten_into_narrow_ones() {
+        let cap = 200u32;
+        // One commit for the whole batch, so the segments it produces are big and span nearly
+        // the whole range, like a full-scan build's. (Committed in small chunks instead, the
+        // pieces are too small to count as wide until the policy has merged them into capped
+        // segments that are, and the rewrite then proceeds in several smaller plans; the end
+        // state is the same.)
+        let sender = make_sender_with_threshold(
+            IndexOptionsPattern {
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: RewriteWideSegments::from(true),
+                ..ordered_options()
+            },
+            2000,
+        );
+        // 2000 rows in a fixed shuffled order: i -> i * 1103 + 977 (mod 2000) is a permutation,
+        // since 1103 and 2000 are coprime.
+        let mut acks = Vec::new();
+        for i in 0..2000u64 {
+            let primary = (i * 1103 + 977) % 2000 + 1;
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    format!("user{primary}将军"),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+
+        let widest_of = |stats: &PatternStats| {
+            stats
+                .segments
+                .iter()
+                .map(|s| s.sort_max.unwrap() - s.sort_min.unwrap())
+                .max()
+                .unwrap_or(0)
+        };
+        // Until every segment is capped and no wider than two ranges, with no rewrite pending.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let idle = !stats.rewrite.pending && stats.merges.running == 0;
+            let capped = stats.segments.iter().all(|s| s.docs <= cap);
+            let narrow = widest_of(&stats) <= 2 * u64::from(cap);
+            if (idle && capped && narrow && stats.rewrite.docs_rewritten > 0)
+                || Instant::now() > deadline
+            {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(!stats.rewrite.pending, "{:?}", stats.rewrite);
+        assert!(stats.rewrite.docs_rewritten >= 1000, "{:?}", stats.rewrite);
+        assert_eq!(stats.tantivy.num_docs, 2000);
+        assert!(
+            stats.segments.iter().all(|s| s.docs <= cap),
+            "a segment is past the cap: {:?}",
+            stats.segments
+        );
+        let mut spans: Vec<(u64, u64, u32)> = stats
+            .segments
+            .iter()
+            .map(|s| (s.sort_min.unwrap(), s.sort_max.unwrap(), s.docs))
+            .collect();
+        spans.sort_unstable();
+        assert!(
+            widest_of(&stats) <= 2 * u64::from(cap),
+            "a segment is still wide: {spans:?}"
+        );
+
+        let (ids, _) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
+        assert_eq!(ids, vec![2000, 1999, 1998]);
     }
 
     /// The columns are opened once per segment: by the commit tick after the reload that made the
@@ -3247,6 +4056,224 @@ mod tests {
         assert_eq!(page.next_cursor, None);
     }
 
+    /// The frame is stripped before a row is re-indexed by the rewrite; otherwise every pass
+    /// would add another pair of marks.
+    #[test]
+    fn a_stored_value_is_unframed_once() {
+        assert_eq!(gram::framed("abc"), "\u{2}abc\u{3}");
+        assert_eq!(gram::unframed("\u{2}abc\u{3}"), Some("abc"));
+        assert_eq!(gram::unframed("abc"), None);
+    }
+
+    /// The rewrite of a large index must not stop the node answering. Its steps hold the writer
+    /// lock for seconds. The actor's tick asked every index for uncommitted documents through that
+    /// lock, so the actor, and every request behind it, waited out each step; and steps run on the
+    /// worker took runtime threads. On AWS the node stopped answering HTTP once a 10M-row build
+    /// began its rewrite; at 10M rows on 4 cores this test saw answers 5.9 s late. Too slow for
+    /// the suite: run with `--ignored` (STALL_ROWS sets the size).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn a_rewrite_in_progress_leaves_the_actor_answering() {
+        // STALL_ROWS=10000000, on 4 cores (taskset -c 0-3), is the size and shape of the AWS run.
+        let rows: u64 = std::env::var("STALL_ROWS").map_or(2_000_000, |rows| rows.parse().unwrap());
+        // Shuffled sort keys, as a build by full scan leaves them: every segment spans the range.
+        let mut mock = MockTableSearch::new();
+        let index_id = IndexIdGenerator::new().next(true).unwrap();
+        let partition_id = PartitionId::global(index_id);
+        mock.expect_index_id().returning(move |_| Some(index_id));
+        mock.expect_partition_id()
+            .returning(move |_, _| Some((partition_id, None)));
+        mock.expect_primary_key().returning(|_, primary_id| {
+            Some(PrimaryKey::from(vec![CqlValue::BigInt(
+                u64::from(primary_id) as i64,
+            )]))
+        });
+        mock.expect_column_value_for()
+            .returning(move |_, primary_id, _| {
+                let shuffled = u64::from(primary_id).wrapping_mul(2_654_435_761) % rows;
+                Some(CqlValue::BigInt(shuffled as i64))
+            });
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options: IndexOptionsPattern {
+                    order_by: "sort_col".parse().unwrap(),
+                    segment_max_docs: "200000".parse().unwrap(),
+                    rewrite_wide_segments: "true".parse().unwrap(),
+                    ..IndexOptionsPattern::default()
+                },
+                key_layout: test_layout(),
+            },
+            Arc::new(RwLock::new(mock)),
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            COMMIT_INTERVAL,
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        for n in 1..=rows {
+            let name = format!("用户{}号玩家{}", n % 9973, n);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    n.into(),
+                    name,
+                    AsyncInProgress::fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        rx.recv().await;
+
+        // Ask while the rewrite runs, until it has finished or two minutes pass.
+        let started = Instant::now();
+        let mut slowest = Duration::ZERO;
+        let mut slowest_count = Duration::ZERO;
+        let mut repair = RewriteTotals::default();
+        while started.elapsed() < Duration::from_secs(120) {
+            let asked = Instant::now();
+            sender.count(make_index_key()).await.unwrap();
+            slowest_count = slowest_count.max(asked.elapsed());
+            let asked = Instant::now();
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            slowest = slowest.max(asked.elapsed());
+            repair = stats.rewrite;
+            if repair.steps > 0 && !repair.pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        println!(
+            "STALL repair {} steps, pending {}, after {:.0}s, slowest stats {:?}, slowest count {:?}",
+            repair.steps,
+            repair.pending,
+            started.elapsed().as_secs_f64(),
+            slowest,
+            slowest_count
+        );
+        assert!(repair.steps > 0, "nothing was repaired");
+        assert!(
+            slowest_count < Duration::from_secs(1),
+            "the actor stalled for {slowest_count:?}"
+        );
+        assert!(slowest < Duration::from_secs(1), "stats took {slowest:?}");
+    }
+
+    fn rss_mb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("VmRSS:"))
+                    .and_then(|kb| kb.trim().trim_end_matches(" kB").parse::<u64>().ok())
+            })
+            .map_or(0, |kb| kb / 1024)
+    }
+
+    /// A table-order index with default options, loaded fast, must settle, and once dropped must
+    /// stop working and give its memory back. On AWS (run a0e51aa9, 10M rows ingested in 136 s next
+    /// to an unordered index) it never settled -- about 2000 merges a minute held it at 500-780
+    /// segments -- and after the drop its merges went on, with the node's memory going from 8 to
+    /// 29.5 GB in four minutes. Diagnostic, not a pass/fail check yet: run with `--ignored`
+    /// (CHURN_ROWS sets the size, CHURN_SECS how long to watch before the drop, CHURN_CAP the cap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn a_fast_loaded_table_order_index_settles_and_stops_when_dropped() {
+        let rows: u64 = std::env::var("CHURN_ROWS").map_or(2_000_000, |rows| rows.parse().unwrap());
+        let watch = std::env::var("CHURN_SECS").map_or(900, |secs| secs.parse().unwrap());
+        let cap =
+            std::env::var("CHURN_CAP").map_or(DEFAULT_SEGMENT_ROWS, |cap| cap.parse().unwrap());
+        // RUST_LOG=info shows the merges ('Starting merge', 'pattern: asking for ... merges').
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                // What db.rs gives a table-order index created with no options.
+                options: IndexOptionsPattern {
+                    segment_max_docs: SegmentMaxDocs::from(Some(cap)),
+                    rewrite_wide_segments: RewriteWideSegments::from(true),
+                    ..IndexOptionsPattern::default()
+                },
+                key_layout: test_layout(),
+            },
+            make_table(bigint_key, |_, _| None),
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            COMMIT_INTERVAL,
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let started = Instant::now();
+        let (tx, mut rx) = mpsc::channel(1);
+        for n in 1..=rows {
+            let name = format!("用户{}号玩家{}", n % 9973, n);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    n.into(),
+                    name,
+                    AsyncInProgress::fullscan(tx.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        drop(tx);
+        rx.recv().await;
+        println!(
+            "CHURN loaded {rows} rows in {:.0}s, rss {} MB",
+            started.elapsed().as_secs_f64(),
+            rss_mb()
+        );
+
+        let loaded = Instant::now();
+        let mut counts = Vec::new();
+        while loaded.elapsed() < Duration::from_secs(watch) {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let segments = stats.tantivy.segment_count;
+            println!(
+                "CHURN t={:.0}s segments={segments} repair={} steps {} rows, pending {} \
+                 fresh={}/{} depth={}/{:.2} merges={}/{} rss={} MB",
+                loaded.elapsed().as_secs_f64(),
+                stats.rewrite.steps,
+                stats.rewrite.docs_rewritten,
+                stats.rewrite.pending,
+                stats.overlap.fresh_rows,
+                stats.overlap.fresh_segments,
+                stats.overlap.depth_max,
+                stats.overlap.depth_rows as f64 / stats.overlap.rows.max(1) as f64,
+                stats.merges.started,
+                stats.merges.ended,
+                rss_mb()
+            );
+            counts.push(segments);
+            let rewrite_done = !stats.rewrite.pending && stats.merges.running == 0;
+            if rewrite_done
+                && counts.len() >= 12
+                && counts[counts.len() - 12..].iter().all(|&c| c == segments)
+            {
+                println!("CHURN settled at {segments} segments");
+                break;
+            }
+        }
+
+        drop(sender);
+        let dropped = Instant::now();
+        while dropped.elapsed() < Duration::from_secs(180) {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            println!(
+                "CHURN dropped t={:.0}s rss={} MB",
+                dropped.elapsed().as_secs_f64(),
+                rss_mb()
+            );
+        }
+    }
+
     /// A table whose rows are named by id: `key_of` gives a row's primary key and `value_of` the
     /// value of an ordering column, `None` for a null.
     fn make_table(
@@ -3485,6 +4512,399 @@ mod tests {
         let (ids, _) = search_ordered(&sender, "将军", 10, ascending()).await;
         assert_eq!(ids, vec![4, 5]);
         assert_eq!(sender.count(make_index_key()).await.unwrap(), 2);
+    }
+
+    /// Whether a segment of a few-values index is narrow: one value, or the end of one and the
+    /// start of the next, which is what a rewritten range crossing a value leaves.
+    fn at_most_two_values(segment: &SegmentLayout) -> bool {
+        segment.sort_max.unwrap() - segment.sort_min.unwrap() <= 1
+    }
+
+    /// An ordered index on a column with few values: rows sharing one keep table order, and the
+    /// rewrite splits a run of one value by token, so segments end narrow even when every row has
+    /// one of three values.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn a_column_with_few_values_still_ends_in_narrow_segments() {
+        let rows = 1200u64;
+        let cap = 100u32;
+        let sender = make_sender_for(
+            IndexOptionsPattern {
+                order_by: "rating".parse().unwrap(),
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: "true".parse().unwrap(),
+                ..IndexOptionsPattern::default()
+            },
+            make_table(bigint_key, |id, _| Some(CqlValue::Int((id % 3) as i32))),
+            test_layout(),
+        );
+        let mut acks = Vec::with_capacity(rows as usize);
+        for id in 1..=rows {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    id.into(),
+                    format!("user{id}将军"),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let settled = stats.rewrite.docs_rewritten > 0
+                && !stats.rewrite.pending
+                && stats.merges.running == 0
+                && stats
+                    .segments
+                    .iter()
+                    .all(|s| s.docs <= cap && at_most_two_values(s));
+            if settled || Instant::now() > deadline {
+                break stats;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(stats.tantivy.num_docs, rows);
+        assert!(
+            stats
+                .segments
+                .iter()
+                .all(|s| s.docs <= cap && at_most_two_values(s)),
+            "{:?}",
+            stats.segments
+        );
+        // Pruning works again: the first page of the highest value opens a segment or two of it.
+        let mut expected: Vec<i64> = (1..=rows as i64).collect();
+        expected.sort_by_key(|id| (Reverse(id % 3), Reverse(token_of(*id as u64))));
+        let before = sender.stats(make_index_key()).await.unwrap().walk;
+        let (ids, _) = search_ordered(
+            &sender,
+            "将军",
+            10,
+            SearchWindow {
+                order: Some(SortOrder::Desc),
+                ..SearchWindow::default()
+            },
+        )
+        .await;
+        assert_eq!(ids, expected[..10]);
+        let after = sender.stats(make_index_key()).await.unwrap().walk;
+        assert!(
+            after.segments_opened - before.segments_opened <= 2,
+            "{before:?} -> {after:?}"
+        );
+    }
+
+    /// The rewrite of a column with few values comes to an end, and leaves no segment spanning
+    /// more than the end of one value and the start of the next. The endless rewrite of a local run with five values (2026-10-30) needed
+    /// merges this size does not reproduce; `a_segment_across_two_values_is_as_narrow_as_its_rows`
+    /// covers its cause.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn the_rewrite_of_a_column_with_few_values_comes_to_an_end() {
+        // Enough caps that a segment holding the whole of two values is wide: the narrow span is
+        // eight caps' worth of the five values' range, half of one value at 80 caps.
+        let rows = 4000u64;
+        let cap = 50u32;
+        let sender = make_sender_for(
+            IndexOptionsPattern {
+                order_by: "rating DESC".parse().unwrap(),
+                segment_max_docs: cap.to_string().parse().unwrap(),
+                rewrite_wide_segments: "true".parse().unwrap(),
+                ..IndexOptionsPattern::default()
+            },
+            make_table(bigint_key, |id, _| Some(CqlValue::Int((id % 5) as i32))),
+            test_layout(),
+        );
+        let mut acks = Vec::with_capacity(rows as usize);
+        for id in 1..=rows {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    id.into(),
+                    format!("user{id}将军"),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+        // Settled: a rewrite ran to its end, and nothing has been moved since for a while.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut quiet_since = (0, Instant::now());
+        let stats = loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let rewrite = &stats.rewrite;
+            let finished =
+                rewrite.docs_rewritten > 0 && !rewrite.pending && stats.merges.running == 0;
+            if !finished || rewrite.docs_rewritten != quiet_since.0 {
+                quiet_since = (rewrite.docs_rewritten, Instant::now());
+            } else if quiet_since.1.elapsed() > Duration::from_secs(3) {
+                break stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the rewrite does not settle: {:?}, {:?}",
+                stats.rewrite,
+                stats.segments
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(stats.tantivy.num_docs, rows);
+        assert!(
+            stats.rewrite.docs_rewritten < 3 * rows,
+            "{:?}",
+            stats.rewrite
+        );
+        assert!(
+            stats.segments.iter().all(at_most_two_values),
+            "{:?}",
+            stats.segments
+        );
+    }
+
+    /// Adds `ids` as rows named by `text`, all sent before any is waited for, as one batch.
+    async fn add_batch(
+        sender: &mpsc::Sender<PatternIndex>,
+        ids: impl IntoIterator<Item = u64>,
+        text: fn(u64) -> String,
+    ) {
+        let mut acks = Vec::new();
+        for primary in ids {
+            let (tx, rx) = mpsc::channel(1);
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    text(primary),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+            acks.push(rx);
+        }
+        for mut ack in acks {
+            ack.recv().await;
+        }
+    }
+
+    /// The ids `i -> i * 1103 + 977 (mod rows)`, plus one: a fixed shuffle of `1..=rows` for a
+    /// `rows` coprime with 1103.
+    fn shuffled(rows: u64) -> impl Iterator<Item = u64> {
+        (0..rows).map(move |i| (i * 1103 + 977) % rows + 1)
+    }
+
+    fn named(primary: u64) -> String {
+        format!("user{primary}将军")
+    }
+
+    /// The stats once the repair has had something to do and has nothing left, no merge runs,
+    /// and `done` holds, for three polls in a row; panics at `secs`.
+    async fn settled(
+        sender: &mpsc::Sender<PatternIndex>,
+        secs: u64,
+        done: impl Fn(&PatternStats) -> bool,
+    ) -> PatternStats {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut quiet = 0;
+        loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let still = stats.rewrite.docs_rewritten > 0
+                && !stats.rewrite.pending
+                && stats.merges.running == 0
+                && done(&stats);
+            quiet = if still { quiet + 1 } else { 0 };
+            if quiet >= 3 {
+                return stats;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "not settled: {:?} {:?} {:?}",
+                stats.rewrite,
+                stats.overlap,
+                stats.segments
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn capped_options(cap: u32) -> IndexOptionsPattern {
+        IndexOptionsPattern {
+            segment_max_docs: cap.to_string().parse().unwrap(),
+            rewrite_wide_segments: RewriteWideSegments::from(true),
+            ..ordered_options()
+        }
+    }
+
+    /// The ids of the first page of `query`, highest sort key first.
+    async fn first_page(sender: &mpsc::Sender<PatternIndex>, query: &str, n: usize) -> Vec<i64> {
+        search_ordered(sender, query, n, SearchWindow::default())
+            .await
+            .0
+    }
+
+    /// An idle index converges: no fresh rows left, and ordered segments that overlap nowhere.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn an_idle_index_ends_with_no_fresh_rows_and_disjoint_segments() {
+        let cap = 100;
+        let sender = make_sender_with_threshold(capped_options(cap), 2000);
+        add_batch(&sender, shuffled(2000), named).await;
+        let stats = settled(&sender, 45, |_| true).await;
+        assert_eq!(stats.tantivy.num_docs, 2000);
+        let overlap = stats.overlap;
+        assert_eq!(
+            (overlap.fresh_rows, overlap.fresh_segments),
+            (0, 0),
+            "{overlap:?}"
+        );
+        assert_eq!(overlap.depth_max, 1, "{overlap:?} {:?}", stats.segments);
+        assert!(
+            stats.segments.iter().all(|s| s.docs <= cap),
+            "{:?}",
+            stats.segments
+        );
+        // A step moves a cap of fresh rows, or splits a stretch: about the rows once or twice.
+        assert!(
+            stats.rewrite.docs_rewritten < 3 * 2000,
+            "{:?}",
+            stats.rewrite
+        );
+        assert_eq!(first_page(&sender, "将军", 3).await, [2000, 1999, 1998]);
+    }
+
+    /// Deletes and updates arriving while the repair moves rows are kept: a row deleted is not
+    /// brought back by the re-add of its old copy, and a row updated is there once, as updated.
+    #[rstest]
+    #[timeout(Duration::from_secs(90))]
+    #[tokio::test]
+    async fn deletes_and_updates_during_the_repair_are_kept() {
+        let cap = 100;
+        let sender = make_sender_with_threshold(capped_options(cap), 2000);
+        add_batch(&sender, shuffled(2000), named).await;
+        // Odd ids up to 400 deleted, even ones renamed, in batches a commit apart, while the
+        // repair runs on the idle ticks between them.
+        for chunk in (1..=400u64).collect::<Vec<_>>().chunks(40) {
+            for &primary in chunk {
+                rm_doc_no_wait(&sender, primary).await;
+            }
+            add_batch(
+                &sender,
+                chunk.iter().copied().filter(|id| id % 2 == 0),
+                |primary| format!("renamed{primary}"),
+            )
+            .await;
+        }
+        let stats = settled(&sender, 75, |stats| stats.overlap.fresh_rows == 0).await;
+        assert_eq!(stats.tantivy.num_docs, 2000 - 200);
+
+        let renamed = first_page(&sender, "renamed", 1000).await;
+        let expected: Vec<i64> = (2..=400).rev().step_by(2).collect();
+        assert_eq!(renamed, expected);
+        let named: Vec<i64> = first_page(&sender, "将军", 2000).await;
+        let expected: Vec<i64> = (401..=2000).rev().collect();
+        assert_eq!(named, expected);
+    }
+
+    /// The sort value of the row with id 7, for `an_update_moving_a_row_takes_it_to_its_new_place`.
+    static MOVED_VALUE: AtomicU64 = AtomicU64::new(7);
+
+    /// An update that changes a row's sort value moves it: the new copy is repaired into its new
+    /// place, and the old one, deleted, is not found at the old.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn an_update_moving_a_row_takes_it_to_its_new_place() {
+        let cap = 100;
+        let sender = make_sender_for(
+            capped_options(cap),
+            make_table(bigint_key, |id, _| {
+                let value = if id == 7 {
+                    MOVED_VALUE.load(Relaxed)
+                } else {
+                    id
+                };
+                Some(CqlValue::BigInt(value as i64))
+            }),
+            test_layout(),
+        );
+        add_batch(&sender, shuffled(1000), named).await;
+        let before = settled(&sender, 45, |_| true).await;
+        MOVED_VALUE.store(5000, Relaxed);
+        rm_doc_no_wait(&sender, 7).await;
+        add_batch(&sender, [7], named).await;
+        // Above every other row, the new copy overlaps nothing: it is adopted where it lands,
+        // with no row moved.
+        let stats = settled(&sender, 45, |stats| stats.overlap.fresh_rows == 0).await;
+        assert_eq!(stats.rewrite.docs_rewritten, before.rewrite.docs_rewritten);
+        assert_eq!(stats.tantivy.num_docs, 1000);
+        assert_eq!(stats.overlap.depth_max, 1, "{:?}", stats.overlap);
+        assert_eq!(first_page(&sender, "将军", 3).await, [7, 1000, 999]);
+        let all = first_page(&sender, "将军", 1000).await;
+        assert_eq!(all.iter().filter(|&&id| id == 7).count(), 1);
+    }
+
+    /// After most rows are deleted, the segments full of holes are merged until none holds more
+    /// deleted rows than live ones and the survivors sit in a few segments. One with fewer may
+    /// stay as it is: its neighbours can be too full to merge with, and a merge of it alone is
+    /// not worth its holes.
+    #[rstest]
+    #[timeout(Duration::from_secs(60))]
+    #[tokio::test]
+    async fn a_mass_delete_compacts_to_few_segments() {
+        let cap = 100;
+        let sender = make_sender_with_threshold(capped_options(cap), 2000);
+        add_batch(&sender, shuffled(2000), named).await;
+        settled(&sender, 45, |_| true).await;
+        for primary in (1..=2000u64).filter(|id| id % 4 != 0) {
+            rm_doc_no_wait(&sender, primary).await;
+        }
+        rm_doc(&sender, 1).await;
+        let stats = settled(&sender, 45, |stats| {
+            stats.tantivy.num_docs == 500
+                && stats
+                    .segments
+                    .iter()
+                    .all(|segment| segment.deleted < segment.docs.max(1))
+        })
+        .await;
+        // Neighbours merge while within three quarters of the cap, so any two of them hold more
+        // than that together.
+        let most = 2 * 500 / ordered_fill(cap) as usize + 1;
+        assert!(
+            stats.tantivy.segment_count <= most,
+            "{} segments: {:?}",
+            stats.tantivy.segment_count,
+            stats.segments
+        );
+        let expected: Vec<i64> = (4..=2000).rev().step_by(4).collect();
+        assert_eq!(first_page(&sender, "将军", 1000).await, expected);
+    }
+
+    /// An idle tick repairs whatever there is; while the index ingests, the repair waits for
+    /// the fresh tier to grow past two caps, or a stretch past the cap.
+    #[test]
+    fn the_repair_waits_for_enough_fresh_rows_while_the_index_ingests() {
+        let under = LOAD_FRESH_ROWS - 1;
+        // (idle, fresh rows, overfull)
+        assert!(!repair_due(true, 0, false));
+        assert!(repair_due(true, 1, false));
+        assert!(!repair_due(false, under, false));
+        assert!(repair_due(false, LOAD_FRESH_ROWS, false));
+        assert!(repair_due(false, 0, true));
     }
 
     /// A segment holding the last tokens of one value and the first of the next spans what its

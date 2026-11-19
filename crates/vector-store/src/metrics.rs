@@ -106,6 +106,9 @@ pub(crate) struct Metrics {
     /// index on scrape, so they are gauges that only ever grow; a client diffs two scrapes to
     /// price the queries in between. One entry per [`PATTERN_SEARCH_TOTALS`].
     pub pattern_search_totals: Vec<GaugeVec>,
+    /// What the repair of a pattern index's layout has done. One entry per
+    /// [`PATTERN_REWRITE_GAUGES`].
+    pub pattern_rewrite: Vec<GaugeVec>,
     /// The merges a pattern index's ticks ask for. One entry per [`PATTERN_MERGE_GAUGES`].
     pub pattern_merges: Vec<GaugeVec>,
     /// How far a pattern index's segments are from disjoint. One entry per
@@ -165,6 +168,23 @@ pub(crate) const PATTERN_SEARCH_TOTALS: &[(&str, &str)] = &[
     (
         "pattern_search_segments_wasted_total",
         "Segments an ordered pattern search opened that put no row on its page, summed over searches",
+    ),
+];
+
+/// The gauges of the repair of a pattern index's layout, in the order `pattern_rewrite` holds
+/// them. An index has settled once nothing is pending and no merge runs.
+pub(crate) const PATTERN_REWRITE_GAUGES: &[(&str, &str)] = &[
+    (
+        "pattern_rewrite_steps_total",
+        "Repair steps since the index was created",
+    ),
+    (
+        "pattern_rewrite_docs_total",
+        "Rows moved by repair steps since the index was created",
+    ),
+    (
+        "pattern_rewrite_pending",
+        "1 while the index has fresh rows, or an ordered stretch past the cap, to repair",
     ),
 ];
 
@@ -395,6 +415,16 @@ impl Metrics {
                 .unwrap()
             })
             .collect::<Vec<_>>();
+        let pattern_rewrite = PATTERN_REWRITE_GAUGES
+            .iter()
+            .map(|(name, help)| {
+                GaugeVec::new(
+                    prometheus::Opts::new(*name, *help),
+                    &["keyspace", "index_name"],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
         let pattern_merges = PATTERN_MERGE_GAUGES
             .iter()
             .map(|(name, help)| {
@@ -454,6 +484,7 @@ impl Metrics {
             .unwrap();
         for gauge in pattern_search_totals
             .iter()
+            .chain(pattern_rewrite.iter())
             .chain(pattern_merges.iter())
             .chain(pattern_layout.iter())
             .chain(pattern_segment_layout.iter())
@@ -476,6 +507,7 @@ impl Metrics {
             pattern_index_size_bytes,
             pattern_segment_count,
             pattern_search_totals,
+            pattern_rewrite,
             pattern_merges,
             pattern_layout,
             pattern_segment_layout,
@@ -576,6 +608,7 @@ impl Metrics {
         for gauge in self
             .pattern_search_totals
             .iter()
+            .chain(self.pattern_rewrite.iter())
             .chain(self.pattern_merges.iter())
             .chain(self.pattern_layout.iter())
         {
@@ -739,6 +772,15 @@ async fn refresh_index(
                 walk.segments_wasted as f64,
             ];
             for (gauge, value) in metrics.pattern_search_totals.iter().zip(totals) {
+                gauge.with_label_values(&labels).set(value);
+            }
+            let rewrite = stats.rewrite;
+            let progress = [
+                rewrite.steps as f64,
+                rewrite.docs_rewritten as f64,
+                f64::from(u8::from(rewrite.pending)),
+            ];
+            for (gauge, value) in metrics.pattern_rewrite.iter().zip(progress) {
                 gauge.with_label_values(&labels).set(value);
             }
             let merges = stats.merges;
