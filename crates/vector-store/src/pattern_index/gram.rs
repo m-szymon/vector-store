@@ -8,12 +8,10 @@ use std::collections::BTreeSet;
 use tantivy::tokenizer::NgramTokenizer;
 use tantivy::tokenizer::TextAnalyzer;
 
-const MIN_GRAM: usize = 1;
-/// A gram is a short piece of a value: from 1 to `MAX_GRAM` characters that stand next to each
-/// other. The index keeps all grams of every value. For example, with `MAX_GRAM` = 3 the value
-/// `abcd` gives `a`, `b`, `c`, `d`, `ab`, `bc`, `cd`, `abc` and `bcd`. The marks around the value
-/// (see [`VALUE_START`]) are part of the grams too.
-const MAX_GRAM: usize = 3;
+// A gram is a short piece of a value: from `min_gram` to `max_gram` characters that stand next to
+// each other, the two lengths being options of the index. The index keeps all grams of every
+// value. For example, with 1 and 3 the value `abcd` gives `a`, `b`, `c`, `d`, `ab`, `bc`, `cd`,
+// `abc` and `bcd`. The marks around the value (see [`VALUE_START`]) are part of the grams too.
 
 /// Every value is indexed and stored between these two marks. The marks are an optimization for
 /// patterns tied to the start or the end of a value: the regex would reject wrong values anyway,
@@ -34,8 +32,11 @@ pub(super) fn unframed(text: &str) -> Option<&str> {
     text.strip_prefix(VALUE_START)?.strip_suffix(VALUE_END)
 }
 
-pub(super) fn build_ngram_analyzer() -> anyhow::Result<TextAnalyzer> {
-    let tokenizer = NgramTokenizer::new(MIN_GRAM, MAX_GRAM, false)
+pub(super) fn build_ngram_analyzer(
+    min_gram: usize,
+    max_gram: usize,
+) -> anyhow::Result<TextAnalyzer> {
+    let tokenizer = NgramTokenizer::new(min_gram, max_gram, false)
         .map_err(|e| anyhow!("pattern: failed to create the n-gram tokenizer: {e}"))?;
     Ok(TextAnalyzer::builder(tokenizer).build())
 }
@@ -78,28 +79,29 @@ pub(super) fn framed_pattern(tokens: &[Token]) -> Vec<Token> {
         .collect()
 }
 
-/// A literal run of up to `MAX_GRAM` characters is a gram itself; a longer one gives all its
-/// `MAX_GRAM`-long grams, as each shorter piece of it lies inside one of them.
-pub(super) fn grams(framed: &[Token]) -> BTreeSet<String> {
+/// A literal run of `min_gram` to `max_gram` characters is a gram itself; a longer one gives all
+/// its `max_gram`-long grams, as each shorter piece of it lies inside one of them. A run shorter
+/// than `min_gram` gives none: the index keeps no gram that short.
+pub(super) fn grams(framed: &[Token], min_gram: usize, max_gram: usize) -> BTreeSet<String> {
     framed
         .split(|token| token.as_char().is_none())
-        .filter(|run| !run.is_empty())
-        .flat_map(|run| run.windows(run.len().min(MAX_GRAM)))
+        .filter(|run| run.len() >= min_gram)
+        .flat_map(|run| run.windows(run.len().min(max_gram)))
         .map(|gram| gram.iter().filter_map(Token::as_char).collect())
         .collect()
 }
 
-/// Only `%`, which matches every value, and `%literal%` with a literal of up to `MAX_GRAM`
-/// characters and no frame mark are proven by their grams: a value holds the gram of the literal
-/// exactly when it contains the literal.
-pub(super) fn grams_prove_match(framed: &[Token]) -> bool {
+/// Only `%`, which matches every value, and `%literal%` with a literal of `min_gram` to
+/// `max_gram` characters and no frame mark are proven by their grams: a value holds the gram of
+/// the literal exactly when it contains the literal.
+pub(super) fn grams_prove_match(framed: &[Token], min_gram: usize, max_gram: usize) -> bool {
     if framed == [Token::AnySeq] {
         return true;
     }
     let [Token::AnySeq, run @ .., Token::AnySeq] = framed else {
         return false;
     };
-    run.len() <= MAX_GRAM
+    (min_gram..=max_gram).contains(&run.len())
         && run.iter().all(|token| {
             // If the pattern holds a start or end mark typed by the user, the grams cannot prove
             // the match, so the regex is needed.
@@ -115,7 +117,7 @@ mod tests {
     use super::*;
 
     fn grams_of(text: &str) -> BTreeSet<String> {
-        let mut analyzer = build_ngram_analyzer().unwrap();
+        let mut analyzer = build_ngram_analyzer(1, 3).unwrap();
         let mut stream = analyzer.token_stream(text);
         let mut grams = BTreeSet::new();
         while stream.advance() {

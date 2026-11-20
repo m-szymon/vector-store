@@ -196,6 +196,8 @@ async fn pattern_index_visible_in_indexes() {
         indexes[0].options,
         IndexOptions::Pattern(PatternIndexOptions {
             order_by: None,
+            min_gram: 1,
+            max_gram: 3,
             case_sensitive: false,
         })
     );

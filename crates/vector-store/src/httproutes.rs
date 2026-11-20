@@ -282,6 +282,8 @@ impl From<&IndexOptionsPattern> for PatternIndexOptions {
                         .join(", "),
                 ),
             },
+            min_gram: options.min_gram.as_ref().get(),
+            max_gram: options.max_gram.as_ref().get(),
             case_sensitive: *options.case_sensitive.as_ref(),
         }
     }
@@ -1376,7 +1378,7 @@ If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
         ),
         (
             status = 400,
-            description = "Bad request. Possible causes: malformed input, or missing required fields.",
+            description = "Bad request. Possible causes: malformed input, missing required fields, an invalid cursor or sort bound, or a pattern whose literal characters all stand in runs shorter than the index's min_gram.",
             content_type = "application/json",
             body = ErrorMessage
         ),
@@ -1524,7 +1526,12 @@ async fn post_index_like(
         Err(err) => {
             let msg = format!("index.like request error: {err}");
             debug!("post_index_like: {msg}");
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+            let status = if err.downcast_ref::<QueryError>().is_some() {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg).into_response()
         }
         Ok(page) => {
             let next_cursor = page

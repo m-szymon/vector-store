@@ -25,7 +25,9 @@ use crate::IndexOptionsFts;
 use crate::IndexOptionsPattern;
 use crate::IndexVersion;
 use crate::KeyspaceName;
+use crate::MaxGram;
 use crate::Metrics;
+use crate::MinGram;
 use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
 use crate::OrderBy;
@@ -600,6 +602,8 @@ async fn process<T: DbDriver>(
 
 /// The options of a pattern index.
 fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPattern {
+    let min_gram: MinGram = parse_index_option(options, "min_gram");
+    let max_gram: MaxGram = parse_index_option(options, "max_gram");
     let case_sensitive: CaseSensitive = parse_index_option(options, "case_sensitive");
     // Only the syntax; that the columns exist and can be ordered is checked later, where the
     // table's schema is in hand. A value that does not parse is kept as `Invalid`, not replaced
@@ -611,9 +615,12 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
         })
     });
     IndexOptionsPattern {
+        min_gram,
+        max_gram,
         case_sensitive,
         order_by,
     }
+    .validated()
 }
 
 /// Parses a single value of an index `options` map, falling back to its default

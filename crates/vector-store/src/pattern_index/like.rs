@@ -9,6 +9,7 @@
 
 use super::gram;
 use super::gram::Token;
+use crate::QueryError;
 use anyhow::anyhow;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -38,12 +39,33 @@ pub(super) struct LikeQuery {
 }
 
 impl LikeQuery {
-    pub(super) fn new(schema: &Schema, field: Field, pattern: &str) -> anyhow::Result<Self> {
+    /// `min_gram` and `max_gram` are the lengths of the grams the index keeps. A pattern whose
+    /// literal characters all stand in runs shorter than `min_gram` has no gram to look up, and
+    /// is a [`QueryError`].
+    pub(super) fn new(
+        schema: &Schema,
+        field: Field,
+        pattern: &str,
+        min_gram: usize,
+        max_gram: usize,
+    ) -> anyhow::Result<Self> {
         let framed = gram::framed_pattern(&parse(pattern));
-        let regex_matcher = matcher_unless_grams_prove_match(&framed)?;
+        let grams = gram::grams(&framed, min_gram, max_gram);
+        if grams.is_empty()
+            && framed
+                .iter()
+                .any(|token| matches!(token, Token::Literal(_)))
+        {
+            return Err(QueryError(format!(
+                "pattern: {pattern:?} has no run of at least min_gram={min_gram} literal \
+                characters, which is the shortest the index can look up"
+            ))
+            .into());
+        }
+        let regex_matcher = matcher_unless_grams_prove_match(&framed, min_gram, max_gram)?;
         // Scoring is off, as LIKE results are not ordered by a score, so the weight needs only the
         // schema.
-        let weight = all_grams_query(field, gram::grams(&framed))
+        let weight = all_grams_query(field, grams)
             .weight(EnableScoring::disabled_from_schema(schema))
             .map_err(|e| anyhow!("pattern: failed to build the query: {e}"))?;
         Ok(Self {
@@ -120,8 +142,12 @@ fn all_grams_query(field: Field, grams: BTreeSet<String>) -> Box<dyn Query> {
 
 /// The regex that checks the stored value, or `None` when holding every gram already proves a
 /// match, so no value has to be read.
-fn matcher_unless_grams_prove_match(framed: &[Token]) -> anyhow::Result<Option<Regex>> {
-    if gram::grams_prove_match(framed) {
+fn matcher_unless_grams_prove_match(
+    framed: &[Token],
+    min_gram: usize,
+    max_gram: usize,
+) -> anyhow::Result<Option<Regex>> {
+    if gram::grams_prove_match(framed, min_gram, max_gram) {
         return Ok(None);
     }
     matcher(framed).map(Some)

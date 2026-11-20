@@ -511,7 +511,7 @@
             }
           },
           "400": {
-            "description": "Bad request. Possible causes: malformed input, or missing required fields.",
+            "description": "Bad request. Possible causes: malformed input, missing required fields, an invalid cursor or sort bound, or a pattern whose literal characters all stand in runs shorter than the index's min_gram.",
             "content": {
               "application/json": {
                 "schema": {
@@ -948,12 +948,24 @@
         "type": "object",
         "description": "Options a pattern index was created with.",
         "required": [
+          "min_gram",
+          "max_gram",
           "case_sensitive"
         ],
         "properties": {
           "case_sensitive": {
             "type": "boolean",
             "description": "Whether matching distinguishes letter case."
+          },
+          "max_gram": {
+            "type": "integer",
+            "description": "Length in characters of the longest indexed substring; longer queries are answered by intersecting their substrings and verifying candidates.",
+            "minimum": 0
+          },
+          "min_gram": {
+            "type": "integer",
+            "description": "Length in characters of the shortest indexed substring; queries shorter than this are rejected.",
+            "minimum": 0
           },
           "order_by": {
             "type": [

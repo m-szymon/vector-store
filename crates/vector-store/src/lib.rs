@@ -608,6 +608,60 @@ impl FromStr for Positions {
     }
 }
 
+/// Upper bound of `min_gram` and `max_gram` of a pattern index. Every substring of a value up
+/// to `max_gram` characters becomes an indexed term, so the bound keeps the index size sane.
+pub const MAX_GRAM_LIMIT: usize = 8;
+
+fn parse_gram(s: &str, name: &str) -> anyhow::Result<NonZeroUsize> {
+    let value: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Unknown {name} value: {s}"))?;
+    if value == 0 || value > MAX_GRAM_LIMIT {
+        anyhow::bail!("{name} must be in 1..={MAX_GRAM_LIMIT}, got {value}");
+    }
+    Ok(NonZeroUsize::new(value).unwrap())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Length in characters of the shortest term a pattern index stores for a value.
+/// A query shorter than this cannot be answered by the index.
+pub struct MinGram(NonZeroUsize);
+
+impl Default for MinGram {
+    fn default() -> Self {
+        Self(NonZeroUsize::new(1).unwrap())
+    }
+}
+
+impl FromStr for MinGram {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_gram(s, "min_gram").map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// Length in characters of the longest term a pattern index stores for a value.
+/// A query up to this length is a single exact term lookup; a longer one is answered by
+/// intersecting its `max_gram`-long substrings and verifying the candidates.
+pub struct MaxGram(NonZeroUsize);
+
+impl Default for MaxGram {
+    fn default() -> Self {
+        Self(NonZeroUsize::new(3).unwrap())
+    }
+}
+
+impl FromStr for MaxGram {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_gram(s, "max_gram").map(Self)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
 /// Whether a pattern index distinguishes letter case. When false: values (documents) and
 /// patterns are lowercased.
@@ -883,9 +937,34 @@ pub struct IndexOptionsFts {
 ///
 /// Not `Copy`: `order_by` holds column names. Clone it rather than reaching for a `*`.
 pub struct IndexOptionsPattern {
+    pub min_gram: MinGram,
+    pub max_gram: MaxGram,
     pub case_sensitive: CaseSensitive,
     /// What the index answers in: table order, no order, or the declared columns.
     pub order_by: OrderBy,
+}
+
+impl IndexOptionsPattern {
+    /// Checks the cross-option invariant `min_gram <= max_gram`. ScyllaDB rejects such an index
+    /// at creation, so a violation here means the options were tampered with; fall back to the
+    /// defaults with a warning, the same way an unparsable single option is handled.
+    pub fn validated(self) -> Self {
+        if self.min_gram.as_ref().get() > self.max_gram.as_ref().get() {
+            tracing::warn!(
+                "pattern index options min_gram={} > max_gram={}, using the defaults",
+                self.min_gram.as_ref(),
+                self.max_gram.as_ref()
+            );
+            // Only the grams are in doubt, so only the grams are reset. Dropping the sort columns
+            // here would silently turn the index into one in table order, and the queries would
+            // come back in the wrong order rather than failing.
+            return Self {
+                order_by: self.order_by,
+                ..Self::default()
+            };
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1372,6 +1451,56 @@ mod tests {
     #[test]
     fn positions_defaults_to_enabled() {
         assert!(*Positions::default().as_ref());
+    }
+
+    #[test]
+    fn grams_parse_within_bounds_only() {
+        assert_eq!("3".parse::<MinGram>().unwrap().as_ref().get(), 3);
+        assert_eq!(" 8 ".parse::<MaxGram>().unwrap().as_ref().get(), 8);
+        assert!("0".parse::<MinGram>().is_err());
+        assert!("9".parse::<MaxGram>().is_err());
+        assert!("three".parse::<MaxGram>().is_err());
+    }
+
+    #[test]
+    fn grams_default_to_one_and_three() {
+        assert_eq!(MinGram::default().as_ref().get(), 1);
+        assert_eq!(MaxGram::default().as_ref().get(), 3);
+    }
+
+    #[test]
+    fn pattern_options_fall_back_to_defaults_when_min_exceeds_max() {
+        let inverted = IndexOptionsPattern {
+            min_gram: "4".parse().unwrap(),
+            max_gram: "3".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+            order_by: OrderBy::default(),
+        };
+        assert_eq!(inverted.validated(), IndexOptionsPattern::default());
+
+        // The sort column survives a gram fallback: dropping it would answer in the wrong order
+        // rather than failing, which is far harder to notice.
+        let inverted_ordered = IndexOptionsPattern {
+            min_gram: "4".parse().unwrap(),
+            max_gram: "3".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+            order_by: "registered_at".parse().unwrap(),
+        };
+        assert_eq!(
+            inverted_ordered.validated(),
+            IndexOptionsPattern {
+                order_by: "registered_at".parse().unwrap(),
+                ..IndexOptionsPattern::default()
+            }
+        );
+
+        let valid = IndexOptionsPattern {
+            min_gram: "2".parse().unwrap(),
+            max_gram: "2".parse().unwrap(),
+            case_sensitive: CaseSensitive::from(false),
+            order_by: OrderBy::default(),
+        };
+        assert_eq!(valid.clone().validated(), valid);
     }
 
     #[test]

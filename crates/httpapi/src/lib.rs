@@ -200,6 +200,10 @@ pub struct PatternIndexOptions {
     /// The column results are ordered by, or absent for unspecified order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_by: Option<String>,
+    /// Length in characters of the shortest indexed substring; queries shorter than this are rejected.
+    pub min_gram: usize,
+    /// Length in characters of the longest indexed substring; longer queries are answered by intersecting their substrings and verifying candidates.
+    pub max_gram: usize,
     /// Whether matching distinguishes letter case.
     pub case_sensitive: bool,
 }

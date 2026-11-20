@@ -413,6 +413,16 @@ pub(crate) struct PatternStats {
 
 pub(crate) type PatternStatsR = anyhow::Result<PatternStats>;
 
+impl PatternBackend {
+    fn min_gram(&self) -> usize {
+        self.options.min_gram.as_ref().get()
+    }
+
+    fn max_gram(&self) -> usize {
+        self.options.max_gram.as_ref().get()
+    }
+}
+
 /// What a row contributes to a pattern index: the text to index, and for an index that keeps an
 /// order, the row's sort prefix.
 pub(crate) struct PatternRow<'a> {
@@ -492,7 +502,7 @@ fn new_index(
         options: options.clone(),
     };
     let schema = backend.build_schema();
-    let analyzer = gram::build_ngram_analyzer()?;
+    let analyzer = gram::build_ngram_analyzer(backend.min_gram(), backend.max_gram())?;
     Index::with_state(schema, TOKENIZER_NAME, analyzer, key, worker, backend)
 }
 
@@ -1019,7 +1029,14 @@ fn handle_like(
 ) -> PatternLikeR {
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let pattern = state.backend().options.case_sensitive.fold(pattern);
-    let like = LikeQuery::new(&state.schema, text_field, &pattern)?;
+    let backend = state.backend();
+    let like = LikeQuery::new(
+        &state.schema,
+        text_field,
+        &pattern,
+        backend.min_gram(),
+        backend.max_gram(),
+    )?;
     let limit: usize = (*limit.as_ref()).into();
     let partition_id = find_partition_id(table.read().unwrap().deref(), index_key)?;
     let (primary_ids, next_cursor) = {
@@ -1206,8 +1223,11 @@ mod tests {
     use super::*;
     use crate::AsyncInProgress;
     use crate::CaseSensitive;
+    use crate::MaxGram;
+    use crate::MinGram;
     use crate::OrderBy;
     use crate::PrimaryKey;
+    use crate::QueryError;
     use crate::memory::Allocate;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
@@ -1253,8 +1273,10 @@ mod tests {
     const TEST_COMMIT_INTERVAL: Duration = Duration::from_millis(50);
     const TEST_COMMIT_THRESHOLD: usize = 100;
 
-    fn options(case_sensitive: bool) -> IndexOptionsPattern {
+    fn options(min_gram: usize, max_gram: usize, case_sensitive: bool) -> IndexOptionsPattern {
         IndexOptionsPattern {
+            min_gram: MinGram::from(NonZeroUsize::new(min_gram).unwrap()),
+            max_gram: MaxGram::from(NonZeroUsize::new(max_gram).unwrap()),
             case_sensitive: CaseSensitive::from(case_sensitive),
             // The matching tests run in table order and sort what they get; the order has tests
             // of its own.
@@ -1342,7 +1364,7 @@ mod tests {
     }
 
     fn make_case_insensitive_sender() -> mpsc::Sender<PatternIndex> {
-        make_sender_with_options(options(false))
+        make_sender_with_options(options(1, 3, false))
     }
 
     async fn add_doc(sender: &mpsc::Sender<PatternIndex>, primary: u64, content: &str) {
@@ -1613,6 +1635,34 @@ mod tests {
         add_doc(&sender, 21, "xxabcdexx").await;
 
         assert_eq!(search_page(&sender, "abcde", 1).await, vec![21]);
+    }
+
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn query_shorter_than_min_gram_is_a_query_error() {
+        let sender = make_sender_with_options(options(2, 3, true));
+        add_docs(&sender, NICKNAMES).await;
+
+        let err = sender
+            .like(
+                make_index_key(),
+                "%宫%".into(),
+                limit(10),
+                SearchWindow::default(),
+            )
+            .await
+            .expect_err("a one-character query cannot be answered by a min_gram=2 index");
+
+        assert!(err.downcast_ref::<QueryError>().is_some(), "got: {err}");
+        // A query at min_gram is still served, and so is a shorter one tied to an end of the
+        // value, whose mark makes the gram long enough.
+        assert_eq!(search(&sender, "南宫").await, vec![6, 7]);
+        assert_eq!(like_ids(&sender, "宫%").await, vec![8]);
+        // A run too short is no hindrance beside one long enough.
+        assert_eq!(like_ids(&sender, "%南宫%团").await, vec![7]);
+        // A pattern without a literal character asks for no gram.
+        assert_eq!(like_ids(&sender, "__").await, vec![4, 5, 8]);
     }
 
     #[rstest]
@@ -1912,7 +1962,7 @@ mod tests {
     async fn ordering_holds_for_a_keyword_past_max_gram() {
         let sender = make_sender_with_options(IndexOptionsPattern {
             order_by: "sort_col".parse().unwrap(),
-            ..options(true)
+            ..options(1, 3, true)
         });
         add_docs(&sender, NICKNAMES).await;
 

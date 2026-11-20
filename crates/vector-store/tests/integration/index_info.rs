@@ -256,6 +256,8 @@ async fn indexes_lists_all_indexes_with_options() {
     .unwrap();
 
     let pattern_options = IndexOptionsPattern {
+        min_gram: "2".parse().unwrap(),
+        max_gram: "4".parse().unwrap(),
         case_sensitive: false.into(),
         ..Default::default()
     };
@@ -302,6 +304,8 @@ async fn indexes_lists_all_indexes_with_options() {
             "fourth",
             IndexOptions::Pattern(PatternIndexOptions {
                 order_by: None,
+                min_gram: 2,
+                max_gram: 4,
                 case_sensitive: false,
             }),
         ),

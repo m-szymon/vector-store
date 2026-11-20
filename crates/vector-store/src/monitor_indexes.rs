@@ -1244,6 +1244,8 @@ mod tests {
     #[tokio::test]
     async fn get_indexes_returns_pattern_index() {
         let options = IndexOptionsPattern {
+            min_gram: "2".parse().unwrap(),
+            max_gram: "4".parse().unwrap(),
             case_sensitive: false.into(),
             ..Default::default()
         };
