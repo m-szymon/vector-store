@@ -263,6 +263,9 @@ fn split_rows(cap: u32) -> usize {
 /// than `REPAIR_LOCK_ROWS`. The ranges are disjoint, so ordered merges fold small ones back
 /// together.
 fn repair_range_rows(cap: u32) -> usize {
+    if walk_off(OFF_LOCK_CHUNKS) {
+        return split_rows(cap);
+    }
     split_rows(cap).min(REPAIR_LOCK_ROWS)
 }
 
@@ -402,7 +405,8 @@ fn merge_runs(pieces: &[Piece], cap: u32) -> Vec<(Vec<SegmentId>, bool)> {
             continue;
         }
         if !run.is_empty()
-            && (run_docs + cluster.docs > fill || fresh_between(run_max, cluster.min))
+            && (run_docs + cluster.docs > fill
+                || (!walk_off(OFF_FRESH_BETWEEN) && fresh_between(run_max, cluster.min)))
         {
             flush(&mut run, &mut run_docs, &mut run_deleted, true);
         }
@@ -1044,6 +1048,23 @@ impl PatternBackend {
                 shape(&coarse)
             );
         }
+        #[cfg(test)]
+        if RECORD_RUN_SHAPES.load(Relaxed) {
+            // (sorted runs, coarse runs, the rows in the coarse ones).
+            let mut shape = (0usize, 0usize, 0u32);
+            for run in columns.runs.iter().flat_map(|runs| runs.runs.iter()) {
+                if run.blocks.is_some() {
+                    shape.1 += 1;
+                    shape.2 += run.end - run.start;
+                } else {
+                    shape.0 += 1;
+                }
+            }
+            RUN_SHAPES
+                .lock()
+                .unwrap()
+                .insert((segment.max_doc(), columns.layout_min), shape);
+        }
         *opened += 1;
         self.columns.write().unwrap().insert(id, columns.clone());
         Ok(columns)
@@ -1447,6 +1468,20 @@ impl PatternBackend {
                 busy.len()
             );
         }
+        #[cfg(test)]
+        if walk_off(OFF_TRACE_REPAIR) {
+            let docs: HashMap<SegmentId, u32> =
+                pieces.iter().map(|piece| (piece.id, piece.docs)).collect();
+            for (run, ordered) in &runs {
+                println!(
+                    "MERGE asked: {} segments, {} rows, ordered {ordered}; {} live, {} busy",
+                    run.len(),
+                    run.iter().map(|id| u64::from(docs[id])).sum::<u64>(),
+                    pieces.len(),
+                    busy.len()
+                );
+            }
+        }
         for (run, ordered) in runs {
             // The merge runs on Tantivy's own thread; the handle only reports its end, and the
             // next reload picks the merged segment up either way.
@@ -1544,6 +1579,17 @@ impl PatternBackend {
         }
         // Lagging holds the repair on an idle tick too: a commit at the row threshold just before
         // the tick leaves nothing to commit in the middle of a stream of changes.
+        #[cfg(test)]
+        {
+            GATE_TICKS[0].fetch_add(1, Relaxed);
+            GATE_TICKS[1].fetch_add(u64::from(lagging), Relaxed);
+            GATE_TICKS[2].fetch_add(u64::from(contended), Relaxed);
+            // Held by the contended signal alone: due without it.
+            let alone = contended
+                && repair_due(idle, scanning || lagging, false, fresh_rows, overfull)
+                && !repair_due(idle, scanning || lagging, true, fresh_rows, overfull);
+            GATE_TICKS[3].fetch_add(u64::from(alone), Relaxed);
+        }
         if !repair_due(idle, scanning || lagging, contended, fresh_rows, overfull) {
             return;
         }
@@ -1705,14 +1751,21 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
         let mut merging = backend.merging.lock().unwrap();
         merging.busy(&mut backend.adopted.lock().unwrap());
         if merging.unsettled(&live_segments(&state.reader.searcher())) {
+            repair_phase(1);
             return Ok(false);
         }
     }
 
+    repair_phase(10);
+    let waiting = Instant::now();
     let mut writer = state.lock_writer();
+    let held = Instant::now();
+    repair_phase(11);
     state
         .commit_and_reload(&mut writer)
         .map_err(|e| anyhow!("pattern: failed to commit before a repair: {e}"))?;
+    let committed = held.elapsed();
+    repair_phase(12);
     let searcher = state.reader.searcher();
     let pieces = backend.geometry(&searcher);
     let ordered = ordered_tier(&pieces);
@@ -1746,6 +1799,7 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
         }
     }
     sample.sort_unstable();
+    let sampled = held.elapsed();
     let Some(range) = plan_repair(&pieces, &sample, stride, cap) else {
         return Ok(false);
     };
@@ -1774,29 +1828,60 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
             }
         }
     }
+    #[cfg(not(test))]
+    let _ = (waiting, committed, sampled);
+    #[cfg(test)]
+    if walk_off(OFF_TRACE_REPAIR) {
+        println!(
+            "REPAIR plan hold: waited {:.2}s for the writer, held {:.2}s: commit {:.2}s, sample to {:.2}s",
+            (held - waiting).as_secs_f64(),
+            held.elapsed().as_secs_f64(),
+            committed.as_secs_f64(),
+            sampled.as_secs_f64(),
+        );
+        println!(
+            "REPAIR plan: {} fresh rows in {} segments, stride {stride}, sample {}; range {:x}..{:x}, cluster {:?}, split {split}, {} keys",
+            fresh_rows,
+            fresh.len(),
+            sample.len(),
+            range.low >> 64,
+            range.high >> 64,
+            range
+                .cluster
+                .as_ref()
+                .map(|cluster| (cluster.docs, cluster.ids.len())),
+            keys.len(),
+        );
+    }
     drop(searcher);
     drop(writer);
     if keys.is_empty() {
         return Ok(false);
     }
     keys.sort_unstable();
-    let ranges: Vec<(u128, u128)> = split_parts(
+    let ranges: Vec<(u128, u128, usize)> = split_parts(
         keys.into_iter().map(|key| (key, ())).collect(),
         repair_range_rows(cap),
     )
     .iter()
-    .map(|part| (part[0].0, part[part.len() - 1].0))
+    .map(|part| (part[0].0, part[part.len() - 1].0, part.len()))
     .collect();
 
     // Each key range under a hold of the lock of its own, its rows read again from what is
     // committed now: a change to one of them since is already in, and a change after lands on
     // the copy added here. The writes waiting for the lock go in between ranges.
     let mut count = 0;
-    for &(low, high) in &ranges {
+    for &(low, high, planned) in &ranges {
+        repair_phase(20);
+        let waiting = Instant::now();
         let mut writer = state.lock_writer();
+        let held = Instant::now();
+        repair_phase(21);
         state
             .commit_and_reload(&mut writer)
             .map_err(|e| anyhow!("pattern: failed to commit before a repair: {e}"))?;
+        let committed = held.elapsed();
+        repair_phase(22);
         let searcher = state.reader.searcher();
         let pieces = backend.geometry(&searcher);
         let ordered = ordered_tier(&pieces);
@@ -1821,7 +1906,11 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
             read_rows(
                 state,
                 segment,
-                |key| low <= key && key <= high && (ordered || in_range(key)),
+                |key| {
+                    low <= key
+                        && key <= high
+                        && (ordered || in_range(key) || walk_off(OFF_HOLD_BOUND))
+                },
                 &mut moved,
             )?;
         }
@@ -1831,16 +1920,37 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
         // them so.
         moved.sort_by_key(|row| row.0);
         count += moved.len();
+        let rows = moved.len();
+        let read = held.elapsed();
+        repair_phase(23);
         writer
             .rewrite_documents(moved.into_iter().map(|(_, row)| row))
             .map_err(|e| anyhow!("pattern: failed to repair a range: {e}"))?;
+        let rewritten = held.elapsed();
+        repair_phase(24);
         state
             .commit_and_reload(&mut writer)
             .map_err(|e| anyhow!("pattern: failed to commit a repair: {e}"))?;
+        #[cfg(test)]
+        if walk_off(OFF_TRACE_REPAIR) {
+            println!(
+                "REPAIR range hold: {rows} rows of {planned} planned, waited {:.2}s, held {:.2}s: commit {:.2}s, read to {:.2}s, rewrite to {:.2}s",
+                (held - waiting).as_secs_f64(),
+                held.elapsed().as_secs_f64(),
+                committed.as_secs_f64(),
+                read.as_secs_f64(),
+                rewritten.as_secs_f64(),
+            );
+        }
+        #[cfg(not(test))]
+        let _ = (waiting, committed, rows, planned, read, rewritten);
         // The writes that waited through this hold go before the next one.
         drop(searcher);
         drop(writer);
-        state.let_writes_in(REPAIR_HANDOVER_LIMIT);
+        repair_phase(25);
+        if !walk_off(OFF_HANDOVER) {
+            state.let_writes_in(REPAIR_HANDOVER_LIMIT);
+        }
     }
     let part_count = ranges.len();
 
@@ -1858,7 +1968,9 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
         }
     );
     // Learn the new segments' bounds and let the policy fold the pieces together.
+    repair_phase(30);
     backend.after_reload(state);
+    repair_phase(0);
     Ok(true)
 }
 
@@ -2171,6 +2283,70 @@ impl Page<'_> {
     }
 }
 
+/// Set by a benchmark test to record the shape of every segment's runs in `RUN_SHAPES`, by the
+/// segment's size and lowest key.
+#[cfg(test)]
+static RECORD_RUN_SHAPES: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static RUN_SHAPES: Mutex<RunShapes> = Mutex::new(RunShapes::new());
+#[cfg(test)]
+type RunShapes = std::collections::BTreeMap<(u32, u128), (usize, usize, u32)>;
+
+/// Mechanisms of the walk a benchmark test switches off, to see what each is worth: see
+/// `walk_off`.
+#[cfg(test)]
+static WALK_OFF: AtomicU32 = AtomicU32::new(0);
+const OFF_TAKE: u32 = 2;
+const OFF_HALVING: u32 = 4;
+const OFF_SWEEP: u32 = 8;
+const OFF_WHOLE_READ: u32 = 16;
+/// Not off but always on: every segment read whole, to find where the two readings cross.
+const FORCE_WHOLE_READ: u32 = 32;
+const OFF_HANDOVER: u32 = 256;
+const OFF_HOLD_BOUND: u32 = 512;
+const OFF_FRESH_BETWEEN: u32 = 2048;
+/// Ticks with a repair pending, and of those: with changes lagging, with indexing contended, and
+/// held by the contended signal alone. For a benchmark test.
+#[cfg(test)]
+static GATE_TICKS: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+const OFF_LOCK_CHUNKS: u32 = 128;
+/// Where a repair step is, for a benchmark test that watches one stall: see `repair_phase`.
+#[cfg(test)]
+static REPAIR_PHASE: AtomicU32 = AtomicU32::new(0);
+
+/// Notes where a repair step is: 1 merges unsettled; 10 waiting for the writer to plan, 11
+/// committing, 12 sampling and reading keys; 20 waiting for the writer for a range, 21
+/// committing, 22 reading its rows, 23 rewriting, 24 committing, 25 letting writes in; 30 the
+/// merges after the step; 0 done.
+fn repair_phase(phase: u32) {
+    #[cfg(test)]
+    REPAIR_PHASE.store(phase, Relaxed);
+    #[cfg(not(test))]
+    let _ = phase;
+}
+#[cfg(test)]
+const OFF_TRACE_REPAIR: u32 = 64;
+
+/// Whether a benchmark test has switched the mechanism off; never outside tests.
+fn walk_off(mechanism: u32) -> bool {
+    #[cfg(test)]
+    return WALK_OFF.load(Relaxed) & mechanism != 0;
+    #[cfg(not(test))]
+    {
+        let _ = mechanism;
+        false
+    }
+}
+
+/// Segments an ordered walk read whole for want of sorted runs, for a benchmark test to report.
+#[cfg(test)]
+static SEGMENTS_READ_WHOLE: AtomicU64 = AtomicU64::new(0);
+
 /// One segment as an ordered walk reads it: the rows of a range of doc ids at a time, either the
 /// whole segment, or stretches of a sorted run from the end the page needs (see
 /// `SegmentColumns::runs`).
@@ -2315,6 +2491,17 @@ impl RegionWalk<'_> {
                             doc_id = enter(doc_id, &mut scorer, page);
                         }
                         if last.len() <= take || doc_id >= region.to {
+                            break;
+                        }
+                        if walk_off(OFF_HALVING) {
+                            // All of the region, as before the halving: its matches offered
+                            // whatever their number.
+                            while doc_id < region.to {
+                                tally.postings_scanned += 1;
+                                last.push(doc_id);
+                                doc_id = scorer.advance();
+                                doc_id = enter(doc_id, &mut scorer, page);
+                            }
                             break;
                         }
                         // From a block's edge in a coarse run, whose blocks are read whole.
@@ -2515,9 +2702,13 @@ impl RegionWalk<'_> {
             .ceil()
             .clamp(1.0, f64::from(u32::MAX)) as u32;
         // The matches a run offers of its stretch, which grow with it.
-        let mut take = 2 * page.limit;
+        let mut take = if walk_off(OFF_TAKE) {
+            usize::MAX
+        } else {
+            2 * page.limit
+        };
         // Whether the runs holding no match have been told apart.
-        let mut swept = false;
+        let mut swept = walk_off(OFF_SWEEP);
         let mut regions: Vec<Region> = Vec::new();
         let mut reading: Vec<u32> = Vec::new();
         // What a run reads of a stretch of `width`: positions `from..to`, going down or up
@@ -2743,16 +2934,22 @@ fn collect_matches_ordered(
         // postings; the segment read whole costs it every match, in one pass. So few matches
         // are read whole.
         let runs = columns.runs.clone().filter(|runs| {
-            matches_bound as usize
-                > WHOLE_READ_MATCHES
-                    + WHOLE_READ_PAGES * page.limit
-                    + WHOLE_READ_PER_RUN * runs.overlap()
+            !walk_off(FORCE_WHOLE_READ)
+                && (walk_off(OFF_WHOLE_READ)
+                    || matches_bound as usize
+                        > WHOLE_READ_MATCHES
+                            + WHOLE_READ_PAGES * page.limit
+                            + WHOLE_READ_PER_RUN * runs.overlap())
         });
         match runs {
             Some(runs) => {
                 walk.walk_runs(&mut page, &mut tally, &mut candidates, &runs, matches_bound)?
             }
             None => {
+                #[cfg(test)]
+                if columns.runs.is_none() {
+                    SEGMENTS_READ_WHOLE.fetch_add(1, Relaxed);
+                }
                 walk.scan(
                     &mut page,
                     &mut tally,
@@ -5947,6 +6144,753 @@ mod tests {
                 .take(50)
                 .collect();
             assert_eq!(ranged, within, "{keyword} in a range");
+        }
+    }
+
+    static MATRIX_ROWS: AtomicU64 = AtomicU64::new(0);
+    /// MATRIX_SPARSE: keywords in one row of 30, 100, 300 and 3000 as well, to find the number
+    /// of matches at which reading a segment whole stops being the cheaper way.
+    static MATRIX_SPARSE: AtomicBool = AtomicBool::new(false);
+
+    /// A row of the matrix benchmark: keywords of every frequency, spread evenly over the ids
+    /// and gathered at either end of them, and one whose grams most rows hold apart.
+    fn matrix_name(id: u64) -> String {
+        let rows = MATRIX_ROWS.load(Relaxed);
+        let mut name = format!("用户{}号玩家{}", id % 9973, id);
+        if id.is_multiple_of(9) {
+            name += "逢九之数";
+        }
+        if id.is_multiple_of(1000) {
+            name += "千禧";
+        }
+        if id.is_multiple_of(5) {
+            name += "末等";
+        }
+        if id <= rows / 10 {
+            name += if id.is_multiple_of(100) {
+                "旧稀客"
+            } else {
+                "旧人"
+            };
+        }
+        if id > rows - rows / 10 {
+            name += "新人";
+        }
+        if MATRIX_SPARSE.load(Relaxed) {
+            for (every, keyword) in [(30, "卅选"), (100, "百选"), (300, "叁选"), (3000, "仟选")]
+            {
+                if id.is_multiple_of(every) {
+                    name += keyword;
+                }
+            }
+        }
+        if id.is_multiple_of(3000) {
+            name += "甲乙丙丁";
+        } else if id.is_multiple_of(3) {
+            name += "甲乙丙之乙丙丁";
+        }
+        name
+    }
+
+    /// What a page costs over a matrix of cases, to see how flat the cost is rather than how low
+    /// in one of them: keywords dense to absent, their matches spread evenly over the order or
+    /// gathered at one end of it, one whose candidates are a thousand to a match, pages of 20 to
+    /// 1000 rows from either end and from the middle. MATRIX_STATE picks the index:
+    ///
+    /// - `settled`: loaded shuffled and repaired;
+    /// - `unrepaired`: the same with no repair, as under writes the repair gives way to;
+    /// - `churned`: settled, then a tenth of the rows deleted and a tenth written again;
+    /// - `tiers`: ordered by a column of five values, so that most rows tie;
+    /// - `stream`: loaded in the index's order, MATRIX_BATCH rows (10000, a full commit) at a
+    ///   time and committed as in production, every MATRIX_COMMIT_MS (1000) or at 10000 rows,
+    ///   as rows stamped with the time arrive.
+    ///
+    /// Run with `--ignored --nocapture`; MATRIX_ROWS sets the size, MATRIX_CAP the segment cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn the_cost_of_a_page_over_a_matrix_of_cases() {
+        let rows: u64 =
+            std::env::var("MATRIX_ROWS").map_or(1_000_000, |rows| rows.parse().unwrap());
+        let cap: u32 = std::env::var("MATRIX_CAP")
+            .map_or(DEFAULT_SEGMENT_ROWS.get(), |cap| cap.parse().unwrap());
+        let state = std::env::var("MATRIX_STATE").unwrap_or_else(|_| "settled".into());
+        MATRIX_ROWS.store(rows, Relaxed);
+        let sparse = std::env::var("MATRIX_SPARSE").is_ok();
+        MATRIX_SPARSE.store(sparse, Relaxed);
+        RECORD_RUN_SHAPES.store(true, Relaxed);
+        // MATRIX_OFF switches one mechanism of the walk off, to see what it is worth.
+        WALK_OFF.store(
+            match std::env::var("MATRIX_OFF").as_deref() {
+                Ok("take") => OFF_TAKE,
+                Ok("halving") => OFF_HALVING,
+                Ok("sweep") => OFF_SWEEP,
+                Ok("whole_read") => OFF_WHOLE_READ,
+                Ok(other) => panic!("MATRIX_OFF: {other}"),
+                Err(_) => 0,
+            },
+            Relaxed,
+        );
+        let tiers = state == "tiers";
+        let options = IndexOptionsPattern {
+            rewrite_wide_segments: RewriteWideSegments::from(state != "unrepaired"),
+            ..capped_options(cap)
+        };
+        let table = if tiers {
+            make_table(bigint_key, |id, _| Some(CqlValue::BigInt((id % 5) as i64)))
+        } else {
+            make_table(bigint_key, |id, _| Some(CqlValue::BigInt(id as i64)))
+        };
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options,
+                key_layout: test_layout(),
+            },
+            table,
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            std::env::var("MATRIX_COMMIT_MS").map_or(
+                if state == "stream" {
+                    COMMIT_INTERVAL
+                } else {
+                    TEST_COMMIT_INTERVAL
+                },
+                |millis| Duration::from_millis(millis.parse().unwrap()),
+            ),
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let started = Instant::now();
+        let stream = state == "stream";
+        let batch: usize =
+            std::env::var("MATRIX_BATCH").map_or(10_000, |batch| batch.parse().unwrap());
+        let ids: Vec<u64> = if stream {
+            (1..=rows).collect()
+        } else {
+            (0..rows)
+                .map(|i| (i * 1_000_003 + 977) % rows + 1)
+                .collect()
+        };
+        for chunk in ids.chunks(if stream { batch } else { 100_000 }) {
+            add_batch(&sender, chunk.iter().copied(), matrix_name).await;
+        }
+        let quiet = |sender: &mpsc::Sender<PatternIndex>| {
+            let sender = sender.clone();
+            async move {
+                // No repair to wait for: until the merges stop.
+                let mut still = 0;
+                let deadline = Instant::now() + Duration::from_secs(1800);
+                loop {
+                    let stats = sender.stats(make_index_key()).await.unwrap();
+                    still = if stats.merges.running == 0 && !stats.rewrite.pending {
+                        still + 1
+                    } else {
+                        0
+                    };
+                    if still >= 20 || Instant::now() > deadline {
+                        return stats;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        let mut stats = if state == "unrepaired" || stream {
+            // Rows in order may leave the repair nothing to do.
+            quiet(&sender).await
+        } else {
+            settled(&sender, 3600, |stats| stats.overlap.fresh_rows == 0).await
+        };
+        if state == "churned" {
+            for chunk in ids.chunks(100_000) {
+                for &id in chunk.iter().filter(|id| *id % 10 == 3) {
+                    rm_doc_no_wait(&sender, id).await;
+                }
+                add_batch(
+                    &sender,
+                    chunk.iter().copied().filter(|id| id % 10 == 7),
+                    matrix_name,
+                )
+                .await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            stats = settled(&sender, 3600, |stats| stats.overlap.fresh_rows == 0).await;
+        }
+        println!(
+            "MATRIX {state} {rows} rows, cap {cap}: ready in {:.0}s at {} segments, depth {}/{:.2}, {} fresh rows, {} deleted, {} docs",
+            started.elapsed().as_secs_f64(),
+            stats.tantivy.segment_count,
+            stats.overlap.depth_max,
+            stats.overlap.depth_rows as f64 / stats.overlap.rows.max(1) as f64,
+            stats.overlap.fresh_rows,
+            stats.overlap.rows_deleted,
+            stats.tantivy.num_docs,
+        );
+        // The runs of the live segments, lowest key first.
+        let live: HashSet<(u32, Option<u64>)> = stats
+            .segments
+            .iter()
+            .map(|segment| (segment.docs + segment.deleted, segment.sort_min))
+            .collect();
+        for (&(max_doc, min), &(runs, short, short_rows)) in RUN_SHAPES.lock().unwrap().iter() {
+            if live.contains(&(max_doc, Some((min >> 64) as u64))) {
+                println!(
+                    "MATRIX segment of {max_doc} rows from {:x}: {runs} sorted runs, {short} coarse with {short_rows} rows",
+                    min >> 64
+                );
+            }
+        }
+        // MATRIX_STATS: what one read of the index's statistics costs, as the node's gauge
+        // refresh makes one a second for an index that is searched or written.
+        if std::env::var("MATRIX_STATS").is_ok() {
+            let mut micros = Vec::new();
+            for _ in 0..30 {
+                let clock = Instant::now();
+                let stats = sender.stats(make_index_key()).await.unwrap();
+                micros.push((clock.elapsed().as_micros() as u64, stats.segments.len()));
+            }
+            let segments = micros[0].1;
+            let mut times: Vec<u64> = micros.iter().map(|(time, _)| *time).collect();
+            times.sort_unstable();
+            println!(
+                "STATS|{state}|{rows}|{segments}|{}|{}|{}",
+                times[0],
+                times[times.len() / 2],
+                times[times.len() - 1]
+            );
+        }
+        let mut queries = vec![
+            ("玩家", "every row"),
+            ("末等", "1/5 even"),
+            ("逢九之", "1/9 even"),
+            ("逢九之数", "1/9 even, verified"),
+            ("号玩家1", "1/9 lead digit, verified"),
+            ("千禧", "1/1000 even"),
+            ("用户42号", "1/10000 even, verified"),
+            ("新人", "top tenth"),
+            ("旧人", "bottom tenth"),
+            ("旧稀客", "1/1000 in bottom tenth"),
+            ("甲乙丙丁", "1/3000 of 1/3 candidates"),
+            ("无此名", "miss"),
+            // Anchored patterns: a value's start or end is checked against the store, row by row.
+            ("用户42号%", "1/10000 prefix, verified"),
+            ("%甲乙丙丁", "1/3000 suffix of 1/3 candidates, verified"),
+            ("%新人", "2/3 of top tenth suffix, verified"),
+        ];
+        if sparse {
+            queries = vec![
+                ("逢九之", "1/9 even"),
+                ("卅选", "1/30 even"),
+                ("百选", "1/100 even"),
+                ("叁选", "1/300 even"),
+                ("千禧", "1/1000 even"),
+                ("仟选", "1/3000 even"),
+            ];
+        }
+        // A keyword is looked for anywhere in the value; a pattern with `%` is taken as it is.
+        let pattern_of = |keyword: &str| {
+            if keyword.contains('%') {
+                keyword.to_string()
+            } else {
+                containing(keyword)
+            }
+        };
+        // In the tiers index the middle of the order is the middle tier.
+        let middle = if tiers { 2 } else { (rows / 2) as i64 };
+        let shapes = [
+            ("newest", 20, SearchWindow::default()),
+            ("ascending", 20, ascending()),
+            ("middle", 20, window(None, None, Some(sort_key(middle)))),
+            ("newest", 200, SearchWindow::default()),
+            ("newest", 1000, SearchWindow::default()),
+        ];
+        // MATRIX_KEYWORD keeps one keyword, MATRIX_SECS the time a cell may take: to profile one.
+        let ab: Vec<(&str, u32)> = if std::env::var("MATRIX_AB").is_ok() {
+            vec![
+                ("take", OFF_TAKE),
+                ("halving", OFF_HALVING),
+                ("sweep", OFF_SWEEP),
+                ("whole_read", OFF_WHOLE_READ),
+            ]
+        } else {
+            Vec::new()
+        };
+        let only = std::env::var("MATRIX_KEYWORD").ok();
+        let secs: u64 = std::env::var("MATRIX_SECS").map_or(3, |secs| secs.parse().unwrap());
+        for (keyword, label) in queries {
+            if only.as_ref().is_some_and(|only| only != keyword) {
+                continue;
+            }
+            for (shape, limit_n, window) in &shapes {
+                if std::env::var("MATRIX_SHAPE").is_ok_and(|only| only != *shape) {
+                    continue;
+                }
+                let before = sender.stats(make_index_key()).await.unwrap().walk;
+                let whole_before = SEGMENTS_READ_WHOLE.load(Relaxed);
+                let clock = Instant::now();
+                let mut searches = 0u32;
+                let mut returned = 0;
+                let enough = if only.is_some() { u32::MAX } else { 100 };
+                while searches < enough
+                    && (searches < 3 || clock.elapsed() < Duration::from_secs(secs))
+                {
+                    returned = like(&sender, &pattern_of(keyword), *limit_n, window.clone())
+                        .await
+                        .primary_keys
+                        .len();
+                    searches += 1;
+                }
+                let wall = clock.elapsed().as_secs_f64() * 1e6 / f64::from(searches);
+                let after = sender.stats(make_index_key()).await.unwrap().walk;
+                let whole = SEGMENTS_READ_WHOLE.load(Relaxed) - whole_before;
+                let per = |a: u64, b: u64| (a - b) as f64 / f64::from(searches);
+                println!(
+                    "MATRIX|{state}|{cap}|{label}|{shape}|{limit_n}|{returned}|{:.0}|{:.0}|{:.1}|{:.1}|{:.1}|{:.1}|{:.1}",
+                    per(after.postings_scanned, before.postings_scanned),
+                    per(after.store_reads, before.store_reads),
+                    per(after.segments_opened, before.segments_opened),
+                    per(after.segments_wasted, before.segments_wasted),
+                    whole as f64 / f64::from(searches),
+                    per(after.walk_nanos, before.walk_nanos) / 1e3,
+                    wall,
+                );
+                // MATRIX_WHOLE: every segment read whole, none, and as the walk chooses, by turns:
+                // where the two readings cross, and whether the choice follows.
+                if std::env::var("MATRIX_WHOLE").is_ok() {
+                    // [runs, whole, as chosen] x (searches, postings, walk nanos)
+                    let mut sides = [[0u64; 3]; 3];
+                    for turn in 0..9 {
+                        let side = turn % 3;
+                        WALK_OFF.store([OFF_WHOLE_READ, FORCE_WHOLE_READ, 0][side], Relaxed);
+                        let before = sender.stats(make_index_key()).await.unwrap().walk;
+                        let clock = Instant::now();
+                        let mut searches = 0u64;
+                        while searches < 30
+                            && (searches < 2 || clock.elapsed() < Duration::from_millis(300))
+                        {
+                            like(&sender, &pattern_of(keyword), *limit_n, window.clone()).await;
+                            searches += 1;
+                        }
+                        let after = sender.stats(make_index_key()).await.unwrap().walk;
+                        sides[side][0] += searches;
+                        sides[side][1] += after.postings_scanned - before.postings_scanned;
+                        sides[side][2] += after.walk_nanos - before.walk_nanos;
+                    }
+                    WALK_OFF.store(0, Relaxed);
+                    let per = |side: usize, what: usize| {
+                        sides[side][what] as f64 / sides[side][0].max(1) as f64
+                    };
+                    println!(
+                        "WHOLE|{state}|{label}|{shape}|{limit_n}|{:.0}|{:.0}|{:.1}|{:.1}|{:.1}",
+                        per(0, 1),
+                        per(1, 1),
+                        per(0, 2) / 1e3,
+                        per(1, 2) / 1e3,
+                        per(2, 2) / 1e3,
+                    );
+                }
+                // MATRIX_AB: each mechanism of the walk off and on by turns on this one index,
+                // so that the layout, which differs from build to build, is the same for both.
+                for &(name, mechanism) in &ab {
+                    // [off, on] x (searches, postings, store reads, walk nanos)
+                    let mut sides = [[0u64; 4]; 2];
+                    for turn in 0..6 {
+                        let side = turn % 2;
+                        WALK_OFF.store(if side == 0 { mechanism } else { 0 }, Relaxed);
+                        let before = sender.stats(make_index_key()).await.unwrap().walk;
+                        let clock = Instant::now();
+                        let mut searches = 0u64;
+                        while searches < 30
+                            && (searches < 2 || clock.elapsed() < Duration::from_millis(300))
+                        {
+                            like(&sender, &pattern_of(keyword), *limit_n, window.clone()).await;
+                            searches += 1;
+                        }
+                        let after = sender.stats(make_index_key()).await.unwrap().walk;
+                        sides[side][0] += searches;
+                        sides[side][1] += after.postings_scanned - before.postings_scanned;
+                        sides[side][2] += after.store_reads - before.store_reads;
+                        sides[side][3] += after.walk_nanos - before.walk_nanos;
+                    }
+                    WALK_OFF.store(0, Relaxed);
+                    let per = |side: usize, what: usize| {
+                        sides[side][what] as f64 / sides[side][0].max(1) as f64
+                    };
+                    println!(
+                        "AB|{state}|{label}|{shape}|{limit_n}|{name}|{:.0}|{:.0}|{:.0}|{:.0}|{:.1}|{:.1}",
+                        per(1, 1),
+                        per(0, 1),
+                        per(1, 2),
+                        per(0, 2),
+                        per(1, 3) / 1e3,
+                        per(0, 3) / 1e3,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The repair as searches see it: rows loaded shuffled, then searches kept on one place of
+    /// the order (HEAT_SHAPE: middle, newest or ascending) while the repair goes on. Each second:
+    /// the fresh rows left, and what those searches cost. Made to measure the repair's order by
+    /// where searches go, which is out for now; kept for the trace of the repair's steps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn the_repair_under_searches_kept_on_one_place() {
+        let rows: u64 =
+            std::env::var("MATRIX_ROWS").map_or(1_000_000, |rows| rows.parse().unwrap());
+        let cap: u32 = std::env::var("MATRIX_CAP")
+            .map_or(DEFAULT_SEGMENT_ROWS.get(), |cap| cap.parse().unwrap());
+        MATRIX_ROWS.store(rows, Relaxed);
+        WALK_OFF.store(OFF_TRACE_REPAIR, Relaxed);
+        let shape = std::env::var("HEAT_SHAPE").unwrap_or_else(|_| "middle".into());
+        let place = match shape.as_str() {
+            "middle" => window(None, None, Some(sort_key((rows / 2) as i64))),
+            "newest" => SearchWindow::default(),
+            "ascending" => ascending(),
+            other => panic!("HEAT_SHAPE: {other}"),
+        };
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options: capped_options(cap),
+                key_layout: test_layout(),
+            },
+            make_table(bigint_key, |id, _| Some(CqlValue::BigInt(id as i64))),
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            TEST_COMMIT_INTERVAL,
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let ids: Vec<u64> = (0..rows)
+            .map(|i| (i * 1_000_003 + 977) % rows + 1)
+            .collect();
+        let started = Instant::now();
+        if std::env::var("HEAT_STRAY").is_ok() {
+            // One row above every other, committed alone: adopted into the ordered tier, which
+            // is what the first commits of a shuffled load do now and then (see the stall of
+            // 2026-11-19 in docs/dev/pattern/postponed.md).
+            add_batch(&sender, [0], matrix_name).await;
+        }
+        let total = rows + u64::from(std::env::var("HEAT_STRAY").is_ok());
+        if std::env::var("HEAT_NO_HOLD_BOUND").is_ok() {
+            WALK_OFF.fetch_or(OFF_HOLD_BOUND, Relaxed);
+        }
+        // HEAT_MERGE_ACROSS: ordered neighbours merged whatever fresh pieces reach between them.
+        if std::env::var("HEAT_MERGE_ACROSS").is_ok() {
+            WALK_OFF.fetch_or(OFF_FRESH_BETWEEN, Relaxed);
+        }
+        for chunk in ids.chunks(100_000) {
+            add_batch(&sender, chunk.iter().copied(), matrix_name).await;
+        }
+        println!("HEAT loaded in {:.0}s", started.elapsed().as_secs_f64());
+        let started = Instant::now();
+        let mut moved = (0u64, Instant::now(), false);
+        let mut settling: Option<(usize, u32)> = None;
+        loop {
+            let before = sender.stats(make_index_key()).await.unwrap();
+            for _ in 0..20 {
+                search_ordered(&sender, "玩家", 20, place.clone()).await;
+            }
+            let after = sender.stats(make_index_key()).await.unwrap();
+            let per = |a: u64, b: u64| (a - b) as f64 / 20.0;
+            println!(
+                "HEAT|{shape}|{:.0}|{}|{}|{:.1}|{:.1}|{:.0}|phase {}|merges {}/{}/{}|segments {} fresh {} largest {}",
+                started.elapsed().as_secs_f64(),
+                after.overlap.fresh_rows,
+                after.rewrite.steps,
+                per(after.walk.segments_opened, before.walk.segments_opened),
+                per(after.walk.segments_wasted, before.walk.segments_wasted),
+                per(after.walk.walk_nanos, before.walk.walk_nanos) / 1e3,
+                REPAIR_PHASE.load(Relaxed),
+                after.merges.started,
+                after.merges.ended,
+                after.merges.running,
+                after.tantivy.segment_count,
+                after.overlap.fresh_segments,
+                after
+                    .segments
+                    .iter()
+                    .map(|segment| segment.docs)
+                    .max()
+                    .unwrap_or(0),
+            );
+            // A stall: the layout as it stands, once.
+            if moved.0 != after.overlap.fresh_rows {
+                moved = (after.overlap.fresh_rows, Instant::now(), false);
+            } else if !moved.2 && moved.1.elapsed() > Duration::from_secs(45) {
+                moved.2 = true;
+                for segment in &after.segments {
+                    println!(
+                        "HEAT stalled: segment of {} rows, {} deleted, {:x?}..{:x?}",
+                        segment.docs, segment.deleted, segment.sort_min, segment.sort_max
+                    );
+                }
+            }
+            // Repaired, and then until the merges that follow have ended: no merge running and
+            // as many segments for five seconds.
+            if after.overlap.fresh_rows == 0 && after.tantivy.num_docs == total {
+                if settling.is_none() {
+                    println!("HEAT repaired in {:.0}s", started.elapsed().as_secs_f64());
+                }
+                let segments = after.tantivy.segment_count;
+                settling = match settling {
+                    Some((count, quiet)) if count == segments && after.merges.running == 0 => {
+                        Some((count, quiet + 1))
+                    }
+                    _ => Some((segments, 0)),
+                };
+            }
+            if settling.is_some_and(|(_, quiet)| quiet >= 5)
+                || started.elapsed() > Duration::from_secs(1800)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// What the bounded lock holds of the repair are worth: rows loaded shuffled, then a writer
+    /// adding a row every 10 ms, stamped as written then, while the repair goes on. Each second:
+    /// the fresh rows left and how long the rows took to be searchable, by bucket.
+    /// MATRIX_OFF=lock_chunks repairs each part of a step under one hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn the_writes_waiting_on_a_repair() {
+        let rows: u64 =
+            std::env::var("MATRIX_ROWS").map_or(1_000_000, |rows| rows.parse().unwrap());
+        let cap: u32 = std::env::var("MATRIX_CAP")
+            .map_or(DEFAULT_SEGMENT_ROWS.get(), |cap| cap.parse().unwrap());
+        MATRIX_ROWS.store(rows, Relaxed);
+        let off = std::env::var("MATRIX_OFF").is_ok_and(|off| off == "lock_chunks");
+        WALK_OFF.store(
+            if off { OFF_LOCK_CHUNKS } else { 0 }
+                | OFF_TRACE_REPAIR
+                | if std::env::var("MATRIX_NO_HANDOVER").is_ok() {
+                    OFF_HANDOVER
+                } else {
+                    0
+                },
+            Relaxed,
+        );
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options: capped_options(cap),
+                key_layout: test_layout(),
+            },
+            make_table(bigint_key, |id, _| Some(CqlValue::BigInt(id as i64))),
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            COMMIT_INTERVAL,
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let ids: Vec<u64> = (0..rows)
+            .map(|i| (i * 1_000_003 + 977) % rows + 1)
+            .collect();
+        let started = Instant::now();
+        for chunk in ids.chunks(100_000) {
+            add_batch(&sender, chunk.iter().copied(), matrix_name).await;
+        }
+        println!("LOCK loaded in {:.0}s", started.elapsed().as_secs_f64());
+        let buckets = vec![0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 40.0];
+        let histogram = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new("lag", "lag").buckets(buckets.clone()),
+        )
+        .unwrap();
+        let writer = tokio::spawn({
+            let sender = sender.clone();
+            let histogram = histogram.clone();
+            async move {
+                let mut primary = rows;
+                loop {
+                    primary += 1;
+                    let written = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap();
+                    sender
+                        .add_document(
+                            test_partition_id(),
+                            primary.into(),
+                            matrix_name(primary),
+                            AsyncInProgress::cdc(
+                                histogram.clone(),
+                                crate::Timestamp::from_millis(written.as_millis() as u64),
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        });
+        let limit: u64 = std::env::var("MATRIX_SECS").map_or(600, |secs| secs.parse().unwrap());
+        let started = Instant::now();
+        let mut worst = 0.0f64;
+        let mut last = (0u64, 0.0f64);
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let now = (histogram.get_sample_count(), histogram.get_sample_sum());
+            let mean = (now.1 - last.1) / (now.0 - last.0).max(1) as f64;
+            worst = worst.max(mean);
+            println!(
+                "LOCK|{}|{:.0}|{}|{}|{}|{:.2}",
+                if off { "off" } else { "on" },
+                started.elapsed().as_secs_f64(),
+                stats.overlap.fresh_rows,
+                stats.rewrite.steps,
+                now.0 - last.0,
+                mean,
+            );
+            last = now;
+            if stats.overlap.fresh_rows < 400_000 || started.elapsed().as_secs() > limit {
+                break;
+            }
+        }
+        writer.abort();
+        let proto = histogram.get_sample_count();
+        println!(
+            "LOCK done in {:.0}s: {proto} rows, mean {:.2}s, worst second's mean {worst:.2}s",
+            started.elapsed().as_secs_f64(),
+            histogram.get_sample_sum() / proto.max(1) as f64,
+        );
+        use prometheus::core::Collector;
+        let family = &histogram.collect()[0];
+        for bucket in family.get_metric()[0].get_histogram().get_bucket() {
+            println!(
+                "LOCK bucket <= {}s: {}",
+                bucket.upper_bound(),
+                bucket.cumulative_count()
+            );
+        }
+    }
+
+    /// Indexing and searches sharing the workers: rows written shuffled as fast as they are
+    /// taken, stamped as written then, with MIXED_SEARCHERS (8) searches kept going. WORKER=fifo
+    /// serves the workers' tasks first come first served, as without the two classes. Reports the
+    /// rows' wait until searchable, the searches' time, and what held the repair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn indexing_and_searches_sharing_the_workers() {
+        let rows: u64 =
+            std::env::var("MATRIX_ROWS").map_or(1_000_000, |rows| rows.parse().unwrap());
+        let cap: u32 = std::env::var("MATRIX_CAP")
+            .map_or(DEFAULT_SEGMENT_ROWS.get(), |cap| cap.parse().unwrap());
+        let searchers: usize =
+            std::env::var("MIXED_SEARCHERS").map_or(8, |searchers| searchers.parse().unwrap());
+        MATRIX_ROWS.store(rows, Relaxed);
+        let fifo = std::env::var("WORKER").is_ok_and(|worker| worker == "fifo");
+        worker::FIFO.store(fifo, Relaxed);
+        let sender = new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options: capped_options(cap),
+                key_layout: test_layout(),
+            },
+            make_table(bigint_key, |id, _| Some(CqlValue::BigInt(id as i64))),
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            COMMIT_INTERVAL,
+            MAX_UNCOMMITTED_THRESHOLD,
+            None,
+        );
+        let histogram = prometheus::Histogram::with_opts(
+            prometheus::HistogramOpts::new("lag", "lag")
+                .buckets(vec![0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 40.0]),
+        )
+        .unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let times = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let mut tasks = Vec::new();
+        for _ in 0..searchers {
+            let (sender, done, times) = (sender.clone(), done.clone(), times.clone());
+            tasks.push(tokio::spawn(async move {
+                while !done.load(Relaxed) {
+                    let clock = Instant::now();
+                    search_ordered(&sender, "号玩家1", 200, SearchWindow::default()).await;
+                    times
+                        .lock()
+                        .unwrap()
+                        .push(clock.elapsed().as_micros() as u32);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }));
+        }
+        let started = Instant::now();
+        let limit: u64 = std::env::var("MATRIX_SECS").map_or(900, |secs| secs.parse().unwrap());
+        let mut rows = rows;
+        let total = rows;
+        for i in 0..total {
+            if i % 100_000 == 0 {
+                println!(
+                    "MIXED sent {i} rows in {:.0}s, {} searches",
+                    started.elapsed().as_secs_f64(),
+                    times.lock().unwrap().len()
+                );
+                if started.elapsed().as_secs() > limit {
+                    rows = i;
+                    break;
+                }
+            }
+            let primary = (i * 1_000_003 + 977) % total + 1;
+            let written = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            sender
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    matrix_name(primary),
+                    AsyncInProgress::cdc(
+                        histogram.clone(),
+                        crate::Timestamp::from_millis(written.as_millis() as u64),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let sent = started.elapsed().as_secs_f64();
+        while histogram.get_sample_count() < rows && started.elapsed().as_secs() < 1800 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let indexed = started.elapsed().as_secs_f64();
+        let stats = sender.stats(make_index_key()).await.unwrap();
+        done.store(true, Relaxed);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let mut times = std::mem::take(&mut *times.lock().unwrap());
+        times.sort_unstable();
+        let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+        let gate: Vec<u64> = GATE_TICKS.iter().map(|ticks| ticks.load(Relaxed)).collect();
+        println!(
+            "MIXED|{}|{rows}|{searchers}|sent {sent:.0}s|indexed {indexed:.0}s|wait mean {:.2}s|searches {}|p50 {}|p90 {}|p99 {}|max {} us|fresh {}|steps {}|ticks pending {} lagging {} contended {} held by contended alone {}",
+            if fifo { "fifo" } else { "classes" },
+            histogram.get_sample_sum() / histogram.get_sample_count().max(1) as f64,
+            times.len(),
+            at(0.5),
+            at(0.9),
+            at(0.99),
+            at(1.0),
+            stats.overlap.fresh_rows,
+            stats.rewrite.steps,
+            gate[0],
+            gate[1],
+            gate[2],
+            gate[3],
+        );
+        use prometheus::core::Collector;
+        for bucket in histogram.collect()[0].get_metric()[0]
+            .get_histogram()
+            .get_bucket()
+        {
+            println!(
+                "MIXED bucket <= {}s: {}",
+                bucket.upper_bound(),
+                bucket.cumulative_count()
+            );
         }
     }
 

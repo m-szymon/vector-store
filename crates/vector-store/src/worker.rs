@@ -262,6 +262,9 @@ struct Queued {
     enqueued: Instant,
 }
 
+#[cfg(test)]
+pub(crate) static FIFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct Queues {
     by_class: [VecDeque<Queued>; 2],
     recent: RecentBusy,
@@ -276,6 +279,17 @@ impl Queues {
         let search_waiting = !self.by_class[TaskClass::Search.index()].is_empty();
         let share = self.recent.search_share(now);
         let class = pick_class(search_waiting, oldest_indexing_wait, share, scheduling)?;
+        // A benchmark test's switch: one queue, first come first served, as without classes.
+        #[cfg(test)]
+        let class = if FIFO.load(Ordering::Relaxed) {
+            TaskClass::ALL
+                .into_iter()
+                .filter_map(|class| Some((self.by_class[class.index()].front()?.enqueued, class)))
+                .min_by_key(|&(enqueued, _)| enqueued)?
+                .1
+        } else {
+            class
+        };
         let queued = self.by_class[class.index()].pop_front()?;
         STATS.queued[class.index()].fetch_sub(1, Ordering::Relaxed);
         Some((queued, class))
