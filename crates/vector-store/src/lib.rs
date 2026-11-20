@@ -819,6 +819,37 @@ fn split_order_items(s: &str) -> anyhow::Result<Vec<(String, bool, Option<bool>)
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From)]
+/// How many of a keyword's grams a pattern index intersects for a keyword past `max_gram`, the
+/// ones with the fewest documents in each segment first, or none for all of them: the
+/// `rarest_grams` option, `'0'` for all, [`DEFAULT_RAREST_GRAMS`] when absent. The verification
+/// drops whatever the grams left out would have, so fewer grams open fewer posting lists and read
+/// more candidates from the store; a keyword with no more grams than this is intersected whole.
+pub struct RarestGrams(Option<NonZeroUsize>);
+
+/// The `rarest_grams` of a pattern index that does not set it: at 10M rows on AWS (run a7be7f76,
+/// `docs/dev/pattern/stage-2-ordering.md`) 4 grams took 8, 16 and 32 characters up 22-94% against
+/// all of them, with no phase slower and the index the same size.
+pub const DEFAULT_RAREST_GRAMS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
+impl Default for RarestGrams {
+    fn default() -> Self {
+        Self(Some(DEFAULT_RAREST_GRAMS))
+    }
+}
+
+impl FromStr for RarestGrams {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let grams: usize = s
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("rarest_grams must be a non-negative integer: {e}"))?;
+        Ok(Self(NonZeroUsize::new(grams)))
+    }
+}
+
 #[derive(Clone, Copy, derive_more::AsRef, derive_more::Display, derive_more::From)]
 /// Limit the number of search result
 pub struct Limit(NonZeroUsize);
@@ -942,6 +973,9 @@ pub struct IndexOptionsPattern {
     pub case_sensitive: CaseSensitive,
     /// What the index answers in: table order, no order, or the declared columns.
     pub order_by: OrderBy,
+    /// How many of a long keyword's rarest grams are intersected; none for all. The
+    /// `rarest_grams` option.
+    pub rarest_grams: RarestGrams,
 }
 
 impl IndexOptionsPattern {
@@ -1475,6 +1509,7 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            rarest_grams: RarestGrams::default(),
         };
         assert_eq!(inverted.validated(), IndexOptionsPattern::default());
 
@@ -1485,6 +1520,7 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: "registered_at".parse().unwrap(),
+            rarest_grams: RarestGrams::default(),
         };
         assert_eq!(
             inverted_ordered.validated(),
@@ -1499,6 +1535,7 @@ mod tests {
             max_gram: "2".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            rarest_grams: RarestGrams::default(),
         };
         assert_eq!(valid.clone().validated(), valid);
     }

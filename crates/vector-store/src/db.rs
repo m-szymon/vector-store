@@ -33,6 +33,7 @@ use crate::NonemptyIteratorExt;
 use crate::OrderBy;
 use crate::Positions;
 use crate::Quantization;
+use crate::RarestGrams;
 use crate::SpaceType;
 use crate::TableName;
 use crate::cql_types;
@@ -614,11 +615,13 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
             OrderBy::Invalid(value.as_str().into())
         })
     });
+    let rarest_grams: RarestGrams = parse_index_option(options, "rarest_grams");
     IndexOptionsPattern {
         min_gram,
         max_gram,
         case_sensitive,
         order_by,
+        rarest_grams,
     }
     .validated()
 }
@@ -1701,6 +1704,20 @@ pub(crate) mod tests {
             options(&[("order_by", "a b")]).order_by,
             OrderBy::Invalid(_)
         ));
+
+        // A long keyword intersects its 4 rarest grams unless `rarest_grams` says how many; '0' is
+        // all of them.
+        assert_eq!(
+            *table_order.rarest_grams.as_ref(),
+            Some(crate::DEFAULT_RAREST_GRAMS)
+        );
+        let rarest = options(&[("rarest_grams", "2")]);
+        assert_eq!(
+            rarest.rarest_grams.as_ref().map(|grams| grams.get()),
+            Some(2)
+        );
+        let all = options(&[("rarest_grams", "0")]);
+        assert_eq!(*all.rarest_grams.as_ref(), None);
     }
 
     #[test]

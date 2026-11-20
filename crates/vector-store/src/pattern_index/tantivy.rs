@@ -421,6 +421,10 @@ impl PatternBackend {
     fn max_gram(&self) -> usize {
         self.options.max_gram.as_ref().get()
     }
+
+    fn rarest_grams(&self) -> Option<usize> {
+        self.options.rarest_grams.as_ref().map(|grams| grams.get())
+    }
 }
 
 /// What a row contributes to a pattern index: the text to index, and for an index that keeps an
@@ -1038,6 +1042,7 @@ fn handle_like(
         &pattern,
         backend.min_gram(),
         backend.max_gram(),
+        backend.rarest_grams(),
     )?;
     let limit: usize = (*limit.as_ref()).into();
     let partition_id = find_partition_id(table.read().unwrap().deref(), index_key)?;
@@ -1230,6 +1235,7 @@ mod tests {
     use crate::OrderBy;
     use crate::PrimaryKey;
     use crate::QueryError;
+    use crate::RarestGrams;
     use crate::memory::Allocate;
     use crate::table::IndexIdGenerator;
     use crate::table::MockTableSearch;
@@ -1283,6 +1289,7 @@ mod tests {
             // The matching tests run in table order and sort what they get; the order has tests
             // of its own.
             order_by: OrderBy::Table,
+            rarest_grams: RarestGrams::default(),
         }
     }
 
@@ -1611,6 +1618,50 @@ mod tests {
 
         // "aaaa" has one distinct gram, so its intersection has one member.
         assert_eq!(search(&sender, "aaaa").await, vec![2, 3]);
+    }
+
+    /// Intersecting only the rarest grams lets more candidates through, and the verification drops
+    /// them again: the matches are those of the whole intersection, in table order or by a column.
+    #[rstest]
+    #[case::one_table(1, false)]
+    #[case::two_table(2, false)]
+    #[case::one_ordered(1, true)]
+    #[case::two_ordered(2, true)]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn rarest_grams_return_the_matches_of_all_grams(
+        #[case] rarest: usize,
+        #[case] ordered: bool,
+    ) {
+        let sender = make_sender_with_options(IndexOptionsPattern {
+            rarest_grams: rarest.to_string().parse().unwrap(),
+            order_by: if ordered {
+                "sort_col".parse().unwrap()
+            } else {
+                OrderBy::default()
+            },
+            ..options(1, 3, true)
+        });
+        // Every decoy holds some of the grams of "abcde", the first one all of them.
+        let docs = [
+            (1, "abcd cde"),
+            (2, "abcde"),
+            (3, "xbcdex"),
+            (4, "zzabcdezz"),
+            (5, "cdeab"),
+            (6, "abc bcd"),
+        ];
+        add_docs(&sender, &docs).await;
+
+        let mut ids = if ordered {
+            search_ordered(&sender, "abcde", 10, SearchWindow::default())
+                .await
+                .0
+        } else {
+            search(&sender, "abcde").await
+        };
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 4]);
     }
 
     #[rstest]

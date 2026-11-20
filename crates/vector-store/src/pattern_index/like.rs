@@ -52,22 +52,30 @@ enum Candidates {
 /// and open a field-norm reader an unscored walk never reads. Measured on the 10M-name corpus
 /// (`benches/pattern_probe.rs`), that second pass was a third of the walk for 8 to 32
 /// characters.
+///
+/// With `rarest`, only that many of the grams found, those with the fewest documents in the
+/// segment, are intersected: the verification drops what the others would have. A long pattern's
+/// grams are mostly common ones, and each costs a posting list opened and walked; a few rare ones
+/// narrow the candidates nearly as far (`benches/pattern_probe.rs`: at 16 characters, 4 of the
+/// pattern's 14 grams took the walk to a quarter, with the same matches).
 struct GramProbe {
     terms: Vec<Term>,
     field: Field,
     found: Vec<TermInfo>,
     /// The segment `found` is of.
     opened: Option<SegmentId>,
+    rarest: Option<usize>,
 }
 
 impl GramProbe {
-    fn new(terms: Vec<Term>, field: Field) -> Self {
+    fn new(terms: Vec<Term>, field: Field, rarest: Option<usize>) -> Self {
         let found = Vec::with_capacity(terms.len());
         Self {
             terms,
             field,
             found,
             opened: None,
+            rarest,
         }
     }
 
@@ -88,6 +96,14 @@ impl GramProbe {
                     return Ok(None);
                 };
                 self.found.push(info);
+            }
+            // Fewer grams than the pattern has cannot prove a match, and need not: a pattern
+            // with more than one gram is always verified.
+            if let Some(rarest) = self.rarest
+                && rarest < self.found.len()
+            {
+                self.found.sort_unstable_by_key(|info| info.doc_freq);
+                self.found.truncate(rarest);
             }
             self.opened = Some(segment.segment_id());
         }
@@ -116,13 +132,15 @@ pub(super) struct LikeQuery {
 impl LikeQuery {
     /// `min_gram` and `max_gram` are the lengths of the grams the index keeps. A pattern whose
     /// literal characters all stand in runs shorter than `min_gram` has no gram to look up, and
-    /// is a [`QueryError`].
+    /// is a [`QueryError`]. With `rarest_grams`, only that many of the pattern's grams are
+    /// intersected in a segment, the rarest there.
     pub(super) fn new(
         schema: &Schema,
         field: Field,
         pattern: &str,
         min_gram: usize,
         max_gram: usize,
+        rarest_grams: Option<usize>,
     ) -> anyhow::Result<Self> {
         let framed = gram::framed_pattern(&parse(pattern));
         let grams = gram::grams(&framed, min_gram, max_gram);
@@ -132,7 +150,7 @@ impl LikeQuery {
                 .iter()
                 .map(|gram| Term::from_field_text(field, gram))
                 .collect();
-            Candidates::Grams(GramProbe::new(terms, field))
+            Candidates::Grams(GramProbe::new(terms, field, rarest_grams))
         } else if framed
             .iter()
             .any(|token| matches!(token, Token::Literal(_)))
