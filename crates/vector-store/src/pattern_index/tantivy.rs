@@ -884,7 +884,7 @@ type OrderedPage = (Vec<PrimaryId>, Option<Cursor>);
 
 fn collect_matches_ordered(
     state: &PatternIndexState,
-    like: &LikeQuery,
+    like: &mut LikeQuery,
     limit: usize,
     window: SortWindow,
     key_of: &dyn Fn(PrimaryId) -> Option<PrimaryKey>,
@@ -929,7 +929,9 @@ fn collect_matches_ordered(
             // ending exactly at the weakest layout key may still hold a row above it.)
             break;
         }
-        let scorer = like.candidates(segment)?;
+        let Some(scorer) = like.candidates(segment)? else {
+            continue;
+        };
         tally.segments_opened += 1;
         candidates.clear();
         let mut walk = RegionWalk {
@@ -1030,7 +1032,7 @@ fn handle_like(
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let pattern = state.backend().options.case_sensitive.fold(pattern);
     let backend = state.backend();
-    let like = LikeQuery::new(
+    let mut like = LikeQuery::new(
         &state.schema,
         text_field,
         &pattern,
@@ -1065,7 +1067,7 @@ fn handle_like(
         let key_of =
             |primary_id: PrimaryId| table.read().unwrap().primary_key(partition_id, primary_id);
         let sort_window = SortWindow::new(forward, window.cursor, min_first, max_first);
-        collect_matches_ordered(state, &like, limit, sort_window, &key_of)?
+        collect_matches_ordered(state, &mut like, limit, sort_window, &key_of)?
     };
 
     let table = table.read().unwrap();
@@ -1939,6 +1941,22 @@ mod tests {
         let (ids, cursor) = search_ordered(&sender, "将军", 3, SearchWindow::default()).await;
         assert_eq!(ids, vec![3, 2, 1]);
         assert!(cursor.is_some(), "a filled page leaves a cursor");
+    }
+
+    /// A segment that lacks one of the pattern's grams is not opened.
+    #[rstest]
+    #[timeout(Duration::from_secs(10))]
+    #[tokio::test]
+    async fn a_segment_without_one_of_the_grams_is_not_opened() {
+        let sender = make_sender();
+        add_docs(&sender, NICKNAMES).await;
+
+        // Every value holds 将 or 军 or 宫, none holds the three-character gram.
+        assert!(like_ids(&sender, "%将宫军%").await.is_empty());
+
+        let walk = sender.stats(make_index_key()).await.unwrap().walk;
+        assert!(walk.segments_considered >= 1, "{walk:?}");
+        assert_eq!(walk.segments_opened, 0, "{walk:?}");
     }
 
     /// No match at all is not a page to resume either.
