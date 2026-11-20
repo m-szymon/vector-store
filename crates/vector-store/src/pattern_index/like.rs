@@ -126,7 +126,7 @@ impl GramProbe {
 pub(super) struct LikeQuery {
     field: Field,
     candidates: Candidates,
-    regex_matcher: Option<Regex>,
+    matcher: Option<Matcher>,
 }
 
 impl LikeQuery {
@@ -144,7 +144,7 @@ impl LikeQuery {
     ) -> anyhow::Result<Self> {
         let framed = gram::framed_pattern(&parse(pattern));
         let grams = gram::grams(&framed, min_gram, max_gram);
-        let regex_matcher = matcher_unless_grams_prove_match(&framed, min_gram, max_gram)?;
+        let matcher = matcher_unless_grams_prove_match(&framed, min_gram, max_gram)?;
         let candidates = if !grams.is_empty() {
             let terms = grams
                 .iter()
@@ -171,14 +171,14 @@ impl LikeQuery {
         Ok(Self {
             field,
             candidates,
-            regex_matcher,
+            matcher,
         })
     }
 
     /// Whether a document that holds every gram may still not match, so that its stored value
     /// has to be checked (`value_matches`).
     pub(super) fn needs_verification(&self) -> bool {
-        self.regex_matcher.is_some()
+        self.matcher.is_some()
     }
 
     /// The documents of `segment` that hold every gram of the pattern, in doc id order, the
@@ -216,7 +216,7 @@ impl LikeQuery {
     /// Whether the stored value of a candidate matches the pattern. No value is read when the
     /// grams already prove the match.
     pub(super) fn value_matches(&self, store: &StoreReader, doc_id: DocId) -> anyhow::Result<bool> {
-        let Some(regex) = &self.regex_matcher else {
+        let Some(matcher) = &self.matcher else {
             return Ok(true);
         };
         let doc: TantivyDocument = store
@@ -226,7 +226,7 @@ impl LikeQuery {
             .get_first(self.field)
             .and_then(|value| value.as_str())
             .and_then(gram::unframed)
-            .is_some_and(|value| regex.is_match(value)))
+            .is_some_and(|value| matcher.is_match(value)))
     }
 }
 
@@ -246,21 +246,73 @@ fn parse(pattern: &str) -> Vec<Token> {
     tokens
 }
 
-/// The regex that checks the stored value, or `None` when holding every gram already proves a
-/// match, so no value has to be read.
+/// How a stored value is checked against the pattern.
+enum Matcher {
+    /// One run of literal characters, tied to the start of the value, to its end, to both or to
+    /// neither: compared as text. This is what most patterns are, and a regex costs them tens of
+    /// microseconds a query to compile and to warm up, where a page's worth of comparisons costs
+    /// a few (2M rows, a page of 20: 97 us a query against 42).
+    Literal {
+        literal: String,
+        at_start: bool,
+        at_end: bool,
+    },
+    Regex(Regex),
+}
+
+impl Matcher {
+    fn new(framed: &[Token]) -> anyhow::Result<Self> {
+        // A framed pattern starts with the start mark or `%`, and ends with the end mark or `%`.
+        if let [first, run @ .., last] = framed
+            && let Some(literal) = run
+                .iter()
+                .map(|token| match token {
+                    Token::Literal(literal) => Some(*literal),
+                    _ => None,
+                })
+                .collect::<Option<String>>()
+        {
+            return Ok(Self::Literal {
+                literal,
+                at_start: *first == Token::ValueStart,
+                at_end: *last == Token::ValueEnd,
+            });
+        }
+        regex(framed).map(Self::Regex)
+    }
+
+    fn is_match(&self, value: &str) -> bool {
+        match self {
+            Self::Literal {
+                literal,
+                at_start,
+                at_end,
+            } => match (at_start, at_end) {
+                (true, true) => value == literal,
+                (true, false) => value.starts_with(literal.as_str()),
+                (false, true) => value.ends_with(literal.as_str()),
+                (false, false) => value.contains(literal.as_str()),
+            },
+            Self::Regex(regex) => regex.is_match(value),
+        }
+    }
+}
+
+/// What checks the stored value, or `None` when holding every gram already proves a match, so
+/// no value has to be read.
 fn matcher_unless_grams_prove_match(
     framed: &[Token],
     min_gram: usize,
     max_gram: usize,
-) -> anyhow::Result<Option<Regex>> {
+) -> anyhow::Result<Option<Matcher>> {
     if gram::grams_prove_match(framed, min_gram, max_gram) {
         return Ok(None);
     }
-    matcher(framed).map(Some)
+    Matcher::new(framed).map(Some)
 }
 
 /// A regex matching a value that matches the pattern.
-fn matcher(framed: &[Token]) -> anyhow::Result<Regex> {
+fn regex(framed: &[Token]) -> anyhow::Result<Regex> {
     let body: String = framed
         .iter()
         .map(|token| match token {
@@ -280,10 +332,31 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    /// What the matcher of `pattern` says of `value`, which the regex of the pattern has to say
+    /// too, whichever of the two the matcher is.
     fn like(pattern: &str, value: &str) -> bool {
-        matcher(&gram::framed_pattern(&parse(pattern)))
-            .unwrap()
-            .is_match(value)
+        let framed = gram::framed_pattern(&parse(pattern));
+        let matches = Matcher::new(&framed).unwrap().is_match(value);
+        assert_eq!(regex(&framed).unwrap().is_match(value), matches);
+        matches
+    }
+
+    #[rstest]
+    #[case::whole("abc", true)]
+    #[case::prefix("abc%", true)]
+    #[case::suffix("%abc", true)]
+    #[case::infix("%abc%", true)]
+    #[case::escaped(r"%a\%b%", true)]
+    #[case::empty("", true)]
+    #[case::any_char("a_c", false)]
+    #[case::inner_any_seq("a%c", false)]
+    #[case::any_chars_only("%_%", false)]
+    fn one_literal_run_is_checked_without_a_regex(#[case] pattern: &str, #[case] literal: bool) {
+        let framed = gram::framed_pattern(&parse(pattern));
+        assert_eq!(
+            matches!(Matcher::new(&framed).unwrap(), Matcher::Literal { .. }),
+            literal
+        );
     }
 
     /// The rules of ScyllaDB's LIKE.
@@ -324,7 +397,7 @@ mod tests {
     #[case::any_char_matches_a_newline("a_z", "a\nz", true)]
     #[case::any_char_is_a_code_point_not_a_byte("a_c", "a€c", true)]
     #[case::cjk_any_char_is_one_code_point("__将军", "宇将军", false)]
-    fn regex_matcher_matches_like_scylladb(
+    fn matcher_matches_like_scylladb(
         #[case] pattern: &str,
         #[case] value: &str,
         #[case] expected: bool,
