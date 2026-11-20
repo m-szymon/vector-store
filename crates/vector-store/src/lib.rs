@@ -65,6 +65,7 @@ pub use crate::nonempty::NonemptyArc;
 pub use crate::nonempty::NonemptyBox;
 pub use crate::nonempty::NonemptyIteratorExt;
 pub use crate::partition_key::PartitionKey;
+pub use crate::pattern_index::KeyLayout;
 pub use crate::primary_key::PrimaryKey;
 pub use crate::similarity::SimilarityScore;
 pub use crate::table::PartitionId;
@@ -755,7 +756,7 @@ pub struct IndexOptionsFts {
     pub positions: Positions,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 /// Pattern-specific index configuration.
 pub struct IndexOptionsPattern {
     pub case_sensitive: CaseSensitive,
@@ -1025,7 +1026,8 @@ pub async fn run(
     let indexes = Arc::new(RwLock::new(Indexes::new()));
     let fts_index_factory =
         fts_index::new_fts_index_factory_tantivy(worker.clone(), memory.clone());
-    let pattern_index_factory = pattern_index::new_factory_tantivy(worker, memory);
+    let pattern_index_factory =
+        pattern_index::new_factory_tantivy(worker, memory, Arc::clone(&metrics));
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {

@@ -597,6 +597,12 @@ async fn process<T: DbDriver>(
     }
 }
 
+/// The options of a pattern index.
+fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPattern {
+    let case_sensitive: CaseSensitive = parse_index_option(options, "case_sensitive");
+    IndexOptionsPattern { case_sensitive }
+}
+
 /// Parses a single value of an index `options` map, falling back to its default
 /// when the option is absent or carries an unsupported value.
 fn parse_index_option<T: FromStr + Default>(options: &BTreeMap<String, String>, name: &str) -> T {
@@ -1058,10 +1064,7 @@ impl<T: DbDriver> Statements<T> {
         index: IndexName,
     ) -> GetPatternIndexParamsR {
         let options = self.get_index_options(keyspace, table, index).await?;
-        Ok(options.map(|options| {
-            let case_sensitive: CaseSensitive = parse_index_option(&options, "case_sensitive");
-            IndexOptionsPattern { case_sensitive }
-        }))
+        Ok(options.as_ref().map(pattern_index_options))
     }
 
     async fn is_valid_index(&self, metadata: IndexMetadata) -> IsValidIndexR {
@@ -1770,6 +1773,16 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("not a text column")
         );
+    }
+
+    #[test]
+    fn validate_pattern_accepts_text_and_ascii_columns() {
+        for col_type in [
+            ColumnType::Native(NativeType::Text),
+            ColumnType::Native(NativeType::Ascii),
+        ] {
+            assert!(validate_column_type_for_kind("name", &col_type, DbIndexKind::Pattern).is_ok());
+        }
     }
 
     #[test]

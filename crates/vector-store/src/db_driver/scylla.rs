@@ -45,6 +45,7 @@ use scylla_cdc::log_reader::CDCLogReader;
 use scylla_cdc::log_reader::CDCLogReaderBuilder;
 use secrecy::ExposeSecret;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tap::Pipe;
@@ -376,11 +377,7 @@ impl DbDriver for ScyllaDriver {
         let query = range_scan_query(
             &keyspace_identifier,
             &table_identifier,
-            index
-                .target_columns
-                .iter()
-                .chain(index.nonpk_partition_key_columns().into_iter().flatten())
-                .chain(index.nonpk_filtering_columns()),
+            read_columns(index),
             &st_primary_key_list,
             &st_partition_key_list,
         );
@@ -456,11 +453,7 @@ impl DbDriver for ScyllaDriver {
         let query = request_query(
             &keyspace_identifier,
             &table_identifier,
-            index
-                .target_columns
-                .iter()
-                .chain(index.nonpk_partition_key_columns().into_iter().flatten())
-                .chain(index.nonpk_filtering_columns()),
+            read_columns(index),
             index.primary_key_columns.iter(),
         );
         Ok(session
@@ -549,6 +542,44 @@ impl DbDriver for ScyllaDriver {
 
     fn clustering_key(&self, table: &Self::Table) -> impl Iterator<Item = ColumnName> {
         table.clustering_key.iter().map(ColumnName::from)
+    }
+
+    fn uses_murmur3(&self, table: &Self::Table) -> bool {
+        // A table that names no partitioner of its own uses the cluster's, which ScyllaDB fixes
+        // to Murmur3 unless deprecated partitioners are enabled.
+        table
+            .partitioner
+            .as_deref()
+            .is_none_or(|name| name.ends_with("Murmur3Partitioner"))
+    }
+
+    async fn clustering_order(
+        &self,
+        session: &Self::Session,
+        keyspace: &KeyspaceName,
+        table: &TableName,
+    ) -> anyhow::Result<HashMap<ColumnName, bool>> {
+        const QUERY: &str = "
+            SELECT column_name, clustering_order
+            FROM system_schema.columns
+            WHERE keyspace_name = ? AND table_name = ?
+        ";
+        let rows = session
+            .query_unpaged(QUERY, (keyspace.as_ref(), table.as_ref()))
+            .await
+            .context(format!("query: {QUERY}"))?
+            .into_rows_result()?;
+        let mut order = HashMap::new();
+        for row in rows.rows::<(String, String)>()? {
+            let (column, clustering_order) = row?;
+            if clustering_order != "none" {
+                order.insert(
+                    ColumnName::from(column),
+                    clustering_order.eq_ignore_ascii_case("desc"),
+                );
+            }
+        }
+        Ok(order)
     }
 
     fn columns<'a>(
@@ -692,6 +723,17 @@ fn build_columns_list<'a>(
 ///
 /// For CQL-native tables, selects the vector column directly.
 /// For Alternator tables, selects from the `:attrs` map column.
+/// The columns the full scan and the read of one row select besides the primary key, in the order
+/// the consumer reads them: the target, the partition key columns it does not otherwise get, then
+/// the filtering columns and a pattern index's sort column (`IndexMetadata::ingested_value_columns`).
+fn read_columns(index: &IndexMetadata) -> impl Iterator<Item = &ColumnName> {
+    index
+        .target_columns
+        .iter()
+        .chain(index.nonpk_partition_key_columns().into_iter().flatten())
+        .chain(index.nonpk_filtering_columns())
+}
+
 pub(crate) fn range_scan_query<'a>(
     keyspace: &KeyspaceIdentifier,
     table: &TableIdentifier,

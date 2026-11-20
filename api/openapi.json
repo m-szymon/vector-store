@@ -467,7 +467,7 @@
         "tags": [
           "scylla-vector-store-index"
         ],
-        "description": "Performs a LIKE 'pattern' search query against the specified index. Returns primary keys of the documents matched to the provided pattern. The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, '\\' is the escape character, and matching is case-sensitive unless the index was created with 'case_sensitive' set to false. The maximum number of results is controlled by the optional 'limit' parameter in the payload. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
+        "description": "Performs a LIKE 'pattern' search query against the specified index. Returns primary keys of the documents matched to the provided pattern. The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, '\\' is the escape character, and matching is case-sensitive unless the index was created with 'case_sensitive' set to false. The rows come in table order (by token, then partition key, then clustering key), a page at a time: the optional 'limit' parameter in the payload is the size of a page, and a response that filled its page carries 'next_cursor', which the next request passes back as 'cursor' to read the following page. If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
         "operationId": "post_index_like",
         "parameters": [
           {
@@ -1435,8 +1435,16 @@
           "pattern"
         ],
         "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Resume a search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's place in the index's order and its primary key)."
+          },
           "limit": {
-            "$ref": "#/components/schemas/Limit"
+            "$ref": "#/components/schemas/Limit",
+            "description": "The maximum number of primary keys to return: the size of a page."
           },
           "pattern": {
             "type": "string",
@@ -1451,8 +1459,16 @@
           "primary_keys"
         ],
         "properties": {
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as the next request's `cursor`, unchanged, to read the following page. Absent when this page exhausted the matches."
+          },
           "primary_keys": {
             "type": "object",
+            "description": "Primary keys of the matching rows, one array of values per primary key column, in table order.",
             "additionalProperties": {
               "type": "array",
               "items": {}

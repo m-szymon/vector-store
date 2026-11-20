@@ -162,12 +162,12 @@ impl IndexDispatch for mpsc::Sender<FtsIndex> {
 impl IndexDispatch for mpsc::Sender<PatternIndex> {
     async fn add_document(
         &self,
-        _partition_id: PartitionId,
+        partition_id: PartitionId,
         primary_id: PrimaryId,
         document: String,
         in_progress: AsyncInProgress,
     ) -> IndexStatus {
-        PatternIndexExt::add_document(self, primary_id, document, in_progress)
+        PatternIndexExt::add_document(self, partition_id, primary_id, document, in_progress)
             .await
             .into()
     }

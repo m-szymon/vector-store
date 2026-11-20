@@ -264,12 +264,61 @@ async fn pattern_like_search_returns_matching_keys() {
             &index_name,
             "%fox%".into(),
             NonZeroUsize::new(10).unwrap().into(),
+            None,
         )
         .await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let response: PostIndexLikeResponse = response.json().await.unwrap();
     assert_eq!(response.primary_keys.get(&"pk".into()).unwrap(), &[1]);
+}
+
+#[tokio::test]
+async fn pattern_like_search_pages_through_the_matches_in_one_order() {
+    crate::enable_tracing();
+
+    let (client, keyspace_name, index_name, _db, _hold) = setup_pattern_and_wait(
+        [
+            (vec![CqlValue::Int(1)], "a fox", 10),
+            (vec![CqlValue::Int(2)], "lazy dog", 20),
+            (vec![CqlValue::Int(3)], "fox trot", 30),
+            (vec![CqlValue::Int(4)], "the fox den", 40),
+            (vec![CqlValue::Int(5)], "foxes", 50),
+            (vec![CqlValue::Int(6)], "outfox", 60),
+        ],
+        6,
+        IndexOptionsPattern::default(),
+    )
+    .await;
+    let page_of = |limit: usize, cursor: Option<String>| {
+        client.like_page(
+            &keyspace_name,
+            &index_name,
+            "%fox%".into(),
+            NonZeroUsize::new(limit).unwrap().into(),
+            cursor,
+        )
+    };
+
+    let whole = page_of(10, None).await;
+    let whole_keys = whole.primary_keys.get(&"pk".into()).unwrap().clone();
+    assert_eq!(whole_keys.len(), 5);
+    // A page that is not full ends the search.
+    assert_eq!(whole.next_cursor, None);
+
+    let mut paged_keys = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = page_of(2, cursor).await;
+        paged_keys.extend(page.primary_keys.get(&"pk".into()).unwrap().clone());
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    // The pages follow one another in the order of the whole, each row once.
+    assert_eq!(paged_keys, whole_keys);
 }
 
 #[tokio::test]
@@ -294,6 +343,7 @@ async fn pattern_like_search_ignores_letter_case_when_not_case_sensitive() {
             &index_name,
             "%FOX%".into(),
             NonZeroUsize::new(10).unwrap().into(),
+            None,
         )
         .await;
 
@@ -351,6 +401,7 @@ async fn pattern_back_to_back_updates_keep_one_latest_document_per_row() {
                 &index_name,
                 pattern,
                 NonZeroUsize::new(10).unwrap().into(),
+                None,
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);

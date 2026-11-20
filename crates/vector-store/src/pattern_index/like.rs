@@ -10,19 +10,17 @@
 use super::gram;
 use super::gram::Token;
 use anyhow::anyhow;
-use itertools::Either;
 use regex::Regex;
 use std::collections::BTreeSet;
 use tantivy::DocId;
-use tantivy::DocSet;
 use tantivy::SegmentReader;
-use tantivy::TERMINATED;
 use tantivy::TantivyDocument;
 use tantivy::Term;
 use tantivy::query::AllQuery;
 use tantivy::query::BooleanQuery;
 use tantivy::query::EnableScoring;
 use tantivy::query::Query;
+use tantivy::query::Scorer;
 use tantivy::query::TermQuery;
 use tantivy::query::Weight;
 use tantivy::schema::Field;
@@ -43,7 +41,8 @@ impl LikeQuery {
     pub(super) fn new(schema: &Schema, field: Field, pattern: &str) -> anyhow::Result<Self> {
         let framed = gram::framed_pattern(&parse(pattern));
         let regex_matcher = matcher_unless_grams_prove_match(&framed)?;
-        // Scoring is off, as LIKE results have no order, so the weight needs only the schema.
+        // Scoring is off, as LIKE results are not ordered by a score, so the weight needs only the
+        // schema.
         let weight = all_grams_query(field, gram::grams(&framed))
             .weight(EnableScoring::disabled_from_schema(schema))
             .map_err(|e| anyhow!("pattern: failed to build the query: {e}"))?;
@@ -54,50 +53,26 @@ impl LikeQuery {
         })
     }
 
-    /// The doc ids of the live documents of `segment` whose value matches the pattern, in order.
-    pub(super) fn matching_docs(
-        &self,
-        segment: &SegmentReader,
-    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<DocId>>> {
-        // Candidates are read in doc id order, so one cached block of the store is enough.
-        const STORE_CACHE_BLOCKS: usize = 1;
-
-        let live_candidates = self
-            .candidates(segment)?
-            .filter(|&doc_id| !segment.is_deleted(doc_id));
-        // No regex means the grams already prove the match, so no value is read.
-        let Some(regex) = &self.regex_matcher else {
-            return Ok(Either::Left(live_candidates.map(Ok)));
-        };
-        let store = segment
-            .get_store_reader(STORE_CACHE_BLOCKS)
-            .map_err(|e| anyhow!("pattern: failed to open the document store: {e}"))?;
-        Ok(Either::Right(live_candidates.filter_map(move |doc_id| {
-            self.value_matches(&store, regex, doc_id)
-                .map(|matches| matches.then_some(doc_id))
-                .transpose()
-        })))
+    /// Whether a document that holds every gram may still not match, so that its stored value
+    /// has to be checked (`value_matches`).
+    pub(super) fn needs_verification(&self) -> bool {
+        self.regex_matcher.is_some()
     }
 
-    /// The doc ids of the documents of `segment` that hold every gram of the pattern, in order.
-    fn candidates(&self, segment: &SegmentReader) -> anyhow::Result<impl Iterator<Item = DocId>> {
-        let mut scorer = self
-            .weight
+    /// The documents of `segment` that hold every gram of the pattern, in doc id order, the
+    /// deleted ones among them.
+    pub(super) fn candidates(&self, segment: &SegmentReader) -> anyhow::Result<Box<dyn Scorer>> {
+        self.weight
             .scorer(segment, 1.0)
-            .map_err(|e| anyhow!("pattern: failed to run the query: {e}"))?;
-        let first = scorer.doc();
-        Ok(
-            std::iter::successors(Some(first), move |_| Some(scorer.advance()))
-                .take_while(|&doc_id| doc_id != TERMINATED),
-        )
+            .map_err(|e| anyhow!("pattern: failed to run the query: {e}"))
     }
 
-    fn value_matches(
-        &self,
-        store: &StoreReader,
-        regex: &Regex,
-        doc_id: DocId,
-    ) -> anyhow::Result<bool> {
+    /// Whether the stored value of a candidate matches the pattern. No value is read when the
+    /// grams already prove the match.
+    pub(super) fn value_matches(&self, store: &StoreReader, doc_id: DocId) -> anyhow::Result<bool> {
+        let Some(regex) = &self.regex_matcher else {
+            return Ok(true);
+        };
         let doc: TantivyDocument = store
             .get(doc_id)
             .map_err(|e| anyhow!("pattern: failed to read the document: {e}"))?;

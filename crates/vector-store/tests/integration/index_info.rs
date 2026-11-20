@@ -7,6 +7,7 @@ use crate::common::blocking_scan_fn;
 use crate::common::make_fts_index;
 use crate::common::make_fts_index_with_options;
 use crate::common::make_index_with_kind;
+use crate::common::make_pattern_index_with_options;
 use crate::common::make_vs_index;
 use crate::common::ordered_timeuuid;
 use crate::common::setup;
@@ -18,6 +19,7 @@ use httpapi::DataType;
 use httpapi::FulltextIndexOptions;
 use httpapi::IndexOptions;
 use httpapi::IndexStatus;
+use httpapi::PatternIndexOptions;
 use httpapi::SimilarityFunction;
 use httpapi::VectorIndexOptions;
 use httpclient::HttpClient;
@@ -36,6 +38,7 @@ use vector_store::DbIndexPartitioning;
 use vector_store::DbUnsupportedIndex;
 use vector_store::IndexKind;
 use vector_store::IndexOptionsFts;
+use vector_store::IndexOptionsPattern;
 use vector_store::IndexOptionsVs;
 use vector_store::NonemptyArc;
 use vector_store::Percentage;
@@ -252,8 +255,30 @@ async fn indexes_lists_all_indexes_with_options() {
     )
     .unwrap();
 
+    let pattern_options = IndexOptionsPattern {
+        case_sensitive: false.into(),
+    };
+    let pattern_index = make_pattern_index_with_options(
+        "fourth",
+        &["pk"],
+        1,
+        "nickname",
+        ordered_timeuuid(4),
+        pattern_options,
+    );
+    db.add_index(
+        pattern_index.clone(),
+        Some(db_basic::scan_fn_documents([(
+            [CqlValue::Int(1)].into(),
+            Some("宇将军".to_string()),
+            Timestamp::from_millis(10),
+        )])),
+        None,
+    )
+    .unwrap();
+
     wait_for(
-        || async { client.indexes().await.len() == 3 },
+        || async { client.indexes().await.len() == 4 },
         "all indexes to be listed",
     )
     .await;
@@ -271,6 +296,12 @@ async fn indexes_lists_all_indexes_with_options() {
         (
             "third",
             IndexOptions::Fulltext(FulltextIndexOptions::from(&fts_options)),
+        ),
+        (
+            "fourth",
+            IndexOptions::Pattern(PatternIndexOptions {
+                case_sensitive: false,
+            }),
         ),
     ]);
     for entry in &entries {
@@ -543,7 +574,13 @@ async fn unsupported_pattern_index_reports_why_it_cannot_be_served() {
 
     let limit = NonZeroUsize::new(1).unwrap().into();
     let response = client
-        .post_like(&"keyspace".into(), &"idx".into(), "%hello%".into(), limit)
+        .post_like(
+            &"keyspace".into(),
+            &"idx".into(),
+            "%hello%".into(),
+            limit,
+            None,
+        )
         .await;
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(response.text().await.unwrap(), UNSUPPORTED_RESPONSE);

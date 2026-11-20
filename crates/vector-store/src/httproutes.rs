@@ -32,8 +32,10 @@ use crate::metrics::OP_HIGHLIGHT;
 use crate::metrics::OP_LIKE;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
+use crate::pattern_index::Cursor;
 use crate::pattern_index::PatternIndex;
 use crate::pattern_index::PatternIndexExt;
+use crate::pattern_index::SearchWindow;
 use crate::perf;
 use crate::vector;
 use crate::vs_index;
@@ -1339,7 +1341,9 @@ Returns primary keys of the documents matched to the provided pattern. \
 The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are wildcards, \
 '\\' is the escape character, and matching is case-sensitive unless the index was created \
 with 'case_sensitive' set to false. \
-The maximum number of results is controlled by the optional 'limit' parameter in the payload. \
+The rows come in table order (by token, then partition key, then clustering key), a page at a time: \
+the optional 'limit' parameter in the payload is the size of a page, and a response that filled its page \
+carries 'next_cursor', which the next request passes back as 'cursor' to read the following page. \
 If TLS is enabled on the server, clients must connect using a HTTPS protocol.",
     params(
         ("keyspace" = httpapi::KeyspaceName, Path, description = "The name of the ScyllaDB keyspace containing the index."),
@@ -1416,13 +1420,17 @@ async fn post_index_like(
             return missing_index_response(&indexes, &index_key, "post_index_like");
         };
         if entry.status() == crate::node_state::IndexStatus::Serving {
-            Ok((entry.index().clone(), entry.primary_key_columns().clone()))
+            Ok((
+                entry.index().clone(),
+                entry.primary_key_columns().clone(),
+                Arc::clone(entry.table_columns()),
+            ))
         } else {
             Err(entry.progress())
         }
     };
 
-    let (pattern_sender, primary_key_columns) = match check_index_serving(
+    let (pattern_sender, primary_key_columns, table_columns) = match check_index_serving(
         serving_or_progress,
         &state.node_state,
         &keyspace,
@@ -1431,18 +1439,39 @@ async fn post_index_like(
     )
     .await
     {
-        Ok(sender) => sender,
+        Ok(serving) => serving,
         Err(resp) => {
             timer.observe_duration();
             return resp;
         }
     };
 
+    let cursor = match request
+        .cursor
+        .as_deref()
+        .map(|text| decode_cursor(text, primary_key_columns.as_slice(), &table_columns))
+        .transpose()
+    {
+        Ok(cursor) => cursor,
+        Err(err) => {
+            timer.observe_duration();
+            let msg = format!("index.like request error: invalid cursor: {err}");
+            debug!("post_index_like: {msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
     let search_result = pattern_sender
-        .like(index_key, request.pattern, request.limit.into())
+        .like(
+            index_key.clone(),
+            request.pattern,
+            request.limit.into(),
+            SearchWindow { cursor },
+        )
         .await;
 
     timer.observe_duration();
+    // A search adds to the index's search totals, which only a refresh of a dirty index exports.
+    state.metrics.mark_dirty(&index_key);
 
     match search_result {
         Err(err) => {
@@ -1450,23 +1479,107 @@ async fn post_index_like(
             debug!("post_index_like: {msg}");
             (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
         }
-        Ok(primary_keys) => {
-            let primary_keys =
-                try_collect_primary_keys(primary_key_columns.as_slice(), &primary_keys);
-
-            match primary_keys {
+        Ok(page) => {
+            let next_cursor = page
+                .next_cursor
+                .as_ref()
+                .map(|cursor| encode_cursor(cursor, primary_key_columns.as_slice()))
+                .transpose();
+            match try_collect_primary_keys(primary_key_columns.as_slice(), &page.primary_keys)
+                .and_then(|primary_keys| Ok((primary_keys, next_cursor?)))
+            {
                 Err(err) => {
                     debug!("post_index_like: {err}");
                     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
                 }
-                Ok(primary_keys) => (
+                Ok((primary_keys, next_cursor)) => (
                     StatusCode::OK,
-                    response::Json(httpapi::PostIndexLikeResponse { primary_keys }),
+                    response::Json(httpapi::PostIndexLikeResponse {
+                        primary_keys,
+                        next_cursor,
+                    }),
                 )
                     .into_response(),
             }
         }
     }
+}
+
+/// The wire form of a paging cursor: JSON, carried by the caller as an opaque string. The primary
+/// key is the same per-column encoding the page's `primary_keys` use, so a cursor is readable
+/// but never meant to be built by hand.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CursorJson {
+    /// The last row's sort prefix: its ordering columns' sort keys, then its token.
+    prefix: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    primary_key: Option<HashMap<httpapi::ColumnName, Value>>,
+}
+
+fn encode_cursor(
+    cursor: &Cursor,
+    primary_key_columns: &[crate::ColumnName],
+) -> anyhow::Result<String> {
+    let primary_key = cursor
+        .primary_key
+        .as_ref()
+        .map(|key| {
+            try_collect_primary_keys(primary_key_columns, std::slice::from_ref(key)).map(
+                |columns| {
+                    columns
+                        .into_iter()
+                        .filter_map(|(column, mut values)| {
+                            values.pop().map(|value| (column, value))
+                        })
+                        .collect()
+                },
+            )
+        })
+        .transpose()?;
+    Ok(serde_json::to_string(&CursorJson {
+        prefix: cursor.prefix.0.to_vec(),
+        primary_key,
+    })?)
+}
+
+fn decode_cursor(
+    text: &str,
+    primary_key_columns: &[crate::ColumnName],
+    table_columns: &HashMap<crate::ColumnName, NativeType>,
+) -> anyhow::Result<Cursor> {
+    let json: CursorJson = serde_json::from_str(text)?;
+    let primary_key = json
+        .primary_key
+        .map(|mut values| {
+            primary_key_columns
+                .iter()
+                .map(|column| {
+                    let value = values
+                        .remove(&httpapi::ColumnName::from(column.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("the cursor's primary key lacks column '{column}'")
+                        })?;
+                    let native_type = table_columns
+                        .get(column)
+                        .ok_or_else(|| anyhow::anyhow!("unknown primary key column '{column}'"))?;
+                    cql_types::from_json(value, native_type)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map(crate::PrimaryKey::from)
+        })
+        .transpose()?;
+    let prefix =
+        crate::pattern_index::SortPrefix(json.prefix.try_into().map_err(|prefix: Vec<u64>| {
+            anyhow::anyhow!(
+                "the cursor's prefix has {} slots, not {}",
+                prefix.len(),
+                crate::pattern_index::PREFIX_SLOTS
+            )
+        })?);
+    Ok(Cursor {
+        prefix,
+        primary_key,
+    })
 }
 
 fn try_from_post_index_ann_filter(

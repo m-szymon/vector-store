@@ -186,6 +186,7 @@ impl HttpClient {
             .unwrap()
     }
 
+    /// The keys of the first page of rows matching a `LIKE` pattern.
     pub async fn like(
         &self,
         keyspace_name: &KeyspaceName,
@@ -193,13 +194,25 @@ impl HttpClient {
         pattern: String,
         limit: Limit,
     ) -> HashMap<ColumnName, Vec<Value>> {
-        let resp = self
-            .post_like(keyspace_name, index_name, pattern, limit)
+        self.like_page(keyspace_name, index_name, pattern, limit, None)
+            .await
+            .primary_keys
+    }
+
+    /// One page of a pattern search, with the cursor to read the next one.
+    pub async fn like_page(
+        &self,
+        keyspace_name: &KeyspaceName,
+        index_name: &IndexName,
+        pattern: String,
+        limit: Limit,
+        cursor: Option<String>,
+    ) -> PostIndexLikeResponse {
+        self.post_like(keyspace_name, index_name, pattern, limit, cursor)
             .await
             .json::<PostIndexLikeResponse>()
             .await
-            .unwrap();
-        resp.primary_keys
+            .unwrap()
     }
 
     pub async fn post_like(
@@ -208,8 +221,13 @@ impl HttpClient {
         index_name: &IndexName,
         pattern: String,
         limit: Limit,
+        cursor: Option<String>,
     ) -> reqwest::Response {
-        let request = PostIndexLikeRequest { pattern, limit };
+        let request = PostIndexLikeRequest {
+            pattern,
+            limit,
+            cursor,
+        };
         self.client
             .post(format!(
                 "{}/indexes/{}/{}/like",

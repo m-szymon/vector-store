@@ -530,12 +530,20 @@ pub struct PostIndexHighlightResponse {
 pub struct PostIndexLikeRequest {
     /// The text pattern to search for.
     pub pattern: String,
+    /// The maximum number of primary keys to return: the size of a page.
     #[serde(default)]
     pub limit: Limit,
+    /// Resume a search after the previous page: the previous response's `next_cursor`, passed back unchanged. Opaque to the caller (it names the last row's place in the index's order and its primary key).
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 /// Response for LIKE search.
 pub struct PostIndexLikeResponse {
+    /// Primary keys of the matching rows, one array of values per primary key column, in table order.
     pub primary_keys: HashMap<ColumnName, Vec<Value>>,
+    /// Pass as the next request's `cursor`, unchanged, to read the following page. Absent when this page exhausted the matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }

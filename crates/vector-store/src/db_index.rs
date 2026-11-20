@@ -30,6 +30,8 @@ use crate::invariant_key::InvariantKey;
 use crate::node_state::Event;
 use crate::node_state::NodeState;
 use crate::node_state::NodeStateExt;
+use crate::pattern_index::KeyLayout;
+use crate::pattern_index::is_key_type_supported;
 use crate::perf;
 use crate::timestamp::Timestamped;
 use anyhow::Context;
@@ -68,6 +70,7 @@ use tracing::trace;
 use tracing::warn;
 
 type GetTableColumnsR = Arc<HashMap<ColumnName, NativeType>>;
+type GetKeyLayoutR = KeyLayout;
 type RangeScanResult =
     anyhow::Result<Pin<Box<dyn Stream<Item = DbIndexedRow> + std::marker::Send>>, anyhow::Error>;
 
@@ -95,6 +98,9 @@ pub enum DbIndex {
     GetTableColumns {
         tx: oneshot::Sender<GetTableColumnsR>,
     },
+    GetKeyLayout {
+        tx: oneshot::Sender<GetKeyLayoutR>,
+    },
     FullScanProgress {
         tx: oneshot::Sender<Progress>,
     },
@@ -106,6 +112,7 @@ pub enum DbIndex {
 
 pub(crate) trait DbIndexExt {
     async fn get_table_columns(&self) -> GetTableColumnsR;
+    async fn get_key_layout(&self) -> GetKeyLayoutR;
     async fn full_scan_progress(&self) -> Progress;
     async fn get_vectors(&self, keys: Vec<PrimaryKey>) -> anyhow::Result<Vec<Option<Vector>>>;
 }
@@ -114,6 +121,14 @@ impl DbIndexExt for mpsc::Sender<DbIndex> {
     async fn get_table_columns(&self) -> GetTableColumnsR {
         let (tx, rx) = oneshot::channel();
         self.send(DbIndex::GetTableColumns { tx })
+            .await
+            .expect("internal actor should receive request");
+        rx.await.expect("internal actor should send response")
+    }
+
+    async fn get_key_layout(&self) -> GetKeyLayoutR {
+        let (tx, rx) = oneshot::channel();
+        self.send(DbIndex::GetKeyLayout { tx })
             .await
             .expect("internal actor should receive request");
         rx.await.expect("internal actor should send response")
@@ -375,6 +390,9 @@ async fn process<T: DbDriver>(
         DbIndex::GetTableColumns { tx } => tx
             .send(statements.get_table_columns())
             .unwrap_or_else(|_| trace!("process: Db::GetTableColumns: unable to send response")),
+        DbIndex::GetKeyLayout { tx } => tx
+            .send(statements.key_layout.clone())
+            .unwrap_or_else(|_| trace!("process: Db::GetKeyLayout: unable to send response")),
         DbIndex::FullScanProgress { tx } => {
             let completed_scan_length =
                 completed_scan_length.load(std::sync::atomic::Ordering::Relaxed);
@@ -403,6 +421,7 @@ struct Statements<T: DbDriver> {
     nonpk_partition_key_columns: Box<[ColumnName]>,
     filtering_columns: Arc<[ColumnName]>,
     table_columns: GetTableColumnsR,
+    key_layout: KeyLayout,
     /// Aligned with nonpk_partition_key_columns + filtering_columns: the
     /// NativeType to decode each one's raw ":attrs" value as, or None for a
     /// real CQL column. See parse_values().
@@ -472,6 +491,12 @@ impl<T: DbDriver> Statements<T> {
                 .map(|(name, typ)| (name.clone(), typ.clone())),
             is_alternator,
         ));
+        // Checked against the driver's table now: the query for the clustering order below must
+        // not hold on to it.
+        let needs_clustering_order = check_key_for_order(&db_driver, table, &metadata)?;
+        let key_layout =
+            key_layout(&db_driver, &session, &metadata, needs_clustering_order).await?;
+
         let alternator_decode_types = alternator_decode_types(
             nonpk_partition_key_columns
                 .iter()
@@ -489,6 +514,7 @@ impl<T: DbDriver> Statements<T> {
             target_columns,
             filtering_columns,
             table_columns,
+            key_layout,
             alternator_decode_types,
             st_range_scan,
             st_fetch_vector,
@@ -795,6 +821,69 @@ fn range_length(begin: Token, end: Token) -> u64 {
     end.value().abs_diff(begin.value() - 1)
 }
 
+/// Refuses a pattern index -- every one keeps table order, after its declared columns if any --
+/// on a table whose tokens are not Murmur3 hashes or whose key has a column of a type table order does not support,
+/// rather than answering in a wrong order. Returns whether the index needs the clustering order.
+fn check_key_for_order<T: DbDriver>(
+    db_driver: &T,
+    table: &T::Table,
+    metadata: &IndexMetadata,
+) -> anyhow::Result<bool> {
+    if metadata.kind.as_pattern().is_none() {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        db_driver.uses_murmur3(table),
+        "pattern index {}.{}: the table's partitioner is not Murmur3, so the index cannot keep \
+         table order",
+        metadata.keyspace_name,
+        metadata.index_name,
+    );
+    for column in metadata.primary_key_columns.iter() {
+        let typ = db_driver.column(table, column).map(|column| &column.typ);
+        anyhow::ensure!(
+            typ.is_some_and(is_key_type_supported),
+            "pattern index {}.{}: primary key column {column} is of a type table order does not \
+             support ({typ:?})",
+            metadata.keyspace_name,
+            metadata.index_name,
+        );
+    }
+    Ok(metadata.primary_key_columns.len().get() > metadata.partition_key_count.get())
+}
+
+/// The primary-key layout table order and tokens need: which columns are the partition key and how
+/// each clustering column is ordered. The order is read only when `needs_clustering_order`; an
+/// index of another kind keeps every column ascending, unused.
+async fn key_layout<T: DbDriver>(
+    db_driver: &T,
+    session: &T::Session,
+    metadata: &IndexMetadata,
+    needs_clustering_order: bool,
+) -> anyhow::Result<KeyLayout> {
+    let partition_key_count = metadata.partition_key_count.get();
+    let clustering_columns = &metadata.primary_key_columns.as_slice()[partition_key_count..];
+    let clustering_descending = if needs_clustering_order {
+        let order = db_driver
+            .clustering_order(session, &metadata.keyspace_name, &metadata.table_name)
+            .await?;
+        clustering_columns
+            .iter()
+            .map(|column| {
+                order.get(column).copied().ok_or_else(|| {
+                    anyhow!("no clustering order for column {column} in system_schema.columns")
+                })
+            })
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        vec![false; clustering_columns.len()]
+    };
+    Ok(KeyLayout {
+        partition_key_count,
+        clustering_descending: clustering_descending.into(),
+    })
+}
+
 /// Builds the `table_columns` lookup Table::new() uses to size and type
 /// in-memory column storage: the table's genuine, natively-typed CQL
 /// columns (`real_columns`), plus synthesized types for Alternator's
@@ -968,15 +1057,7 @@ fn parse_indexed_value(value: DbValue, kind: &IndexKind) -> anyhow::Result<DbInd
                 .map_err(|err| anyhow!("parse_indexed_value: {err}"))
                 .map(DbIndexedValue::Vector),
         },
-        IndexKind::Fts(_) => match value {
-            DbValue::Value(CqlValue::Text(s) | CqlValue::Ascii(s)) => {
-                Ok(DbIndexedValue::Document(s))
-            }
-            other => {
-                bail!("parse_indexed_value: expected text column, got {:?}", other);
-            }
-        },
-        IndexKind::Pattern(_) => match value {
+        IndexKind::Fts(_) | IndexKind::Pattern(_) => match value {
             DbValue::Value(CqlValue::Text(s) | CqlValue::Ascii(s)) => {
                 Ok(DbIndexedValue::Document(s))
             }

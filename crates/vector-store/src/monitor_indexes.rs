@@ -1180,6 +1180,92 @@ mod tests {
         mock_db
     }
 
+    fn mock_db_with_pattern_index(options: Option<IndexOptionsPattern>) -> MockSimDb {
+        let mut mock_db = MockSimDb::new();
+
+        mock_db.expect_get_indexes().returning(move |tx| {
+            async move {
+                tx.send(Ok((
+                    vec![DbCustomIndex {
+                        keyspace: "ks".to_string().into(),
+                        index: "sub_idx".to_string().into(),
+                        table: "tbl".to_string().into(),
+                        primary_key_columns: NonemptyArc::new(["pk"]).unwrap(),
+                        partition_key_count: NonZeroUsize::new(1).unwrap(),
+                        target_columns: NonemptyArc::new(["nickname"]).unwrap(),
+                        partitioning: DbIndexPartitioning::Global,
+                        filtering_columns: Arc::new([]),
+                        alternator_attribute_types: Arc::new(BTreeMap::new()),
+                        kind: DbIndexKind::Pattern,
+                    }],
+                    vec![],
+                )))
+                .unwrap();
+            }
+            .boxed()
+        });
+
+        mock_db
+            .expect_get_index_version()
+            .returning(move |_, _, _, tx| {
+                async move {
+                    tx.send(Ok(Some(Uuid::new_v4().into()))).unwrap();
+                }
+                .boxed()
+            });
+
+        mock_db
+            .expect_get_pattern_index_params()
+            .returning(move |_, _, _, tx| {
+                let options = options.clone();
+                async move {
+                    tx.send(Ok(options)).unwrap();
+                }
+                .boxed()
+            });
+
+        mock_db.expect_is_valid_index().returning(move |_, tx| {
+            async move {
+                tx.send(true).unwrap();
+            }
+            .boxed()
+        });
+
+        mock_db.expect_is_valid_schema().returning(move |_, tx| {
+            async move {
+                tx.send(true).unwrap();
+            }
+            .boxed()
+        });
+
+        mock_db
+    }
+
+    #[tokio::test]
+    async fn get_indexes_returns_pattern_index() {
+        let options = IndexOptionsPattern {
+            case_sensitive: false.into(),
+        };
+        let db = db::tests::new(mock_db_with_pattern_index(Some(options.clone())));
+
+        let (result, _) = get_indexes(&db, Uuid::new_v4()).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        let idx = result.into_iter().next().unwrap();
+        assert_eq!(idx.index_name.as_ref(), "sub_idx");
+        assert_eq!(idx.kind, IndexKind::Pattern(options));
+    }
+
+    #[tokio::test]
+    async fn get_indexes_defaults_pattern_options_when_db_has_none() {
+        let db = db::tests::new(mock_db_with_pattern_index(None));
+
+        let (result, _) = get_indexes(&db, Uuid::new_v4()).await.unwrap();
+
+        let idx = result.into_iter().next().unwrap();
+        assert_eq!(idx.kind, IndexKind::Pattern(IndexOptionsPattern::default()));
+    }
+
     #[tokio::test]
     async fn get_indexes_returns_fts_index() {
         let options = IndexOptionsFts {

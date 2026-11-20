@@ -32,6 +32,7 @@ use vector_store::IndexKind;
 use vector_store::IndexMetadata;
 use vector_store::IndexName;
 use vector_store::IndexVersion;
+use vector_store::KeyLayout;
 use vector_store::KeyspaceName;
 use vector_store::NonemptyArc;
 use vector_store::NonemptyBox;
@@ -551,7 +552,7 @@ fn process_db(db: &DbBasic, msg: Db, node_state: Sender<NodeState>) {
                 .keyspaces
                 .get(&keyspace)
                 .and_then(|keyspace| keyspace.indexes.get(&index))
-                .and_then(|index| index.metadata.pattern().copied())))
+                .and_then(|index| index.metadata.pattern().cloned())))
             .map_err(|_| anyhow!("Db::GetPatternIndexParams: unable to send response"))
             .unwrap(),
 
@@ -722,6 +723,18 @@ async fn spawn_process_db_index(
                         .unwrap_or_default(),
                 )
                 .map_err(|_| anyhow!("DbIndex::GetPrimaryKeyColumns: unable to send response"))
+                .unwrap(),
+
+            DbIndex::GetKeyLayout { tx } => tx
+                .send(KeyLayout::new(
+                    metadata.partition_key_count.get(),
+                    vec![
+                        false;
+                        metadata.primary_key_columns.len().get()
+                            - metadata.partition_key_count.get()
+                    ],
+                ))
+                .map_err(|_| anyhow!("DbIndex::GetKeyLayout: unable to send response"))
                 .unwrap(),
 
             DbIndex::FullScanProgress { tx } => tx

@@ -121,6 +121,9 @@ pub(crate) struct FtsIndexData {
 #[derive(Debug)]
 pub(crate) struct PatternIndexData {
     options: crate::IndexOptionsPattern,
+    /// The types of the table's columns: a paging cursor names a row by primary key in JSON,
+    /// which is read back with them.
+    table_columns: Arc<HashMap<ColumnName, NativeType>>,
 }
 
 impl<I, D> IndexEntry<I, D> {
@@ -279,8 +282,9 @@ impl PatternIndexEntry {
         index: mpsc::Sender<PatternIndex>,
         monitor: mpsc::Sender<MonitorItems>,
         db_index: mpsc::Sender<DbIndex>,
+        table_columns: Arc<HashMap<ColumnName, NativeType>>,
     ) -> anyhow::Result<Self> {
-        let options = *metadata.pattern().ok_or_else(|| {
+        let options = metadata.pattern().cloned().ok_or_else(|| {
             anyhow::anyhow!("PatternIndexEntry::new must be called with a pattern index")
         })?;
         let progress = db_index.full_scan_progress().await;
@@ -291,12 +295,19 @@ impl PatternIndexEntry {
             status: IndexStatus::Initializing,
             progress,
             primary_key_columns: metadata.primary_key_columns,
-            data: PatternIndexData { options },
+            data: PatternIndexData {
+                options,
+                table_columns,
+            },
         })
     }
 
     pub(crate) fn options(&self) -> &crate::IndexOptionsPattern {
         &self.data.options
+    }
+
+    pub(crate) fn table_columns(&self) -> &Arc<HashMap<ColumnName, NativeType>> {
+        &self.data.table_columns
     }
 }
 

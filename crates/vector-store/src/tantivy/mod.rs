@@ -45,7 +45,7 @@ use crate::worker::WorkerExt;
 pub(crate) const COMMIT_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const MAX_UNCOMMITTED_THRESHOLD: usize = 10_000;
 
-struct Writer {
+pub(crate) struct Writer {
     writer: IndexWriter,
     // Handed to the reader on commit, which holds them until the documents are searchable.
     uncommitted_docs_in_progress_guards: Vec<AsyncInProgress>,
@@ -124,12 +124,16 @@ struct ReaderInner {
     reader: tantivy::IndexReader,
     key: IndexKey,
     reload_state: Mutex<ReloadState>,
+    // Held across a reload, so that the reload task and a caller reloading on its own
+    // (`Index::commit_and_reload`) never store an older searcher or opstamp after a newer one.
+    reloading: Mutex<()>,
     worker: async_channel::Sender<Worker>,
 }
 
 impl ReaderInner {
     /// Reloads the reader and drops the guards of the committed documents it made searchable.
-    fn reload(&self) {
+    fn reload(&self) -> tantivy::Result<()> {
+        let _reloading = self.reloading.lock().unwrap();
         // The index meta holds the opstamp of its last commit, so a reload after reading it
         // serves at least that commit.
         let reloaded = self.index.load_metas().and_then(|meta| {
@@ -144,10 +148,12 @@ impl ReaderInner {
                 reload_state
                     .unsearchable_docs
                     .retain(|committed, _| *committed > opstamp);
+                Ok(())
             }
             Err(err) => {
                 reload_state.reload_failed = true;
                 error!("tantivy: failed to reload reader for {}: {err}", self.key);
+                Err(err)
             }
         }
     }
@@ -158,7 +164,7 @@ impl ReaderInner {
         let inner = Arc::clone(self);
         self.worker
             .spawn_blocking(move || {
-                inner.reload();
+                _ = inner.reload();
                 _ = done_tx.send(());
             })
             .await;
@@ -182,6 +188,7 @@ impl Reader {
             reader,
             key: key.clone(),
             reload_state: Mutex::new(ReloadState::default()),
+            reloading: Mutex::new(()),
             worker,
         });
         let (reload_tx, mut reload_rx) = watch::channel(());
@@ -237,11 +244,14 @@ impl Reader {
     }
 }
 
-pub(crate) struct Index {
+/// A tantivy index with its writer and reader, and `state`: whatever a kind of index keeps
+/// alongside, such as caches of per-segment data. The full-text index keeps nothing.
+pub(crate) struct Index<E = ()> {
     pub(crate) index: tantivy::Index,
     writer: RwLock<Writer>,
     pub(crate) reader: Reader,
     pub(crate) schema: Schema,
+    pub(crate) state: E,
 }
 
 impl Index {
@@ -252,6 +262,19 @@ impl Index {
         key: &IndexKey,
         worker: async_channel::Sender<Worker>,
     ) -> anyhow::Result<Self> {
+        Self::with_state(schema, tokenizer_name, tokenizer, key, worker, ())
+    }
+}
+
+impl<E> Index<E> {
+    pub(crate) fn with_state(
+        schema: Schema,
+        tokenizer_name: &str,
+        tokenizer: TextAnalyzer,
+        key: &IndexKey,
+        worker: async_channel::Sender<Worker>,
+        state: E,
+    ) -> anyhow::Result<Self> {
         let index = tantivy::Index::create_in_ram(schema.clone());
         index.tokenizers().register(tokenizer_name, tokenizer);
         let reader = Reader::new(&index, key, worker)?;
@@ -261,7 +284,16 @@ impl Index {
             writer,
             reader,
             schema,
+            state,
         })
+    }
+
+    /// Whether the writer holds uncommitted documents, or None while someone holds the writer.
+    /// Never waits for the writer: the actors ask on their ticks, and a writer held for seconds --
+    /// a pattern index moving rows between segments -- would stop an actor answering anything.
+    pub(crate) fn has_uncommitted_docs(&self) -> Option<bool> {
+        let writer = self.writer.try_read().ok()?;
+        Some(writer.has_uncommitted_docs())
     }
 }
 
@@ -282,7 +314,7 @@ fn create_doc(schema: &Schema, primary_id: PrimaryId, document: &str) -> Tantivy
     doc
 }
 
-fn commit(index: &Index, key: &IndexKey) {
+fn commit<E>(index: &Index<E>, key: &IndexKey) {
     let result = index.writer.write().unwrap().commit();
     match result {
         Ok((commit_opstamp, guards)) => index
@@ -292,13 +324,12 @@ fn commit(index: &Index, key: &IndexKey) {
     }
 }
 
-fn add_document(
-    index: &Index,
+fn add_document<E>(
+    index: &Index<E>,
     primary_id: PrimaryId,
-    document: String,
+    doc: TantivyDocument,
     in_progress: AsyncInProgress,
 ) -> usize {
-    let doc = create_doc(&index.schema, primary_id, &document);
     let mut writer = index.writer.write().unwrap();
     match writer.add_document(doc, in_progress) {
         Ok(pending) => pending,
@@ -314,28 +345,33 @@ fn create_term(schema: &Schema, primary_id: PrimaryId) -> tantivy::Term {
     tantivy::Term::from_field_u64(primary_id_field, u64::from(primary_id))
 }
 
-fn remove_document(index: &Index, primary_id: PrimaryId, in_progress: AsyncInProgress) -> usize {
+fn remove_document<E>(
+    index: &Index<E>,
+    primary_id: PrimaryId,
+    in_progress: AsyncInProgress,
+) -> usize {
     let term = create_term(&index.schema, primary_id);
     index.writer.write().unwrap().rm_document(term, in_progress)
 }
 
 /// The tantivy indexes of one index key, one per index id.
-pub(crate) struct Indexes<T, F> {
+pub(crate) struct Indexes<T, F, E = ()> {
     key: IndexKey,
     table: Arc<RwLock<T>>,
     worker: async_channel::Sender<Worker>,
     commit_interval: tokio::time::Interval,
     commit_threshold: usize,
-    indexes: BTreeMap<IndexId, Arc<Index>>,
+    indexes: BTreeMap<IndexId, Arc<Index<E>>>,
     allocate_rx: watch::Receiver<Allocate>,
     allocate_prev: Allocate,
     new_index: F,
 }
 
-impl<T, F> Indexes<T, F>
+impl<T, F, E> Indexes<T, F, E>
 where
     T: TableSearch,
-    F: Fn(&IndexKey, async_channel::Sender<Worker>) -> anyhow::Result<Index>,
+    F: Fn(&IndexKey, async_channel::Sender<Worker>) -> anyhow::Result<Index<E>>,
+    E: Send + Sync + 'static,
 {
     pub(crate) async fn new(
         key: IndexKey,
@@ -368,6 +404,20 @@ where
         document: String,
         in_progress: AsyncInProgress,
     ) {
+        self.add_document_with(primary_id, in_progress, move |index| {
+            create_doc(&index.schema, primary_id, &document)
+        })
+        .await;
+    }
+
+    /// Adds the document `make_doc` builds, for an index whose documents carry more than the
+    /// text. It runs on the worker, with the index the document goes to.
+    pub(crate) async fn add_document_with(
+        &mut self,
+        primary_id: PrimaryId,
+        in_progress: AsyncInProgress,
+        make_doc: impl FnOnce(&Index<E>) -> TantivyDocument + Send + 'static,
+    ) {
         let Some(index) = self.get_or_create() else {
             return;
         };
@@ -378,7 +428,8 @@ where
         let commit_threshold = self.commit_threshold;
         self.worker
             .spawn_blocking(move || {
-                let pending = add_document(&index, primary_id, document, in_progress);
+                let doc = make_doc(&index);
+                let pending = add_document(&index, primary_id, doc, in_progress);
                 if pending >= commit_threshold {
                     commit(&index, &key);
                 }
@@ -406,7 +457,7 @@ where
             .await;
     }
 
-    pub(crate) fn get(&self, index_key: &IndexKey) -> Option<Arc<Index>> {
+    pub(crate) fn get(&self, index_key: &IndexKey) -> Option<Arc<Index<E>>> {
         let index_id = self.table.read().unwrap().index_id(index_key)?;
         self.indexes.get(&index_id).cloned()
     }
@@ -422,10 +473,14 @@ where
     }
 
     /// Commits every index with uncommitted documents and requests a reload of every other index
-    /// whose committed documents are not searchable yet.
+    /// whose committed documents are not searchable yet. An index whose writer is held right now
+    /// is left for the next tick rather than waited for.
     pub(crate) async fn commit_or_reload(&self) {
         for index in self.indexes.values() {
-            if index.writer.read().unwrap().has_uncommitted_docs() {
+            let Some(uncommitted) = index.has_uncommitted_docs() else {
+                continue;
+            };
+            if uncommitted {
                 let index = Arc::clone(index);
                 let key = self.key.clone();
                 self.worker
@@ -437,7 +492,7 @@ where
         }
     }
 
-    fn get_or_create(&mut self) -> Option<Arc<Index>> {
+    fn get_or_create(&mut self) -> Option<Arc<Index<E>>> {
         let index_id = self.table.read().unwrap().index_id(&self.key)?;
         if let Some(index) = self.indexes.get(&index_id) {
             return Some(Arc::clone(index));

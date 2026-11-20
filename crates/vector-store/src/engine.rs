@@ -275,7 +275,7 @@ async fn add_index(
     };
 
     let table_columns = db_index.get_table_columns().await;
-    let table = match build_table(&key, &metadata, table_columns) {
+    let table = match build_table(&key, &metadata, Arc::clone(&table_columns)) {
         Ok(table) => Arc::new(RwLock::new(table)),
         Err(err) => {
             debug!("unable to create a table cache for an index {key}: {err}");
@@ -288,6 +288,7 @@ async fn add_index(
     let ctx = AddIndexContext {
         key,
         table,
+        table_columns,
         embeddings_stream,
         metrics,
         db_index,
@@ -317,6 +318,7 @@ async fn add_index(
 struct AddIndexContext<'a> {
     key: IndexKey,
     table: Arc<RwLock<Table>>,
+    table_columns: Arc<HashMap<ColumnName, NativeType>>,
     embeddings_stream: mpsc::Receiver<(crate::DbIndexedRow, crate::AsyncInProgress)>,
     metrics: Arc<Metrics>,
     db_index: mpsc::Sender<DbIndex>,
@@ -394,10 +396,12 @@ async fn add_index_pattern(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
         .metadata
         .pattern()
         .ok_or_else(|| anyhow::anyhow!("add_index_pattern must be called with a pattern index"))?;
+    let key_layout = ctx.db_index.get_key_layout().await;
     let pattern_sender = ctx.index_factories.pattern.create_index(
         PatternIndexConfiguration {
             key: ctx.key.clone(),
-            case_sensitive: options.case_sensitive,
+            options: options.clone(),
+            key_layout,
         },
         Arc::clone(&ctx.table),
     );
@@ -416,6 +420,7 @@ async fn add_index_pattern(ctx: AddIndexContext<'_>) -> anyhow::Result<()> {
         pattern_sender,
         monitor_actor,
         ctx.db_index,
+        ctx.table_columns,
     )
     .await?;
     ctx.indexes.write().unwrap().insert_pattern(ctx.key, entry);
