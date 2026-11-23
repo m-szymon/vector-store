@@ -620,6 +620,80 @@ Known costs: rows that arrive out of sort order are indexed twice, once by the i
 by the repair, as they were by the rewrite; and fresh rows repaired into a full stretch rewrite
 the stretch's rows too, at most every quarter of a cap of inflow.
 
+#### A budget for a request (2026-11-23)
+
+The matrix left one row out of line: a keyword whose grams a third of the rows hold apart
+(`甲乙丙之乙丙丁` for `甲乙丙丁`). The index can tell such a row from a match only by reading its
+stored value, so a page costs every such row above its last one: 11 ms for a page of 20 on 2M
+rows, 365 ms for a page of 1000. The cost has no bound in the size of the index, the request
+holds one of the node's workers for all of it, and it runs to its end after ScyllaDB has given
+up on it.
+
+A request now has a budget of time, `VECTOR_STORE_PATTERN_SEARCH_BUDGET`, 50 ms by default, a
+setting of the node (the workers it keeps free are shared by the node's indexes); `0s` is no
+limit. When the budget ends:
+
+- The walk stops, and the page is cut at the highest layout key it has not examined. The rows
+  over that key are final and are returned. The cursor is that key with no row, which takes
+  every row at it again (the cursor of a row that is gone already worked so).
+- The page may hold fewer rows than asked for, or none, and is still not the last. ScyllaDB goes
+  on from the cursor: a paged query for half of the statement's timeout, then it hands the client
+  the page as it is; an unpaged one until its LIMIT is met or the timeout fails it.
+
+Scenarios:
+
+1. `LIKE '%ab%'`, a page of 20, 50 us. The budget is never looked at twice.
+2. The keyword above, a page of 1000 on a repaired index: 8 requests of at most 50.4 ms, 398 ms
+   in all, against 365 ms in one request.
+3. A keyword with candidates everywhere and no match: request after request returns no rows and
+   a cursor further down. A paged client gets an empty page with more to come after half the
+   timeout, and the scan ends over as many pages as it takes, where it timed out before.
+4. An unpaged query that cannot be filled in time fails at the timeout, as before; the node no
+   longer works on after it.
+
+Where the walk looks at the budget: before a segment, between the passes over a segment's runs,
+and once in 32 stored values verified. What keeps the cut right and a row of requests moving:
+
+- **A coarse run.** Its blocks are read in doc order, so after a pass the block with the highest
+  keys may be unread: the cut is that run's key, not the candidate the verification stopped at.
+- **Overlapping segments.** The walk reads a segment at a time, so the segments after a cut may
+  hold rows over it. Each is read over the cut only, with a share of half the budget, and a stop
+  there raises the cut. Where the first segment's rows lie among another's it gets half the
+  budget itself, or it reads far down while the others get hardly under the cursor and the cut
+  is theirs. A budget that ends between two segments has the rest read the same way, rather than
+  the page given up.
+- **Progress.** The walk stops only under the key of the cursor the request came with. Rows
+  sharing a layout key -- the first two slots -- are read by one request, however many.
+- **Unsorted stretches.** A coarse run, or a segment with no runs, settles nothing until all of
+  it is read, and the next request reads it again. So the verification is not ended before it
+  has cost, since the segment was last read, what the reading did. Without this a request read
+  for all of its time and verified 32 values: a page of 20 over two unrepaired segments of 1M
+  rows took 311 requests and 35 s.
+
+Measured (2M rows, cap 1M, `MATRIX_BUDGET_MS=50`, against the same build's run without it):
+
+| index | page | requests | longest | total | one request, no budget |
+|---|---|---|---|---|---|
+| repaired | 200 | 3 | 56 ms | 120 ms | 112 ms |
+| repaired | 1000 (666 rows) | 8 | 55 ms | 408 ms | 365 ms |
+| stream | 1000 (666 rows) | 8 | 52 ms | 381 ms | 370 ms |
+| two unrepaired segments | 20 | 2 | 246 ms | 281 ms | 227 ms |
+| two unrepaired segments | 1000 (666 rows) | 5 | 245 ms | 792 ms | 407 ms |
+
+The other cells of the matrix are within 5-8% of the run without the budget, which is in the
+range two runs of one build differ by.
+
+One cell was not: a pattern nothing matches (2026-11-24). The walk looked at the clock before
+every segment, and such a pattern leaves each of its segments after one look in the dictionary,
+which costs about what the clock does. On 10M rows in about 70 segments its walk took 22-23 us
+with the budget against 17.5-19 us without (two builds each), and on AWS 58 us against 49 (run
+`0818814c` against `a2b5883f`). The budget is now looked at only before a segment that has
+candidates: 19-21 us.
+
+What the budget does not bound: a request over a large unsorted segment takes that segment's
+reading and as much again. With the repair on, the unsorted part is the fresh tier; with it off
+(`rewrite: 'false'`) every segment is, and a request takes what the table above shows.
+
 ### Measured at 10M names (AWS, 2026-09-27, one run, six index variants)
 
 i4i.xlarge Scylla, c8g.xlarge vector-store (4 cores), 20 rows per page, 10k queries/s offered

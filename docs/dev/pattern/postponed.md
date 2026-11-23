@@ -67,9 +67,17 @@ the same name).
 
 ### 5. Work limit per request
 
-A page gets a time budget from the CQL statement timeout; past it the index returns a short page
-with a cursor at the highest key not examined. Next after the rebase. Open: how much of the
-timeout one page may use, and what an unpaged query does at the deadline.
+Done (2026-11-23): a request has a budget of time and returns a short page with a cursor when
+it ends; see "A budget for a request" in `stage-2-ordering.md`. Left out, each a small addition:
+
+- **A budget in the request.** ScyllaDB knows how much of the statement's timeout is left and
+  could send a smaller budget with a request. The node's 50 ms is far under any timeout in use.
+- **A budget per index**, as an index option. The budget is about the node's workers, which its
+  indexes share; no measurement asks for two indexes with different ones.
+- **Reading the rows of one round while the node works on the next.** ScyllaDB does the two in
+  turn. It would shorten a page of several rounds.
+- **Unsorted segments.** A request over one takes its whole reading and as much again, not the
+  budget. Sorting each commit (7) would leave none.
 
 ### 6. Positions option
 
