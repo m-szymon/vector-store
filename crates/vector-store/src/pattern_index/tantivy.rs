@@ -2409,6 +2409,7 @@ const OFF_WHOLE_READ: u32 = 16;
 const FORCE_WHOLE_READ: u32 = 32;
 const OFF_HANDOVER: u32 = 256;
 const OFF_HOLD_BOUND: u32 = 512;
+const OFF_SORTED_COMMITS: u32 = 1024;
 const OFF_FRESH_BETWEEN: u32 = 2048;
 /// Ticks with a repair pending, and of those: with changes lagging, with indexing contended, and
 /// held by the contended signal alone. For a benchmark test.
@@ -3441,7 +3442,13 @@ pub(crate) fn new(
                             let scanned = in_progress.is_fullscan();
                             let lag = in_progress.lag();
                             indexes
-                                .add_document_with(primary_id, in_progress, move |index| {
+                                .add_document_with(
+                                    primary_id,
+                                    in_progress,
+                                    prefix
+                                        .filter(|_| !walk_off(OFF_SORTED_COMMITS))
+                                        .map(|prefix| Box::from(prefix.0)),
+                                    move |index| {
                                     if scanned {
                                         index.backend().scan_rows.store(true, Relaxed);
                                     }
@@ -3457,7 +3464,8 @@ pub(crate) fn new(
                                             repaired: false,
                                         },
                                     )
-                                })
+                                    },
+                                )
                                 .await;
                         }
                         PatternIndex::RemoveDocument {
@@ -6192,6 +6200,52 @@ mod tests {
         assert!(walk.cut_short < walk.searches, "{walk:?}");
     }
 
+    /// Rows that arrive in no order are written a commit at a time in the order of their keys,
+    /// so a page reads the end of each commit's stretch and no more, with no repair: written as
+    /// they came they would make segments in no order, of which a page reads every match.
+    #[rstest]
+    #[timeout(Duration::from_secs(90))]
+    #[tokio::test]
+    async fn rows_arriving_in_no_order_are_read_from_the_end_without_a_repair() {
+        let rows = 20_000u64;
+        let options = IndexOptionsPattern {
+            rewrite_wide_segments: RewriteWideSegments::from(false),
+            ..capped_options(10_000)
+        };
+        let sender = make_sender_with_threshold(options, 5_000);
+        add_batch(&sender, shuffled(rows), named).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut quiet = 0;
+        while quiet < 3 {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            let still = stats.tantivy.num_docs == rows && stats.merges.running == 0;
+            quiet = if still { quiet + 1 } else { 0 };
+            assert!(Instant::now() < deadline, "not settled: {stats:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let stats = sender.stats(make_index_key()).await.unwrap();
+        assert_eq!(stats.rewrite.docs_rewritten, 0, "{:?}", stats.rewrite);
+
+        for (window, expected) in [
+            (
+                SearchWindow::default(),
+                (rows as i64 - 9..=rows as i64).rev().collect::<Vec<_>>(),
+            ),
+            (ascending(), (1..=10).collect()),
+        ] {
+            let before = sender.stats(make_index_key()).await.unwrap().walk;
+            let (page, _) = search_ordered(&sender, "将军", 10, window).await;
+            assert_eq!(page, expected);
+            let after = sender.stats(make_index_key()).await.unwrap().walk;
+            let scanned = after.postings_scanned - before.postings_scanned;
+            assert!(
+                scanned <= rows / 4,
+                "{scanned} postings for a page of 10 of {rows} rows: {:?}",
+                stats.segments
+            );
+        }
+    }
+
     fn shuffled(rows: u64) -> impl Iterator<Item = u64> {
         (0..rows).map(move |i| (i * 1103 + 977) % rows + 1)
     }
@@ -6608,7 +6662,8 @@ mod tests {
     /// 1000 rows from either end and from the middle. MATRIX_STATE picks the index:
     ///
     /// - `settled`: loaded shuffled and repaired;
-    /// - `unrepaired`: the same with no repair, as under writes the repair gives way to;
+    /// - `unrepaired`: the same with no repair, as under writes the repair gives way to
+    ///   (MATRIX_RANDOM loads these two in no order at all);
     /// - `churned`: settled, then a tenth of the rows deleted and a tenth written again;
     /// - `tiers`: ordered by a column of five values, so that most rows tie;
     /// - `stream`: loaded in the index's order, MATRIX_BATCH rows (10000, a full commit) at a
@@ -6635,6 +6690,8 @@ mod tests {
                 Ok("halving") => OFF_HALVING,
                 Ok("sweep") => OFF_SWEEP,
                 Ok("whole_read") => OFF_WHOLE_READ,
+                // The rows of a commit written as they came, not in the order of their keys.
+                Ok("sorted_commits") => OFF_SORTED_COMMITS,
                 Ok(other) => panic!("MATRIX_OFF: {other}"),
                 Err(_) => 0,
             },
@@ -6683,6 +6740,19 @@ mod tests {
             std::env::var("MATRIX_BATCH").map_or(10_000, |batch| batch.parse().unwrap());
         let ids: Vec<u64> = if stream {
             (1..=rows).collect()
+        } else if std::env::var("MATRIX_RANDOM").is_ok() {
+            // In no order at all: every commit's rows lie all over the order. The other
+            // shuffle comes in two stretches of the order that move up as it goes, 3 ids at a
+            // time, so a commit's rows lie close together.
+            let mut ids: Vec<u64> = (1..=rows).collect();
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            for at in (1..ids.len()).rev() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ids.swap(at, (state % (at as u64 + 1)) as usize);
+            }
+            ids
         } else {
             (0..rows)
                 .map(|i| (i * 1_000_003 + 977) % rows + 1)

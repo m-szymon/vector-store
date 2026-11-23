@@ -4,6 +4,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -26,6 +27,7 @@ use tantivy::index::SegmentId;
 use tantivy::index::SegmentMeta;
 use tantivy::indexer::IndexWriterOptions;
 use tantivy::indexer::MergePolicy;
+use tantivy::indexer::UserOperation;
 use tantivy::schema::FAST;
 use tantivy::schema::INDEXED;
 use tantivy::schema::Schema;
@@ -51,46 +53,126 @@ use crate::worker::WorkerExt;
 pub(crate) const COMMIT_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const MAX_UNCOMMITTED_THRESHOLD: usize = 10_000;
 
+/// What the documents of one commit are ordered by, for an index that asks for it.
+pub(crate) type CommitKey = Box<[u64]>;
+
+/// The fewest documents of one commit written as a group: see `Writer::write_held`.
+const HELD_GROUP_DOCS: usize = 1024;
+
 pub(crate) struct Writer {
     writer: IndexWriter,
+    /// How many threads `writer` indexes with.
+    threads: usize,
     // Handed to the reader on commit, which holds them until the documents are searchable.
     uncommitted_docs_in_progress_guards: Vec<AsyncInProgress>,
+    /// The documents added with a key since the last commit, which the commit writes in the
+    /// order of their keys. Tantivy gives a segment's documents their ids in the order they were
+    /// added, each of its threads taking some of them as they come: written in the order of
+    /// the keys, a thread's share is in that order, a sorted stretch of the segment, and a
+    /// search that wants the highest keys reads the end of each stretch. Written as they came,
+    /// rows that arrive in no order make a segment in no order, and nothing in it is settled
+    /// until all of it is read. A slot is emptied when its row is removed before the commit.
+    held: Vec<Option<(CommitKey, TantivyDocument)>>,
+    /// Where in `held` each row's documents are.
+    held_at: HashMap<PrimaryId, Vec<usize>>,
 }
 
 impl Writer {
     fn new(index: &tantivy::Index) -> anyhow::Result<Self> {
+        let threads: usize = perf::num_workers().into();
         let options = IndexWriterOptions::builder()
-            .num_worker_threads(perf::num_workers().into())
+            .num_worker_threads(threads)
             .build();
         let writer = index
             .writer_with_options(options)
             .map_err(|e| anyhow!("tantivy: failed to create writer: {e}"))?;
         Ok(Self {
             writer,
+            threads,
             uncommitted_docs_in_progress_guards: Vec::new(),
+            held: Vec::new(),
+            held_at: HashMap::new(),
         })
     }
 
+    /// Adds `doc`. With a key, at the next commit, in the order of the keys among that
+    /// commit's documents: see `held`.
     fn add_document(
         &mut self,
+        primary_id: PrimaryId,
+        key: Option<CommitKey>,
         doc: TantivyDocument,
         mut in_progress: AsyncInProgress,
     ) -> tantivy::Result<usize> {
-        self.writer.add_document(doc)?;
+        match key {
+            Some(key) => {
+                self.held_at
+                    .entry(primary_id)
+                    .or_default()
+                    .push(self.held.len());
+                self.held.push(Some((key, doc)));
+            }
+            None => {
+                self.writer.add_document(doc)?;
+            }
+        }
+        // A held document is as good as added: a removal that comes before the commit takes it
+        // out of `held`.
         in_progress.applied();
         self.uncommitted_docs_in_progress_guards.push(in_progress);
         Ok(self.uncommitted_docs())
     }
 
-    fn rm_document(&mut self, term: tantivy::Term, in_progress: AsyncInProgress) -> usize {
+    fn rm_document(
+        &mut self,
+        primary_id: PrimaryId,
+        term: tantivy::Term,
+        in_progress: AsyncInProgress,
+    ) -> usize {
+        // A delete reaches the documents written before it, and the held ones are written
+        // after: the row's are dropped here instead.
+        for at in self.held_at.remove(&primary_id).unwrap_or_default() {
+            self.held[at] = None;
+        }
         self.writer.delete_term(term);
         self.uncommitted_docs_in_progress_guards.push(in_progress);
         self.uncommitted_docs()
     }
 
+    /// Writes the held documents, in the order of their keys.
+    ///
+    /// As groups (`IndexWriter::run`), each of which Tantivy writes into one segment in the
+    /// order given: added one by one, the documents would go to whichever thread was free, and
+    /// with many threads and few documents a thread's share would be too short a stretch to
+    /// read as a run. The documents are dealt to the groups in turn, so every group is in the
+    /// order of the keys and spans all of them; as many groups as threads, so that the threads
+    /// all write, but none shorter than `HELD_GROUP_DOCS`.
+    fn write_held(&mut self) {
+        self.held_at.clear();
+        let mut held: Vec<_> = self.held.drain(..).flatten().collect();
+        if held.is_empty() {
+            return;
+        }
+        // Stable: rows with one key stay in the order they came.
+        held.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let groups = (held.len() / HELD_GROUP_DOCS).clamp(1, self.threads);
+        let mut dealt: Vec<Vec<UserOperation>> = (0..groups)
+            .map(|_| Vec::with_capacity(held.len() / groups + 1))
+            .collect();
+        for (at, (_, doc)) in held.into_iter().enumerate() {
+            dealt[at % groups].push(UserOperation::Add(doc));
+        }
+        for group in dealt {
+            if let Err(err) = self.writer.run(group) {
+                error!("tantivy: failed to add documents: {err}");
+            }
+        }
+    }
+
     /// Commits the documents to the index and returns the commit opstamp with their in-progress
     /// guards.
     fn commit(&mut self) -> tantivy::Result<(Opstamp, Vec<AsyncInProgress>)> {
+        self.write_held();
         let opstamp = self.writer.commit()?;
         Ok((
             opstamp,
@@ -109,6 +191,8 @@ impl Writer {
         &mut self,
         docs: impl IntoIterator<Item = (tantivy::Term, TantivyDocument)>,
     ) -> tantivy::Result<usize> {
+        // A held document of one of these rows would be written after its copy here.
+        self.write_held();
         let mut count = 0;
         for (term, doc) in docs {
             self.writer.delete_term(term);
@@ -405,11 +489,12 @@ fn commit<E>(index: &Index<E>, key: &IndexKey) {
 fn add_document<E>(
     index: &Index<E>,
     primary_id: PrimaryId,
+    commit_key: Option<CommitKey>,
     doc: TantivyDocument,
     in_progress: AsyncInProgress,
 ) -> usize {
     let mut writer = index.write();
-    match writer.add_document(doc, in_progress) {
+    match writer.add_document(primary_id, commit_key, doc, in_progress) {
         Ok(pending) => pending,
         Err(err) => {
             error!("tantivy: failed to add document {primary_id:?}: {err}");
@@ -429,7 +514,7 @@ fn remove_document<E>(
     in_progress: AsyncInProgress,
 ) -> usize {
     let term = create_term(&index.schema, primary_id);
-    index.write().rm_document(term, in_progress)
+    index.write().rm_document(primary_id, term, in_progress)
 }
 
 /// The tantivy indexes of one index key, one per index id.
@@ -482,18 +567,20 @@ where
         document: String,
         in_progress: AsyncInProgress,
     ) {
-        self.add_document_with(primary_id, in_progress, move |index| {
+        self.add_document_with(primary_id, in_progress, None, move |index| {
             create_doc(&index.schema, primary_id, &document)
         })
         .await;
     }
 
     /// Adds the document `make_doc` builds, for an index whose documents carry more than the
-    /// text. It runs on the worker, with the index the document goes to.
+    /// text. It runs on the worker, with the index the document goes to. With a `commit_key`
+    /// the documents of a commit are written in the order of their keys.
     pub(crate) async fn add_document_with(
         &mut self,
         primary_id: PrimaryId,
         in_progress: AsyncInProgress,
+        commit_key: Option<CommitKey>,
         make_doc: impl FnOnce(&Index<E>) -> TantivyDocument + Send + 'static,
     ) {
         let Some(index) = self.get_or_create() else {
@@ -507,7 +594,7 @@ where
         self.worker
             .spawn_indexing_blocking(move || {
                 let doc = make_doc(&index);
-                let pending = add_document(&index, primary_id, doc, in_progress);
+                let pending = add_document(&index, primary_id, commit_key, doc, in_progress);
                 if pending >= commit_threshold {
                     commit(&index, &key);
                 }
@@ -670,11 +757,69 @@ mod tests {
 
     use tantivy::schema::STORED;
     use tantivy::schema::TEXT;
+    use tantivy::schema::Value;
     use tantivy::tokenizer::SimpleTokenizer;
     use tantivy::tokenizer::TextAnalyzer;
 
     use super::test_support::make_index_key;
     use super::*;
+
+    /// The documents added with a key are written at the commit in the order of the keys; a row
+    /// removed before the commit is not written, and one added again after that is there once,
+    /// as it was added last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_documents_are_written_in_the_order_of_their_keys_less_the_removed() {
+        let mut schema = Schema::builder();
+        schema.add_u64_field("primary_id", INDEXED | STORED | FAST);
+        schema.add_text_field("text", TEXT | STORED);
+        let index = Index::new(
+            schema.build(),
+            "default",
+            TextAnalyzer::from(SimpleTokenizer::default()),
+            &make_index_key(),
+            crate::worker::new(),
+        )
+        .unwrap();
+        let guard = || AsyncInProgress::fullscan(tokio::sync::mpsc::channel(1).0);
+        let doc = |id: u64, text: &str| create_doc(&index.schema, id.into(), text);
+        let key = |key: u64| Some(CommitKey::from([key]));
+        let term = |id: u64| create_term(&index.schema, id.into());
+        {
+            let mut writer = index.lock_writer();
+            writer
+                .add_document(1.into(), key(30), doc(1, "one"), guard())
+                .unwrap();
+            writer
+                .add_document(2.into(), key(10), doc(2, "gone"), guard())
+                .unwrap();
+            writer
+                .add_document(3.into(), key(20), doc(3, "old"), guard())
+                .unwrap();
+            writer
+                .add_document(4.into(), key(5), doc(4, "four"), guard())
+                .unwrap();
+            writer.rm_document(2.into(), term(2), guard());
+            writer.rm_document(3.into(), term(3), guard());
+            writer
+                .add_document(3.into(), key(20), doc(3, "new"), guard())
+                .unwrap();
+            index.commit_and_reload(&mut writer).unwrap();
+        }
+        let searcher = index.reader.searcher();
+        assert_eq!(searcher.num_docs(), 3);
+        // One group, so one segment, its documents in the order of the keys: 5, 20, 30.
+        let segments = searcher.segment_readers();
+        assert_eq!(segments.len(), 1);
+        let ids = segments[0].fast_fields().u64("primary_id").unwrap();
+        let written: Vec<u64> = (0..3).filter_map(|doc_id| ids.first(doc_id)).collect();
+        assert_eq!(written, vec![4, 3, 1]);
+        let text = index.schema.get_field("text").unwrap();
+        let stored: TantivyDocument = searcher.doc(tantivy::DocAddress::new(0, 1)).unwrap();
+        assert_eq!(
+            stored.get_first(text).and_then(|value| value.as_str()),
+            Some("new")
+        );
+    }
 
     /// A write that waits for the writer gets it before a holder that lets the writes in takes
     /// it again; without that the holder, asking at once, would get it back first.
