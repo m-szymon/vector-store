@@ -77,7 +77,7 @@ it ends; see "A budget for a request" in `stage-2-ordering.md`. Left out, each a
 - **Reading the rows of one round while the node works on the next.** ScyllaDB does the two in
   turn. It would shorten a page of several rounds.
 - **Unsorted segments.** A request over one takes its whole reading and as much again, not the
-  budget. Sorting each commit (7) would leave none.
+  budget. Sorting each commit (7) leaves none but what commits of under a block's rows make.
 
 ### 6. Positions option
 
@@ -87,13 +87,22 @@ worst cell of the matrix). Index size not estimated.
 
 ### 7. Sorting each commit
 
-Rows of one commit sorted by key before they are written, so that a fresh segment is one sorted
-run. Would cut the cost of the fresh tier for rows arriving out of order.
+Done (2026-11-23): a commit's rows are held and written in the order of their keys; see "A
+commit written in the order of its keys" in `stage-2-ordering.md`. Left open:
+
+- **A keyword that is verified and has many candidates for a few matches** (one row in 10,000
+  of candidates in every row) is read by its runs, since the threshold for reading a segment
+  whole counts candidates; whole is 1.4 to 3.5 times cheaper in every layout (0.54 ms for 1.8 ms
+  on 2M rows in no order, 0.24 for 0.32 ms settled).
+- **The walk reads a segment at a time.** A segment with candidates everywhere and no match is
+  verified whole before the next is opened; a merge by key across segments would not.
 
 ### 8. Tuning left as found
 
-- The per-run cap and the halving cost 1.6-1.8x on dense keywords with a page of 20 on a stream
-  index (20 us against 11); they save up to 5.5x elsewhere.
+- The per-run cap and the halving cost a keyword found only at the far end of the order twice
+  (0.11 ms against 0.05 for a page of 20 on a stream index); they save 2 to 10 times in nine
+  other cells. What they cost dense keywords before commits were sorted (1.6-1.8x) is gone:
+  1.25x in one cell.
 - The "indexing contended" signal alone holds the repair on 60-80% of ticks under mixed load.
   Whether it should hold it that much is not measured.
 - A dense page of 1000 on a stream index costs about 1.5 ms in sorted-vector inserts.
@@ -128,15 +137,15 @@ search (`gram.rs`, `like.rs`). What changed in the series because of it:
   for the unchecked `新人` at 20 rows, 1257 us against 876 us at 1000, settled).
 - **Dropped: `VECTOR_STORE_PATTERN_INDEXES`.** Upstream removed the full-text flag it was modelled
   on (`6654aaa`), as a gate of a feature under development.
-- **Operations applied in the order they came: kept, for the layout.** Upstream holds the
+- **Dropped: operations applied in the order they came** (old commit 15). Upstream holds the
   removal of a row in the monitor until its add is applied (`5030ae4`), which covers the race
-  the commit was written for, and it was dropped at first. Without it the workers apply
-  neighbouring rows in a shuffled order: on a stream-built index of 2M rows over 90% of the rows
-  lay in coarse runs (about 100 sorted and 100 coarse runs a segment, against about 270 sorted
-  and one coarse), and a page of 20 scanned 10 to 70 times the postings (2026-11-20, matrix
-  runs `up` and `up2`). It was restored for that alone. Sorting each commit (7 above) would
-  give the same layout for rows arriving in any order and make it unnecessary; this
-  measurement is an argument for doing that.
+  the commit was written for. It also kept rows that arrive in the index's order in that order
+  in a segment, whichever worker took which: without it, on a stream-built index of 2M rows,
+  over 90% of the rows lay in coarse runs and a page of 20 scanned 10 to 70 times the postings
+  (2026-11-20, matrix runs `up` and `up2`), and it was restored for that. A commit's rows are
+  now written in the order of their keys however they arrive, which gives that layout and more:
+  with the commit taken out again the stream state has about 200 sorted runs a segment and no
+  coarse one, and the matrix is unchanged (2026-11-23, run `noturn`).
 - **Dropped: the series' validator tests**, which called `/like` with keywords. Upstream's
   validator tests of the pattern index stay. None covers the order or the paging.
 - **The index size in the statistics skips a segment whose files are gone.** A merge deletes the

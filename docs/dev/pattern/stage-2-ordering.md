@@ -691,8 +691,56 @@ with the budget against 17.5-19 us without (two builds each), and on AWS 58 us a
 candidates: 19-21 us.
 
 What the budget does not bound: a request over a large unsorted segment takes that segment's
-reading and as much again. With the repair on, the unsorted part is the fresh tier; with it off
-(`rewrite: 'false'`) every segment is, and a request takes what the table above shows.
+reading and as much again, as the two unrepaired segments of the table show. The next section
+is what left such segments out.
+
+#### A commit written in the order of its keys (2026-11-23)
+
+Tantivy numbers a segment's documents in the order they were added. Rows that arrive in no
+order -- a restore, a backfill by partition key, writes with sort values all over the order --
+made segments in no order: one coarse run, of which nothing is settled until all is read.
+
+A pattern index's documents are now held until the commit and written then in the order of
+their sort prefixes, in groups Tantivy writes into one segment each (`IndexWriter::run`): the
+rows dealt to the groups in turn, as many groups as the writer has threads, none under 1024
+rows. A fresh segment is then a set of sorted runs, one per group, and after its merges still
+is: about 660 runs in a segment of 1M rows. A removal takes a held row out of the held ones,
+since a delete only reaches documents written before it.
+
+With hundreds of runs lying among one another, the first stretch of a pass is divided among
+the runs whose bounds overlap the highest one's; it had been a page's worth from every run.
+
+Measured on 2M rows that arrived in no order (`MATRIX_RANDOM=1`), repair off, two segments of
+1M, against `MATRIX_OFF=sorted_commits`:
+
+| cell | as they came | in key order |
+|---|---|---|
+| keyword in every row, page of 20 | 0.69 ms, 27392 postings | 0.30 ms, 1220 postings |
+| keyword in every row, page of 1000 | 13.4 ms | 1.5 ms |
+| 1/9 of the rows, verified, page of 20 | 1.7 ms | 0.64 ms |
+| 1/1000 of the rows, page of 20 | 0.07 ms | 0.37 ms |
+| median of the matrix | 1 | 0.59 |
+| longest request with a budget of 50 ms | 2314 ms | 69 ms |
+
+The states the matrix loads in its own order (settled, stream) are within 5% in the median.
+
+The row that got worse, a keyword in one row of a thousand, is the walk looking at each of
+660 runs where it had read the segment whole: the threshold for reading whole counted one match
+a run. Both readings by turns on that index (`MATRIX_WHOLE=1 MATRIX_SPARSE=1`, 2026-11-25), a
+page of 20:
+
+| keyword in one row of | by its runs | whole | as chosen since |
+|---|---|---|---|
+| 3000 | 0.34 ms | 0.02 ms | 0.02 ms |
+| 1000 | 0.29 ms | 0.04 ms | 0.04 ms |
+| 300 | 0.24 ms | 0.12 ms | 0.13 ms |
+| 100 | 0.20 ms | 0.47 ms | 0.20 ms |
+| 9 | 0.31 ms | 3.3 ms | 0.32 ms |
+
+A look at a run costs what about eight matches read in a pass do, and only the runs read
+together count: where the runs follow one another (the stream and the settled index) that is
+one or a few of them, and the threshold there was right as it was. So it is 256 matches, four
+pages, and eight for each run the walk would read together (`Runs::overlap`).
 
 ### Measured at 10M names (AWS, 2026-09-27, one run, six index variants)
 
