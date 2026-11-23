@@ -2759,8 +2759,10 @@ impl RegionWalk<'_> {
     /// read when its bounds reach the floor.
     ///
     /// The first stretch is as wide as the page needs at the segment's density of matches
-    /// (`matches` of `max_doc`, the postings' own bound), twice over, so that a page usually
-    /// fills in one pass whatever the keyword; each later one is four times wider. The walk ends
+    /// (`matches` of `max_doc`, the postings' own bound), twice over, divided among the runs
+    /// whose rows lie among one another at the end the page is read from, so that a page
+    /// usually fills in one pass whatever the keyword and however many runs it is read from;
+    /// each later one is four times wider. The walk ends
     /// when the highest key left unread can no longer enter the page or the window.
     ///
     /// Or when the budget ends it, between two passes or in the verification after one: it then
@@ -2851,9 +2853,26 @@ impl RegionWalk<'_> {
                 unread.push((best(run, at), index as u32));
             }
         }
+        // The runs whose rows lie among those of the run with the highest key: the first pass
+        // reads a stretch of each. One, where the runs follow one another, as a repair step or
+        // rows arriving in the index's order leave them; every run, where each holds a commit
+        // of rows that arrived in no order.
+        let among = unread
+            .iter()
+            .max()
+            .map(|&(_, index)| {
+                let run = &runs[index as usize];
+                oriented(if forward { run.max } else { run.min })
+            })
+            .map_or(1, |lowest| {
+                unread.iter().filter(|&&(key, _)| key >= lowest).count()
+            })
+            .max(1);
         let mut unread = BinaryHeap::from(unread);
         let density = f64::from(matches.max(1)) / f64::from(self.segment.max_doc().max(1));
-        let mut width = ((2 * page.limit) as f64 / density.min(1.0))
+        // The first stretch: what the page needs at that density, twice over, in all the runs
+        // it is read from together.
+        let mut width = ((2 * page.limit) as f64 / density.min(1.0) / among as f64)
             .ceil()
             .clamp(1.0, f64::from(u32::MAX)) as u32;
         // The matches a run offers of its stretch, which grow with it.
