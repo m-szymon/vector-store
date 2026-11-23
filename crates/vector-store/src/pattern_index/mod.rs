@@ -27,12 +27,18 @@ pub(crate) use order::PREFIX_SLOTS;
 pub(crate) use order::SortPrefix;
 pub(crate) use order::is_key_type_supported;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
+pub(crate) use tantivy::DEFAULT_SEARCH_BUDGET;
+
+/// `search_budget` is how long one search request may take before it returns what it has
+/// settled; None for no limit.
 pub(crate) fn new_factory_tantivy(
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
     metrics: Arc<Metrics>,
+    search_budget: Option<Duration>,
 ) -> Box<dyn PatternIndexFactory + Send + Sync> {
-    Box::new(tantivy::new_factory(worker, memory, metrics))
+    Box::new(tantivy::new_factory(worker, memory, metrics, search_budget))
 }

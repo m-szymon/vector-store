@@ -225,6 +225,13 @@ impl ConfigManager {
             ));
         }
 
+        if old_config.pattern_search_budget != new_config.pattern_search_budget {
+            changes.push(format!(
+                "Pattern search budget: {:?} -> {:?}",
+                old_config.pattern_search_budget, new_config.pattern_search_budget
+            ));
+        }
+
         // Check the worker pool's scheduling
         if old_config.indexing_queue_budget != new_config.indexing_queue_budget
             || old_config.min_search_share_pct != new_config.min_search_share_pct
@@ -444,6 +451,15 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
             "VECTOR_STORE_MIN_SEARCH_SHARE is a percentage, 0 to 100, not {pct}"
         );
         config.min_search_share_pct = Some(pct);
+    }
+
+    if let Some(budget) = env("VECTOR_STORE_PATTERN_SEARCH_BUDGET")
+        .ok()
+        .map(|v| v.parse_duration())
+        .transpose()
+        .map_err(|err| anyhow!("Unable to parse VECTOR_STORE_PATTERN_SEARCH_BUDGET env: {err}"))?
+    {
+        config.pattern_search_budget = Some(budget);
     }
 
     if let Some(memory_limit) = env("VECTOR_STORE_MEMORY_LIMIT")
@@ -906,6 +922,36 @@ mod tests {
         let env = mock_env(HashMap::from([(
             "VECTOR_STORE_MIN_SEARCH_SHARE",
             "140".into(),
+        )]));
+        assert!(load_config(env).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_config_pattern_search_budget() {
+        let config = load_config(mock_env(HashMap::new())).await.unwrap();
+        assert_eq!(config.pattern_search_budget, None);
+
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_PATTERN_SEARCH_BUDGET",
+            "20ms".into(),
+        )]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(
+            config.pattern_search_budget,
+            Some(Duration::from_millis(20))
+        );
+
+        // Zero is a value of its own: no limit.
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_PATTERN_SEARCH_BUDGET",
+            "0s".into(),
+        )]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.pattern_search_budget, Some(Duration::ZERO));
+
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_PATTERN_SEARCH_BUDGET",
+            "soon".into(),
         )]));
         assert!(load_config(env).await.is_err());
     }

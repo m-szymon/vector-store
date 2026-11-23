@@ -115,6 +115,7 @@ pub(crate) struct Factory {
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
     metrics: Arc<Metrics>,
+    search_budget: Option<Duration>,
 }
 
 /// What one search request may spend before it returns what it has settled, with a cursor the
@@ -130,7 +131,8 @@ pub(crate) struct SearchBudget {
     pub(crate) work: Option<u64>,
 }
 
-/// The time a search request may take when nothing says otherwise: a hundredth of ScyllaDB's
+/// The time a search request may take when the configuration does not say
+/// (`VECTOR_STORE_PATTERN_SEARCH_BUDGET`): a hundredth of ScyllaDB's
 /// default read timeout, so that a statement has many requests in it, and short enough for a
 /// worker not to be missed.
 pub(crate) const DEFAULT_SEARCH_BUDGET: Duration = Duration::from_millis(50);
@@ -150,7 +152,7 @@ impl PatternIndexFactory for Factory {
             MAX_UNCOMMITTED_THRESHOLD,
             Some(Arc::clone(&self.metrics)),
             SearchBudget {
-                time: Some(DEFAULT_SEARCH_BUDGET),
+                time: self.search_budget,
                 work: None,
             },
         )
@@ -161,11 +163,13 @@ pub(super) fn new_factory(
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
     metrics: Arc<Metrics>,
+    search_budget: Option<Duration>,
 ) -> Factory {
     Factory {
         worker,
         memory,
         metrics,
+        search_budget,
     }
 }
 

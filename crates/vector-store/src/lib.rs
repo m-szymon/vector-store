@@ -226,6 +226,9 @@ pub struct Config {
     /// The minimum share of the workers' time, in percent, searches get while they wait; see
     /// `worker::Scheduling`. `None`: `worker::DEFAULT_MIN_SEARCH_SHARE`.
     pub min_search_share_pct: Option<u8>,
+    /// How long one pattern search request may take before it returns what it has settled, with
+    /// a cursor to go on from. `None`: `pattern_index::DEFAULT_SEARCH_BUDGET`. Zero: no limit.
+    pub pattern_search_budget: Option<Duration>,
     pub memory_limit: Option<u64>,
     pub memory_usage_check_interval: Option<Duration>,
     pub opensearch_addr: Option<String>,
@@ -263,6 +266,7 @@ impl Default for Config {
             threads: None,
             indexing_queue_budget: None,
             min_search_share_pct: None,
+            pattern_search_budget: None,
             memory_limit: None,
             memory_usage_check_interval: None,
             opensearch_addr: None,
@@ -1321,6 +1325,10 @@ pub async fn run(
     let db_driver = db_driver::new_scylla();
     let internals = internals::new(db_driver.clone());
     let memory = memory::new(internals.clone(), config_rx.clone());
+    let pattern_search_budget = config_rx
+        .borrow()
+        .pattern_search_budget
+        .unwrap_or(pattern_index::DEFAULT_SEARCH_BUDGET);
     let worker = {
         let config = config_rx.borrow();
         let defaults = worker::Scheduling::default();
@@ -1363,8 +1371,13 @@ pub async fn run(
     let indexes = Arc::new(RwLock::new(Indexes::new()));
     let fts_index_factory =
         fts_index::new_fts_index_factory_tantivy(worker.clone(), memory.clone());
-    let pattern_index_factory =
-        pattern_index::new_factory_tantivy(worker, memory, Arc::clone(&metrics));
+    let pattern_index_factory = pattern_index::new_factory_tantivy(
+        worker,
+        memory,
+        Arc::clone(&metrics),
+        // Zero is no limit.
+        (!pattern_search_budget.is_zero()).then_some(pattern_search_budget),
+    );
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {
