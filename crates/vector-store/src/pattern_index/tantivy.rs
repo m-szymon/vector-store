@@ -117,6 +117,24 @@ pub(crate) struct Factory {
     metrics: Arc<Metrics>,
 }
 
+/// What one search request may spend before it returns what it has settled, with a cursor the
+/// next request goes on from. Without one, a keyword whose grams most rows hold costs a request
+/// every such row above the page's last: time without a bound, on a worker the other searches
+/// wait for, spent to the end even when the caller has given up.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SearchBudget {
+    /// Wall time, from when the search starts on its worker.
+    pub(crate) time: Option<Duration>,
+    /// Postings read and stored values checked. For tests, which need the cut at the same place
+    /// on every run.
+    pub(crate) work: Option<u64>,
+}
+
+/// The time a search request may take when nothing says otherwise: a hundredth of ScyllaDB's
+/// default read timeout, so that a statement has many requests in it, and short enough for a
+/// worker not to be missed.
+pub(crate) const DEFAULT_SEARCH_BUDGET: Duration = Duration::from_millis(50);
+
 impl PatternIndexFactory for Factory {
     fn create_index(
         &self,
@@ -131,6 +149,10 @@ impl PatternIndexFactory for Factory {
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
             Some(Arc::clone(&self.metrics)),
+            SearchBudget {
+                time: Some(DEFAULT_SEARCH_BUDGET),
+                work: None,
+            },
         )
     }
 }
@@ -1134,6 +1156,7 @@ struct WalkCounters {
     store_reads: AtomicU64,
     column_opens: AtomicU64,
     segments_wasted: AtomicU64,
+    cut_short: AtomicU64,
     walk_nanos: AtomicU64,
     prepare_nanos: AtomicU64,
     page_resolve_nanos: AtomicU64,
@@ -1150,6 +1173,66 @@ struct WalkTally {
     column_opens: u64,
     /// Segments opened that put no row on the page.
     segments_wasted: u64,
+    /// 1 when the search's budget ended it before its page was settled.
+    cut_short: u64,
+}
+
+/// One search's budget as its walk spends it.
+struct Spending {
+    budget: SearchBudget,
+    deadline: Option<Instant>,
+    work: Option<u64>,
+    /// The oriented layout key of the request's cursor: the walk stops only under it, so that
+    /// the cursor it leaves is past the one it came with and a row of requests gets somewhere.
+    /// Rows sharing a layout key are read by one request, however many.
+    progress: Option<u128>,
+}
+
+impl Spending {
+    /// One of `parts` equal parts of the budget, from now.
+    fn new(budget: SearchBudget, window: &SortWindow, parts: u32) -> Self {
+        Self {
+            budget,
+            deadline: budget.time.map(|time| Instant::now() + time / parts),
+            work: budget.work.map(|work| work / u64::from(parts)),
+            progress: window
+                .cursor
+                .as_ref()
+                .map(|(cursor, _)| cursor.layout_key()),
+        }
+    }
+
+    /// One of `parts` equal shares of half the budget, from now: for a segment read after the
+    /// budget ended the walk in another, see `collect_matches_ordered`.
+    fn share(&self, parts: usize, tally: &WalkTally) -> Self {
+        let parts = 2 * parts.max(1);
+        Self {
+            budget: self.budget,
+            deadline: self
+                .budget
+                .time
+                .map(|time| Instant::now() + time / parts as u32),
+            work: self
+                .budget
+                .work
+                .map(|work| tally.postings_scanned + tally.store_reads + work / parts as u64),
+            progress: self.progress,
+        }
+    }
+
+    /// Whether the walk stops here, with `frontier` the highest oriented layout key it has not
+    /// examined.
+    fn stops_at(&self, frontier: u128, tally: &WalkTally) -> bool {
+        self.progress.is_none_or(|progress| frontier < progress) && self.is_spent(tally)
+    }
+
+    fn is_spent(&self, tally: &WalkTally) -> bool {
+        self.work
+            .is_some_and(|work| tally.postings_scanned + tally.store_reads >= work)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
 }
 
 /// How long the parts of one search took.
@@ -1174,6 +1257,7 @@ impl WalkCounters {
         self.column_opens.fetch_add(tally.column_opens, Relaxed);
         self.segments_wasted
             .fetch_add(tally.segments_wasted, Relaxed);
+        self.cut_short.fetch_add(tally.cut_short, Relaxed);
         let nanos = |d: Duration| d.as_nanos().try_into().unwrap_or(u64::MAX);
         self.walk_nanos.fetch_add(nanos(times.walk), Relaxed);
         self.prepare_nanos.fetch_add(nanos(times.prepare), Relaxed);
@@ -1191,6 +1275,7 @@ impl WalkCounters {
             store_reads: self.store_reads.load(Relaxed),
             column_opens: self.column_opens.load(Relaxed),
             segments_wasted: self.segments_wasted.load(Relaxed),
+            cut_short: self.cut_short.load(Relaxed),
             walk_nanos: self.walk_nanos.load(Relaxed),
             prepare_nanos: self.prepare_nanos.load(Relaxed),
             page_resolve_nanos: self.page_resolve_nanos.load(Relaxed),
@@ -1212,6 +1297,9 @@ pub(crate) struct WalkTotals {
     /// Segments an ordered search opened that put no row on its page: what the overlap of the
     /// layout costs the searches, where they go.
     pub(crate) segments_wasted: u64,
+    /// Searches their budget ended before the page was settled: they returned what was, and a
+    /// cursor to go on from.
+    pub(crate) cut_short: u64,
     pub(crate) walk_nanos: u64,
     /// Time spent before the first posting: reading every segment's bounds. Part of `walk_nanos`.
     pub(crate) prepare_nanos: u64,
@@ -2102,6 +2190,19 @@ impl SortWindow {
         }
     }
 
+    /// The window's part over an oriented layout key: the rows whose own lies above `key`.
+    /// None when no key does.
+    fn above(&self, key: u128) -> Option<Self> {
+        let key = key.checked_add(1)?;
+        let mut floor = SortPrefix::default();
+        floor.0[0] = (key >> 64) as u64;
+        floor.0[1] = key as u64;
+        Some(Self {
+            lower: Some(self.lower.map_or(floor, |lower| lower.max(floor))),
+            ..self.clone()
+        })
+    }
+
     /// A prefix from the columns, in walk orientation.
     fn orient(&self, prefix: SortPrefix) -> SortPrefix {
         if self.complement {
@@ -2347,6 +2448,11 @@ fn walk_off(mechanism: u32) -> bool {
 #[cfg(test)]
 static SEGMENTS_READ_WHOLE: AtomicU64 = AtomicU64::new(0);
 
+/// How many candidates are verified between two looks at a search's budget.
+const BUDGET_CHECK_EVERY: u32 = 32;
+/// What checking a stored value costs, in postings read: see `RegionWalk::verified_its_reading`.
+const STORED_VALUE_COST: u64 = 4;
+
 /// One segment as an ordered walk reads it: the rows of a range of doc ids at a time, either the
 /// whole segment, or stretches of a sorted run from the end the page needs (see
 /// `SegmentColumns::runs`).
@@ -2363,6 +2469,9 @@ struct RegionWalk<'a> {
     /// The postings, kept while the next range starts at or after where they stand: a scorer
     /// only seeks forward.
     scorer: Option<Box<dyn Scorer>>,
+    /// The search's postings read when it came to this segment, and its stored values checked
+    /// when this segment's postings were last read.
+    before: (u64, u64),
 }
 
 impl RegionWalk<'_> {
@@ -2427,6 +2536,7 @@ impl RegionWalk<'_> {
         let Some(first) = regions.first().map(|region| region.from) else {
             return Ok(());
         };
+        self.before.1 = tally.store_reads;
         let mut scorer = match self.scorer.take() {
             Some(scorer) if scorer.doc() <= first => scorer,
             _ => match self.like.candidates(self.segment)? {
@@ -2550,26 +2660,61 @@ impl RegionWalk<'_> {
         Ok(())
     }
 
+    /// Whether the verification since this segment's postings were last read has cost at least
+    /// what reading them did. Until then the budget does not end it. Where the rows are in
+    /// sorted runs a pass reads little, and this holds almost at once. An unsorted stretch -- a
+    /// coarse run, a segment with no runs -- settles nothing until all of it is read, and the
+    /// next request reads it all again: a request that stopped as its budget ended would have
+    /// read for all of its time and verified next to nothing, and a page would take requests
+    /// without number. What was verified between two reads does not count: the later read
+    /// brings candidates over it.
+    fn verified_its_reading(&self, tally: &WalkTally) -> bool {
+        let (postings, stored) = self.before;
+        (tally.store_reads - stored) * STORED_VALUE_COST >= tally.postings_scanned - postings
+    }
+
     /// Verifies `candidates` against the stored text, from the highest prefix down, and offers
     /// the page the ones that match, stopping at the first that can no longer enter it. The grams
     /// only nominate candidates, and the text that decides is in the document store. Postings arrive in doc order, so verifying as they come reads nearly every
     /// candidate when doc order is roughly ascending sort order: each later one beats the page
     /// the earlier ones built. From the highest down, the store is read for the page's rows plus
     /// the false positives above them.
+    ///
+    /// The budget does not end the verification before it has cost what the reading of this
+    /// segment did (`verified_its_reading`).
+    ///
+    /// `unread` is the highest layout key the segment has left unread, 0 for none. When the
+    /// budget ends the verification, returns the highest layout key not examined: the highest
+    /// candidate left unverified, or `unread` if that is higher -- a coarse run's blocks are read
+    /// in doc order, and the one with its highest keys may be among those a pass left.
     fn verify(
         &mut self,
         page: &mut Page,
         tally: &mut WalkTally,
         candidates: &mut Vec<(SortPrefix, u32)>,
-    ) -> anyhow::Result<()> {
+        budget: &Spending,
+        unread: u128,
+    ) -> anyhow::Result<Option<u128>> {
         // A heap, not a sort: of the many a wide pass gathers, few are looked at.
         let mut highest = BinaryHeap::from(std::mem::take(candidates));
+        let mut verified = 0u32;
+        let mut stopped_at = None;
         while let Some(&(prefix, doc_id)) = highest.peek() {
             if !page.may_take(prefix) {
                 // Nor can any after it, now or once the page holds more.
                 highest.clear();
                 break;
             }
+            // The clock is read once in so many, not for every stored value.
+            let frontier = prefix.layout_key().max(unread);
+            if verified.is_multiple_of(BUDGET_CHECK_EVERY)
+                && budget.stops_at(frontier, tally)
+                && self.verified_its_reading(tally)
+            {
+                stopped_at = Some(frontier);
+                break;
+            }
+            verified += 1;
             highest.pop();
             let Some(entry) = self.entry(page, prefix, doc_id) else {
                 continue;
@@ -2589,7 +2734,7 @@ impl RegionWalk<'_> {
             }
         }
         *candidates = highest.into_vec();
-        Ok(())
+        Ok(stopped_at)
     }
 
     /// Walks the segment's `runs` from the end the page needs -- the highest layout keys, or,
@@ -2612,6 +2757,10 @@ impl RegionWalk<'_> {
     /// (`matches` of `max_doc`, the postings' own bound), twice over, so that a page usually
     /// fills in one pass whatever the keyword; each later one is four times wider. The walk ends
     /// when the highest key left unread can no longer enter the page or the window.
+    ///
+    /// Or when the budget ends it, between two passes or in the verification after one: it then
+    /// returns the highest layout key it has not examined, a run's next row or a candidate left
+    /// unverified. What the page holds over that key is final as far as this segment goes.
     fn walk_runs(
         &mut self,
         page: &mut Page,
@@ -2619,7 +2768,8 @@ impl RegionWalk<'_> {
         candidates: &mut Vec<(SortPrefix, u32)>,
         runs: &Runs,
         matches: u32,
-    ) -> anyhow::Result<()> {
+        budget: &Spending,
+    ) -> anyhow::Result<Option<u128>> {
         let columns = self.columns;
         let window = self.window;
         let forward = window.complement;
@@ -2735,6 +2885,9 @@ impl RegionWalk<'_> {
             {
                 break;
             }
+            if budget.stops_at(highest, tally) {
+                return Ok(Some(highest));
+            }
             // The runs with rows at the floor or over it, and the floor: the highest key a run
             // among them has left, or ends at, once its stretch is read.
             regions.clear();
@@ -2838,14 +2991,18 @@ impl RegionWalk<'_> {
             if unread.is_empty() {
                 break;
             }
-            self.verify(page, tally, candidates)?;
+            let left = unread.peek().map_or(0, |&(key, _)| key);
+            if let Some(unexamined) = self.verify(page, tally, candidates, budget, left)? {
+                return Ok(Some(unexamined));
+            }
             width = width.saturating_mul(4);
             // More of each run only once the matches of this many were not enough.
             if tally.postings_scanned > scanned {
                 take = take.saturating_mul(4);
             }
         }
-        self.verify(page, tally, candidates)
+        let left = unread.peek().map_or(0, |&(key, _)| key);
+        self.verify(page, tally, candidates, budget, left)
     }
 }
 
@@ -2859,7 +3016,17 @@ impl RegionWalk<'_> {
 /// cannot make the page costs almost nothing. Measured, the second is worth 4-13x on its own and
 /// does not depend on how the segments are laid out.
 ///
-/// Returns the page's primary ids, and the cursor of its last row when the page filled.
+/// A search has a budget (`SearchBudget`). When it ends the walk in a segment, the page is cut at
+/// the highest layout key that segment has not examined -- a run's next row, or a candidate left
+/// unverified. The walk reads a segment at a time, so the segments after it may hold rows over
+/// that key too, where segments overlap: each is then read over the cut only, with a share of
+/// half the budget, and a stop there raises the cut. When it ends between two segments, the ones
+/// left are read the same way, and the page is cut only if one of them stops. The rows over the cut are final, and the cursor
+/// is the cut, a key with no row, which takes every row at it again. Such a page may hold fewer
+/// rows than `limit`, or none, and still not be the last.
+///
+/// Returns the page's primary ids, and the cursor of its last row when the page filled, or the
+/// key it was cut at.
 type OrderedPage = (Vec<PrimaryId>, Option<Cursor>);
 
 fn collect_matches_ordered(
@@ -2868,6 +3035,7 @@ fn collect_matches_ordered(
     limit: usize,
     window: SortWindow,
     key_of: &dyn Fn(PrimaryId) -> Option<PrimaryKey>,
+    budget: SearchBudget,
 ) -> anyhow::Result<OrderedPage> {
     let searcher = state.reader.searcher();
 
@@ -2882,11 +3050,17 @@ fn collect_matches_ordered(
             window.orient_bounds(columns.layout_min, columns.layout_max);
         // Ruled out from the bounds alone, so the segment is never opened.
         if window.overlaps(lower_bound, upper_bound) {
-            segments.push((segment_ord as u32, segment, columns, upper_bound));
+            segments.push((
+                segment_ord as u32,
+                segment,
+                columns,
+                upper_bound,
+                lower_bound,
+            ));
         }
     }
     state.backend().prune_columns(searcher.segment_readers());
-    segments.sort_by_key(|(_, _, _, upper_bound)| Reverse(*upper_bound));
+    segments.sort_by_key(|(_, _, _, upper_bound, _)| Reverse(*upper_bound));
     tally.segments_considered = segments.len() as u64;
     let prepare = started.elapsed();
 
@@ -2901,7 +3075,23 @@ fn collect_matches_ordered(
         ties: &ties,
     };
     let mut candidates: Vec<(SortPrefix, u32)> = Vec::new();
-    for (segment_ord, segment, columns, upper_bound) in segments {
+    let bounds: Vec<u128> = segments.iter().map(|&(_, _, _, bound, _)| bound).collect();
+    // Where the first segment's rows lie among another's, the walk may have to cut in more than
+    // one: the first then has half the budget, and the others the other half between them.
+    // Left to spend it all, the first would read far down, and the others, with what is left,
+    // hardly under the cursor: the cut would be theirs, and the first's reading lost.
+    let overlapping = segments
+        .first()
+        .zip(bounds.get(1))
+        .is_some_and(|(&(_, _, _, _, lower), &second)| second >= lower);
+    let whole = Spending::new(budget, &window, if overlapping { 2 } else { 1 });
+    // Once the budget has ended the walk, the segments left are read with a share of it each,
+    // and over the cut only: the highest oriented layout key the walk has not examined, when
+    // the budget ended it inside a segment.
+    let mut spent = false;
+    let mut cut: Option<u128> = None;
+    let mut share = 1;
+    for (at, (segment_ord, segment, columns, upper_bound, _)) in segments.into_iter().enumerate() {
         if let Some(weakest) = page.weakest()
             && upper_bound < weakest.prefix.layout_key()
         {
@@ -2909,6 +3099,9 @@ fn collect_matches_ordered(
             // ending exactly at the weakest layout key may still hold a row above it.)
             break;
         }
+        // Before the budget is looked at: a segment with no candidate costs a look in its
+        // dictionary, and the clock costs as much. A pattern nothing matches met the clock at
+        // each of its segments, a fifth of its walk over 70 of them.
         let Some(scorer) = like.candidates(segment)? else {
             continue;
         };
@@ -2917,18 +3110,46 @@ fn collect_matches_ordered(
             // Nothing matches here: no run to look for an end in.
             continue;
         }
+        if !spent && whole.is_spent(&tally) {
+            // Between two segments. What the page holds is not final while a segment left may
+            // hold a row over it, and to cut over them all would give up the page.
+            spent = true;
+            share = bounds.len() - at;
+        }
+        let over_cut;
+        let shared;
+        let (window, budget) = if spent {
+            let window = match cut {
+                // The segments come by descending upper bound: none after this one reaches
+                // over the cut either.
+                Some(cut) if upper_bound <= cut => break,
+                Some(cut) => match window.above(cut) {
+                    Some(above) => {
+                        over_cut = above;
+                        &over_cut
+                    }
+                    None => break,
+                },
+                None => &window,
+            };
+            shared = whole.share(share, &tally);
+            (window, &shared)
+        } else {
+            (&window, &whole)
+        };
         let matches_bound = like.matches_bound(scorer.as_ref());
         candidates.clear();
         let mut walk = RegionWalk {
             segment,
             segment_ord,
             columns: &columns,
-            window: &window,
+            window,
             ties: &ties,
             key_of,
             like: &mut *like,
             store: None,
             scorer: Some(scorer),
+            before: (tally.postings_scanned, tally.store_reads),
         };
         // The runs cost the walk a look at each it reads together and a pass or more of the
         // postings; the segment read whole costs it every match, in one pass. So few matches
@@ -2941,10 +3162,15 @@ fn collect_matches_ordered(
                             + WHOLE_READ_PAGES * page.limit
                             + WHOLE_READ_PER_RUN * runs.overlap())
         });
-        match runs {
-            Some(runs) => {
-                walk.walk_runs(&mut page, &mut tally, &mut candidates, &runs, matches_bound)?
-            }
+        let left = match runs {
+            Some(runs) => walk.walk_runs(
+                &mut page,
+                &mut tally,
+                &mut candidates,
+                &runs,
+                matches_bound,
+                budget,
+            )?,
             None => {
                 #[cfg(test)]
                 if columns.runs.is_none() {
@@ -2961,9 +3187,31 @@ fn collect_matches_ordered(
                     }],
                     usize::MAX,
                 )?;
-                walk.verify(&mut page, &mut tally, &mut candidates)?
+                walk.verify(&mut page, &mut tally, &mut candidates, budget, 0)?
             }
+        };
+        if let Some(left) = left {
+            if !spent {
+                spent = true;
+                share = bounds[at + 1..]
+                    .iter()
+                    .filter(|&&bound| bound > left)
+                    .count();
+            }
+            // Read over the cut, a segment leaves a key over it.
+            cut = Some(cut.map_or(left, |cut| cut.max(left)));
         }
+    }
+    let unexamined = cut;
+    // A full page whose last row is over everything unexamined is settled all the same.
+    let cut_at = unexamined.filter(|&unexamined| {
+        page.weakest()
+            .is_none_or(|weakest| unexamined >= weakest.prefix.layout_key())
+    });
+    if let Some(cut_at) = cut_at {
+        page.entries
+            .retain(|entry| entry.prefix.layout_key() > cut_at);
+        tally.cut_short = 1;
     }
 
     // A cursor says there may be more below this point. That is only true if the page filled: a
@@ -2974,10 +3222,22 @@ fn collect_matches_ordered(
     let needed: HashSet<u32> = page.entries.iter().map(|entry| entry.segment).collect();
     tally.segments_wasted = tally.segments_opened - needed.len() as u64;
     let resolving = Instant::now();
-    let resume_at = page.weakest().map(|weakest| Cursor {
-        prefix: window.unorient(weakest.prefix),
-        primary_key: key_of(weakest.primary_id.into()),
-    });
+    let resume_at = match cut_at {
+        Some(cut_at) => {
+            // Every row at the key or under it, whatever its later slots.
+            let mut prefix = SortPrefix([u64::MAX; PREFIX_SLOTS]);
+            prefix.0[0] = (cut_at >> 64) as u64;
+            prefix.0[1] = cut_at as u64;
+            Some(Cursor {
+                prefix: window.unorient(prefix),
+                primary_key: None,
+            })
+        }
+        None => page.weakest().map(|weakest| Cursor {
+            prefix: window.unorient(weakest.prefix),
+            primary_key: key_of(weakest.primary_id.into()),
+        }),
+    };
     let ids = page
         .entries
         .iter()
@@ -3054,6 +3314,7 @@ fn handle_like(
     pattern: String,
     limit: Limit,
     window: SearchWindow,
+    budget: SearchBudget,
 ) -> PatternLikeR {
     let text_field = state.schema.get_field(TEXT_FIELD).unwrap();
     let pattern = state.backend().options.case_sensitive.fold(pattern);
@@ -3094,7 +3355,7 @@ fn handle_like(
         let key_of =
             |primary_id: PrimaryId| table.read().unwrap().primary_key(partition_id, primary_id);
         let sort_window = SortWindow::new(forward, window.cursor, min_first, max_first);
-        collect_matches_ordered(state, &mut like, limit, sort_window, &key_of)?
+        collect_matches_ordered(state, &mut like, limit, sort_window, &key_of, budget)?
     };
 
     let table = table.read().unwrap();
@@ -3107,6 +3368,7 @@ fn handle_like(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn new(
     index: PatternIndexConfiguration,
     table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
@@ -3115,6 +3377,7 @@ pub(crate) fn new(
     commit_interval: Duration,
     commit_threshold: usize,
     metrics: Option<Arc<Metrics>>,
+    search_budget: SearchBudget,
 ) -> mpsc::Sender<PatternIndex> {
     let (tx, mut rx) = mpsc::channel::<PatternIndex>(perf::channel_size().into());
     tokio::spawn(async move {
@@ -3226,6 +3489,7 @@ pub(crate) fn new(
                                         pattern,
                                         limit,
                                         window,
+                                        search_budget,
                                     );
                                     _ = tx.send(result);
                                 })
@@ -3410,6 +3674,7 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             commit_threshold,
             None,
+            SearchBudget::default(),
         )
     }
 
@@ -3426,6 +3691,7 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
             None,
+            SearchBudget::default(),
         )
     }
 
@@ -4973,6 +5239,7 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
             None,
+            SearchBudget::default(),
         )
     }
 
@@ -5190,6 +5457,7 @@ mod tests {
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
             None,
+            SearchBudget::default(),
         );
         let (tx, mut rx) = mpsc::channel(1);
         for n in 1..=rows {
@@ -5287,6 +5555,7 @@ mod tests {
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
             None,
+            SearchBudget::default(),
         );
         let started = Instant::now();
         let (tx, mut rx) = mpsc::channel(1);
@@ -5393,6 +5662,7 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             TEST_COMMIT_THRESHOLD,
             None,
+            SearchBudget::default(),
         )
     }
 
@@ -5782,6 +6052,142 @@ mod tests {
 
     /// The ids `i -> i * 1103 + 977 (mod rows)`, plus one: a fixed shuffle of `1..=rows` for a
     /// `rows` coprime with 1103.
+    fn make_sender_with_budget(
+        options: IndexOptionsPattern,
+        commit_threshold: usize,
+        search_budget: SearchBudget,
+    ) -> mpsc::Sender<PatternIndex> {
+        new(
+            PatternIndexConfiguration {
+                key: make_index_key(),
+                options,
+                key_layout: test_layout(),
+            },
+            make_table_with_keys(),
+            worker::new(),
+            make_memory_actor(Allocate::Can),
+            TEST_COMMIT_INTERVAL,
+            commit_threshold,
+            None,
+            search_budget,
+        )
+    }
+
+    /// A row of the budget tests: a thirtieth hold the keyword 甲乙丙丁, and a third all of its
+    /// grams apart, which the index can only tell from the keyword by reading the value.
+    fn nominated(primary: u64) -> String {
+        if primary.is_multiple_of(30) {
+            format!("user{primary}甲乙丙丁")
+        } else if primary.is_multiple_of(3) {
+            format!("user{primary}甲乙丙之乙丙丁")
+        } else {
+            format!("user{primary}将军")
+        }
+    }
+
+    /// Every page of `query` from the first, each from the cursor of the one before: the ids in
+    /// the order they came, and how many pages came with fewer rows than `limit_n` and a cursor.
+    async fn pages_by_cursor(
+        sender: &mpsc::Sender<PatternIndex>,
+        query: &str,
+        limit_n: usize,
+        order: Option<SortOrder>,
+    ) -> (Vec<i64>, usize) {
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        let mut short = 0;
+        for _ in 0..100_000 {
+            let window = SearchWindow {
+                order,
+                cursor,
+                ..SearchWindow::default()
+            };
+            let page = like(sender, &containing(query), limit_n, window).await;
+            let got = ids_of(&page.primary_keys);
+            if page.next_cursor.is_some() && got.len() < limit_n {
+                short += 1;
+            }
+            ids.extend(got);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return (ids, short);
+            }
+        }
+        panic!("the cursors do not come to an end");
+    }
+
+    /// A search whose budget ends returns the rows it has settled and a cursor, and the pages
+    /// that follow from the cursors hold every match once, in order: whatever the page size and
+    /// the direction, over sorted runs and over segments that have none, and with no time at
+    /// all, when a request gets only as far as it must to leave a cursor past the one it came
+    /// with.
+    #[rstest]
+    #[case::sorted_runs(true, Some(300), None)]
+    #[case::no_runs(false, Some(300), None)]
+    #[case::no_time_at_all(true, None, Some(Duration::ZERO))]
+    #[timeout(Duration::from_secs(180))]
+    #[tokio::test]
+    async fn a_budget_cuts_a_page_short_and_loses_no_row_and_no_order(
+        #[case] repair: bool,
+        #[case] work: Option<u64>,
+        #[case] time: Option<Duration>,
+    ) {
+        let rows = 9_000u64;
+        let options = IndexOptionsPattern {
+            rewrite_wide_segments: RewriteWideSegments::from(repair),
+            ..capped_options(4_000)
+        };
+        let limited = make_sender_with_budget(options.clone(), 2000, SearchBudget { time, work });
+        let unlimited = make_sender_with_threshold(options, 2000);
+        for sender in [&limited, &unlimited] {
+            add_batch(sender, shuffled(rows), nominated).await;
+            let deadline = Instant::now() + Duration::from_secs(75);
+            let mut quiet = 0;
+            while quiet < 3 {
+                let stats = sender.stats(make_index_key()).await.unwrap();
+                let still = stats.tantivy.num_docs == rows
+                    && stats.merges.running == 0
+                    && !stats.rewrite.pending
+                    && (!repair
+                        || (stats.rewrite.docs_rewritten > 0 && stats.overlap.fresh_rows == 0));
+                quiet = if still { quiet + 1 } else { 0 };
+                assert!(Instant::now() < deadline, "not settled: {stats:?}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        let newest_first: Vec<i64> = (1..=rows as i64).rev().filter(|id| id % 30 == 0).collect();
+        let (whole, short) = pages_by_cursor(&unlimited, "甲乙丙丁", 10_000, None).await;
+        assert_eq!(whole, newest_first);
+        assert_eq!(short, 0);
+        assert_eq!(
+            unlimited
+                .stats(make_index_key())
+                .await
+                .unwrap()
+                .walk
+                .cut_short,
+            0
+        );
+
+        for limit_n in [7, 10_000] {
+            let (ids, _) = pages_by_cursor(&limited, "甲乙丙丁", limit_n, None).await;
+            assert_eq!(ids, newest_first, "pages of {limit_n}");
+            let (ids, _) =
+                pages_by_cursor(&limited, "甲乙丙丁", limit_n, Some(SortOrder::Asc)).await;
+            let oldest_first: Vec<i64> = newest_first.iter().rev().copied().collect();
+            assert_eq!(ids, oldest_first, "pages of {limit_n}, ascending");
+        }
+        // No row in the answer, and every candidate still read: by many requests.
+        // Every gram of this one is in a third of the rows, and the keyword in none.
+        let (none, short) = pages_by_cursor(&limited, "乙丙之乙丙之", 20, None).await;
+        assert_eq!(none, Vec::<i64>::new());
+        assert!(short > 0);
+        let walk = limited.stats(make_index_key()).await.unwrap().walk;
+        assert!(walk.cut_short > 0, "{walk:?}");
+        assert!(walk.cut_short < walk.searches, "{walk:?}");
+    }
+
     fn shuffled(rows: u64) -> impl Iterator<Item = u64> {
         (0..rows).map(move |i| (i * 1103 + 977) % rows + 1)
     }
@@ -6259,6 +6665,13 @@ mod tests {
             ),
             MAX_UNCOMMITTED_THRESHOLD,
             None,
+            // MATRIX_BUDGET_MS: the budget of a search request, none without it.
+            SearchBudget {
+                time: std::env::var("MATRIX_BUDGET_MS")
+                    .ok()
+                    .map(|millis| Duration::from_millis(millis.parse().unwrap())),
+                work: None,
+            },
         );
         let started = Instant::now();
         let stream = state == "stream";
@@ -6453,6 +6866,34 @@ mod tests {
                     per(after.walk_nanos, before.walk_nanos) / 1e3,
                     wall,
                 );
+                // With a budget a request may return a short page: what the whole page costs,
+                // request after request from the cursors, and the longest of the requests.
+                if std::env::var("MATRIX_BUDGET_MS").is_ok() {
+                    let (mut rows, mut requests, mut longest) = (0usize, 0u32, Duration::ZERO);
+                    let mut next = window.clone();
+                    let clock = Instant::now();
+                    loop {
+                        let asked = Instant::now();
+                        let page =
+                            like(&sender, &pattern_of(keyword), *limit_n - rows, next.clone())
+                                .await;
+                        longest = longest.max(asked.elapsed());
+                        requests += 1;
+                        rows += page.primary_keys.len();
+                        match page.next_cursor {
+                            // Not for ever, if requests get nowhere.
+                            Some(cursor) if rows < *limit_n && requests < 500 => {
+                                next.cursor = Some(cursor)
+                            }
+                            _ => break,
+                        }
+                    }
+                    println!(
+                        "BUDGET|{state}|{label}|{shape}|{limit_n}|{rows}|{requests}|{:.0}|{:.0}",
+                        clock.elapsed().as_secs_f64() * 1e6,
+                        longest.as_secs_f64() * 1e6,
+                    );
+                }
                 // MATRIX_WHOLE: every segment read whole, none, and as the walk chooses, by turns:
                 // where the two readings cross, and whether the choice follows.
                 if std::env::var("MATRIX_WHOLE").is_ok() {
@@ -6561,6 +7002,7 @@ mod tests {
             TEST_COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
             None,
+            SearchBudget::default(),
         );
         let ids: Vec<u64> = (0..rows)
             .map(|i| (i * 1_000_003 + 977) % rows + 1)
@@ -6685,6 +7127,7 @@ mod tests {
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
             None,
+            SearchBudget::default(),
         );
         let ids: Vec<u64> = (0..rows)
             .map(|i| (i * 1_000_003 + 977) % rows + 1)
@@ -6795,6 +7238,7 @@ mod tests {
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
             None,
+            SearchBudget::default(),
         );
         let histogram = prometheus::Histogram::with_opts(
             prometheus::HistogramOpts::new("lag", "lag")

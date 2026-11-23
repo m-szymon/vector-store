@@ -172,6 +172,10 @@ pub(crate) const PATTERN_SEARCH_TOTALS: &[(&str, &str)] = &[
         "pattern_search_segments_wasted_total",
         "Segments an ordered pattern search opened that put no row on its page, summed over searches",
     ),
+    (
+        "pattern_search_cut_short_total",
+        "Pattern searches their budget ended before the page was settled: they returned what was, with a cursor to go on from",
+    ),
 ];
 
 /// The gauges of the repair of a pattern index's layout, in the order `pattern_rewrite` holds
@@ -806,6 +810,7 @@ async fn refresh_index(
                 walk.prepare_nanos as f64 / 1e9,
                 walk.page_resolve_nanos as f64 / 1e9,
                 walk.segments_wasted as f64,
+                walk.cut_short as f64,
             ];
             for (gauge, value) in metrics.pattern_search_totals.iter().zip(totals) {
                 gauge.with_label_values(&labels).set(value);
