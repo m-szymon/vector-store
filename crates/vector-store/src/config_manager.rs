@@ -232,21 +232,7 @@ impl ConfigManager {
             ));
         }
 
-        // Check the worker pool's scheduling
-        if old_config.indexing_queue_budget != new_config.indexing_queue_budget
-            || old_config.min_search_share_pct != new_config.min_search_share_pct
-            || old_config.min_background_share_pct != new_config.min_background_share_pct
-        {
-            changes.push(format!(
-                "Worker scheduling: budget {:?}, minimum search share {:?}%, minimum background share {:?}% -> budget {:?}, minimum search share {:?}%, minimum background share {:?}%",
-                old_config.indexing_queue_budget,
-                old_config.min_search_share_pct,
-                old_config.min_background_share_pct,
-                new_config.indexing_queue_budget,
-                new_config.min_search_share_pct,
-                new_config.min_background_share_pct
-            ));
-        }
+        // The worker pool's scheduling takes effect without a restart: the pool follows it.
 
         // Log all changes if any were detected
         if !changes.is_empty() {

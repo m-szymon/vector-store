@@ -1368,19 +1368,40 @@ pub async fn run(
         .pattern_search_budget
         .unwrap_or(pattern_index::DEFAULT_SEARCH_BUDGET);
     let worker = {
-        let config = config_rx.borrow();
-        let defaults = worker::Scheduling::default();
-        worker::with_scheduling(worker::Scheduling {
-            indexing_queue_budget: config
-                .indexing_queue_budget
-                .unwrap_or(defaults.indexing_queue_budget),
-            min_search_share: config
-                .min_search_share_pct
-                .map_or(defaults.min_search_share, |pct| f64::from(pct) / 100.0),
-            min_background_share: config
-                .min_background_share_pct
-                .map_or(defaults.min_background_share, |pct| f64::from(pct) / 100.0),
-        })
+        // The pool follows the configuration as it is reloaded.
+        let scheduling = |config: &Config| {
+            let defaults = worker::Scheduling::default();
+            worker::Scheduling {
+                indexing_queue_budget: config
+                    .indexing_queue_budget
+                    .unwrap_or(defaults.indexing_queue_budget),
+                min_search_share: config
+                    .min_search_share_pct
+                    .map_or(defaults.min_search_share, |pct| f64::from(pct) / 100.0),
+                min_background_share: config
+                    .min_background_share_pct
+                    .map_or(defaults.min_background_share, |pct| f64::from(pct) / 100.0),
+            }
+        };
+        let (scheduling_tx, scheduling_rx) =
+            tokio::sync::watch::channel(scheduling(&config_rx.borrow()));
+        tokio::spawn({
+            let mut config_rx = config_rx.clone();
+            async move {
+                while config_rx.changed().await.is_ok() {
+                    let new = scheduling(&config_rx.borrow_and_update());
+                    scheduling_tx.send_if_modified(|current| {
+                        let changed = *current != new;
+                        if changed {
+                            tracing::info!("worker scheduling changed: {current:?} -> {new:?}");
+                            *current = new;
+                        }
+                        changed
+                    });
+                }
+            }
+        });
+        worker::with_scheduling(scheduling_rx)
     };
 
     let vs_index_factory = if let Some(addr) = opensearch_addr {

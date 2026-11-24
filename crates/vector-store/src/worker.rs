@@ -28,6 +28,9 @@
 //! at once and tells the sender when the queue has room
 //! ([`WorkerExt::spawn_background_blocking`]): a full scan then waits for that, at the pace of
 //! its share, without holding up what the other classes send through the same channel.
+//!
+//! The policy can change while the node runs: the workers read [`Scheduling`] from a watch
+//! channel for every task they take.
 
 use crate::perf;
 use async_channel::Sender;
@@ -46,6 +49,7 @@ use tokio::runtime::Builder;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::error_span;
@@ -420,7 +424,8 @@ struct Shared {
     work: Notify,
     /// Signalled when an indexing task is taken, so that a full indexing queue takes more.
     room: Notify,
-    scheduling: Scheduling,
+    /// The policy, as it is now: read for every task taken.
+    scheduling: watch::Receiver<Scheduling>,
 }
 
 /// Totals since the process started, over every pool, for `/metrics`: per class, the tasks run,
@@ -531,10 +536,11 @@ async fn run_in_thread(
 
 #[cfg(test)]
 pub(crate) fn new() -> Sender<Worker> {
-    with_scheduling(Scheduling::default())
+    with_scheduling(watch::channel(Scheduling::default()).1)
 }
 
-pub(crate) fn with_scheduling(scheduling: Scheduling) -> Sender<Worker> {
+/// A pool whose workers follow `scheduling` as it changes.
+pub(crate) fn with_scheduling(scheduling: watch::Receiver<Scheduling>) -> Sender<Worker> {
     let capacity = perf::channel_size().into();
     let (tx_worker, rx_worker) = async_channel::bounded::<Worker>(capacity);
     let (tx_thread, mut rx_thread) = mpsc::channel::<(NewTaskFuture, oneshot::Sender<()>)>(1);
@@ -625,7 +631,8 @@ pub(crate) fn with_scheduling(scheduling: Scheduling) -> Sender<Worker> {
                     let work = shared.work.notified();
                     let next = {
                         let mut queues = shared.queues.lock().unwrap();
-                        let next = queues.take(&shared.scheduling, Instant::now());
+                        let scheduling = *shared.scheduling.borrow();
+                        let next = queues.take(&scheduling, Instant::now());
                         if next.is_none() && queues.closed && queues.is_empty() {
                             break;
                         }
@@ -912,6 +919,16 @@ mod tests {
     }
 
     async fn run_order(scheduling: Scheduling, sent: &[TaskClass]) -> Vec<TaskClass> {
+        run_order_following(watch::channel(scheduling).1, sent, || ()).await
+    }
+
+    /// The order tasks sent in the order of `sent` ran in, all queued before any could run;
+    /// `queued` is called once they are, before the workers are let go.
+    async fn run_order_following(
+        scheduling: watch::Receiver<Scheduling>,
+        sent: &[TaskClass],
+        queued: impl FnOnce(),
+    ) -> Vec<TaskClass> {
         let worker = with_scheduling(scheduling);
         // Hold every worker, so that what is sent next queues up behind them.
         let workers: usize = perf::num_workers().into();
@@ -942,6 +959,7 @@ mod tests {
         }
         // Let the dispatcher queue all of it before the workers are let go.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        queued();
         release_tx.close();
         let mut ran = Vec::with_capacity(sent.len());
         for _ in sent {
@@ -1043,5 +1061,23 @@ mod tests {
             ran.push(ran_rx.recv().await.unwrap());
         }
         assert_eq!(ran.iter().filter(|class| **class == "search").count(), 1);
+    }
+
+    /// A change of the policy reaches a pool that is running: the tasks queued under one policy
+    /// are taken by the one in force when a worker comes free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_policy_in_force_is_the_one_last_sent() {
+        use TaskClass::Indexing;
+        use TaskClass::Search;
+        let (tx, rx) = watch::channel(Scheduling::default());
+        let searches_first = Scheduling {
+            indexing_queue_budget: Duration::from_secs(3600),
+            ..Scheduling::default()
+        };
+        let ran = run_order_following(rx, &[Indexing, Search, Search], || {
+            tx.send(searches_first).unwrap()
+        })
+        .await;
+        assert_eq!(&ran[..2], &[Search, Search], "{ran:?}");
     }
 }
