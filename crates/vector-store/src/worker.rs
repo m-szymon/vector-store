@@ -139,6 +139,9 @@ pub(crate) trait WorkerExt {
     /// A write of an index: `spawn_background_blocking` for one of a full scan,
     /// `spawn_indexing_blocking` otherwise.
     async fn spawn_write_blocking(&self, background: bool, f: impl FnOnce() + Send + 'static) {
+        // A benchmark test's switch: the writes of a full scan as indexing, as without the class.
+        #[cfg(test)]
+        let background = background && !BACKGROUND_OFF.load(Ordering::Relaxed);
         if background {
             self.spawn_background_blocking(f).await
         } else {
@@ -229,6 +232,10 @@ impl WorkerExt for Sender<Worker> {
 /// uncapped, every worker picked one in a moment with no search waiting and sat behind the
 /// commit, and the searches of the other indexes that came next waited for it to end.
 fn background_cap(workers: usize) -> usize {
+    #[cfg(test)]
+    if BACKGROUND_CAP_OFF.load(Ordering::Relaxed) {
+        return workers;
+    }
     (workers / 2).max(1)
 }
 
@@ -363,6 +370,22 @@ struct Queued {
     msg: Worker,
     enqueued: Instant,
 }
+
+/// A benchmark test's trace: while it holds a list, the tasks that waited or ran for 2 ms or
+/// more, as (taken at, class, time in the queue, time running).
+#[cfg(test)]
+pub(crate) static TRACE: Mutex<Option<Vec<Traced>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) type Traced = (Instant, TaskClass, Duration, Duration);
+
+#[cfg(test)]
+pub(crate) static BACKGROUND_CAP_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) static BACKGROUND_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 pub(crate) static FIFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -689,6 +712,12 @@ pub(crate) fn with_scheduling(scheduling: watch::Receiver<Scheduling>) -> Sender
                     let finished = Instant::now();
                     let busy = finished.saturating_duration_since(started);
                     STATS.record(class, queue_wait, busy);
+                    #[cfg(test)]
+                    if queue_wait.max(busy) >= Duration::from_millis(2)
+                        && let Some(trace) = TRACE.lock().unwrap().as_mut()
+                    {
+                        trace.push((started, class, queue_wait, busy));
+                    }
                     let mut queues = shared.queues.lock().unwrap();
                     queues.recent.add(class, busy, finished);
                     if class == TaskClass::Background {

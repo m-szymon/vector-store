@@ -7472,6 +7472,286 @@ mod tests {
         }
     }
 
+    /// An index built by a full scan beside the searches of another, on one pool of workers:
+    /// what the build costs the searches, and the searches the build. BUILD_SEARCHERS (8)
+    /// searches are kept going on a settled index of MATRIX_ROWS rows, each BUILD_THINK_MS (0)
+    /// after the last; after 10 s of them alone, a second index takes BUILD_ROWS rows of a full
+    /// scan. BUILD_CLASS=indexing sends those as indexing, as before the background class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn a_build_beside_the_searches_of_another_index() {
+        let env = |name: &str, default: u64| -> u64 {
+            std::env::var(name).map_or(default, |value| value.parse().unwrap())
+        };
+        let rows = env("MATRIX_ROWS", 1_000_000);
+        let build_rows = env("BUILD_ROWS", 1_000_000);
+        let searchers = env("BUILD_SEARCHERS", 8);
+        let think = Duration::from_millis(env("BUILD_THINK_MS", 0));
+        let class = std::env::var("BUILD_CLASS").unwrap_or_else(|_| "background".into());
+        worker::BACKGROUND_OFF.store(class == "indexing", Relaxed);
+        // BUILD_CAP=off: as many background tasks at once as there are workers.
+        worker::BACKGROUND_CAP_OFF.store(
+            std::env::var("BUILD_CAP").is_ok_and(|cap| cap == "off"),
+            Relaxed,
+        );
+        MATRIX_ROWS.store(rows.max(build_rows), Relaxed);
+        let worker = worker::new();
+        let index = |worker: &async_channel::Sender<Worker>| {
+            new(
+                PatternIndexConfiguration {
+                    key: make_index_key(),
+                    options: capped_options(DEFAULT_SEGMENT_ROWS.get()),
+                    key_layout: test_layout(),
+                },
+                make_table(bigint_key, |id, _| Some(CqlValue::BigInt(id as i64))),
+                worker.clone(),
+                make_memory_actor(Allocate::Can),
+                COMMIT_INTERVAL,
+                MAX_UNCOMMITTED_THRESHOLD,
+                None,
+                SearchBudget {
+                    time: Some(DEFAULT_SEARCH_BUDGET),
+                    work: None,
+                },
+            )
+        };
+        let served = index(&worker);
+        let shuffled = |rows: u64| (0..rows).map(move |i| (i * 1_000_003 + 977) % rows + 1);
+        let ids: Vec<u64> = shuffled(rows).collect();
+        for chunk in ids.chunks(100_000) {
+            add_batch(&served, chunk.iter().copied(), matrix_name).await;
+        }
+        settled(&served, 3600, |stats| stats.overlap.fresh_rows == 0).await;
+
+        // 0: warm-up, 1: the searches alone, 2: beside the build, 3: done.
+        let phase = Arc::new(AtomicU32::new(0));
+        let times = Arc::new(Mutex::new([Vec::<u32>::new(), Vec::new()]));
+        // BUILD_TRACE: the searches beside the build that took 5 ms or more, and the pool's
+        // tasks that waited or ran 2 ms or more, by the time they started.
+        let tracing = std::env::var("BUILD_TRACE").is_ok();
+        let slow = Arc::new(Mutex::new(Vec::<(Instant, Duration)>::new()));
+        let mut tasks = Vec::new();
+        for _ in 0..searchers {
+            let (served, phase, times) = (served.clone(), phase.clone(), times.clone());
+            let slow = slow.clone();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let at = phase.load(Relaxed);
+                    if at == 3 {
+                        break;
+                    }
+                    let clock = Instant::now();
+                    search_ordered(&served, "号玩家1", 200, SearchWindow::default()).await;
+                    let took = clock.elapsed().as_micros() as u32;
+                    if at == 1 || at == 2 {
+                        times.lock().unwrap()[at as usize - 1].push(took);
+                    }
+                    if at == 2 && took >= 5000 {
+                        slow.lock().unwrap().push((clock, clock.elapsed()));
+                    }
+                    if !think.is_zero() {
+                        tokio::time::sleep(think).await;
+                    }
+                }
+            }));
+        }
+        // Where the time goes: the pool's totals per class, and the CPU time of the process's
+        // threads by name, read before and after each phase.
+        let cpu_by_thread = || -> std::collections::BTreeMap<String, f64> {
+            let mut cpu = std::collections::BTreeMap::new();
+            for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+                let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+                    continue;
+                };
+                // pid (comm) state ...: the name may hold spaces, so split at the last ')'.
+                let (head, tail) = stat.rsplit_once(')').unwrap();
+                let name = head.split_once('(').unwrap().1;
+                let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-');
+                let fields: Vec<&str> = tail.split_whitespace().collect();
+                let ticks: f64 =
+                    fields[11].parse::<f64>().unwrap() + fields[12].parse::<f64>().unwrap();
+                *cpu.entry(name.to_string()).or_insert(0.0) += ticks / 100.0;
+            }
+            cpu
+        };
+        type Reading = (
+            [(worker::TaskClass, u64, f64, f64); 3],
+            std::collections::BTreeMap<String, f64>,
+        );
+        let reading = || -> Reading { (worker::STATS.snapshot(), cpu_by_thread()) };
+        let spent = |label: &str, before: &Reading, after: &Reading, over: Duration| {
+            for (b, a) in before.0.iter().zip(&after.0) {
+                let tasks = (a.1 - b.1).max(1) as f64;
+                println!(
+                    "BUILD pool {label}: {} tasks {:.0}, in the queue {:.0} us each, running {:.0} us each, {:.2} workers busy",
+                    a.0.name(),
+                    tasks,
+                    (a.2 - b.2) * 1e6 / tasks,
+                    (a.3 - b.3) * 1e6 / tasks,
+                    (a.3 - b.3) / over.as_secs_f64(),
+                );
+            }
+            let cores: Vec<String> = after
+                .1
+                .iter()
+                .map(|(name, cpu)| (name, cpu - before.1.get(name).copied().unwrap_or(0.0)))
+                .filter(|(_, cpu)| *cpu / over.as_secs_f64() >= 0.02)
+                .map(|(name, cpu)| format!("{name} {:.2}", cpu / over.as_secs_f64()))
+                .collect();
+            println!("BUILD cores {label}: {}", cores.join(", "));
+        };
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        phase.store(1, Relaxed);
+        let alone = Duration::from_secs(10);
+        let before = reading();
+        tokio::time::sleep(alone).await;
+        spent("alone", &before, &reading(), alone);
+
+        phase.store(2, Relaxed);
+        let before = reading();
+        let started = Instant::now();
+        if tracing {
+            *worker::TRACE.lock().unwrap() = Some(Vec::new());
+        }
+        // Controls in place of a build, BUILD_SPIN threads for 10 s: BUILD_CLASS=spin keeps
+        // them computing, which takes cores and nothing else; BUILD_CLASS=memory keeps them
+        // copying 64 MB, which takes the memory and the caches too.
+        if class == "spin" || class == "memory" {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let threads: Vec<_> = (0..env("BUILD_SPIN", 2))
+                .map(|_| {
+                    let (stop, memory) = (stop.clone(), class == "memory");
+                    std::thread::spawn(move || {
+                        let from = vec![1u8; 64 << 20];
+                        let mut to = vec![0u8; 64 << 20];
+                        let mut sum = 0u64;
+                        while !stop.load(Relaxed) {
+                            if memory {
+                                to.copy_from_slice(&from);
+                                sum += u64::from(to[sum as usize % to.len()]);
+                            } else {
+                                for i in 0..1_000_000u64 {
+                                    sum = sum.wrapping_mul(6364136223846793005).wrapping_add(i);
+                                }
+                            }
+                        }
+                        std::hint::black_box(sum);
+                    })
+                })
+                .collect();
+            tokio::time::sleep(alone).await;
+            stop.store(true, Relaxed);
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            let over = started.elapsed();
+            spent("beside the control", &before, &reading(), over);
+            phase.store(3, Relaxed);
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let times = std::mem::take(&mut *times.lock().unwrap());
+            for (label, mut times, over) in [
+                ("alone", times[0].clone(), alone),
+                ("beside", times[1].clone(), over),
+            ] {
+                times.sort_unstable();
+                let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+                println!(
+                    "BUILD|{class}|{searchers} searchers|{label}: {:.0} q/s p50 {} p90 {} p99 {} max {} us",
+                    times.len() as f64 / over.as_secs_f64(),
+                    at(0.5),
+                    at(0.9),
+                    at(0.99),
+                    at(1.0)
+                );
+            }
+            return;
+        }
+        let built = index(&worker);
+        for primary in shuffled(build_rows) {
+            let (tx, _rx) = mpsc::channel(1);
+            built
+                .add_document(
+                    test_partition_id(),
+                    primary.into(),
+                    matrix_name(primary),
+                    AsyncInProgress::fullscan(tx),
+                )
+                .await
+                .unwrap();
+        }
+        let sent = started.elapsed();
+        while built
+            .stats(make_index_key())
+            .await
+            .unwrap()
+            .tantivy
+            .num_docs
+            < build_rows
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let searchable = started.elapsed();
+        spent("beside the build", &before, &reading(), searchable);
+        if let Some(trace) = worker::TRACE.lock().unwrap().take() {
+            let ms = |at: Instant| at.saturating_duration_since(started).as_secs_f64() * 1e3;
+            let mut lines: Vec<(f64, String)> = trace
+                .iter()
+                .map(|(at, class, waited, ran)| {
+                    (
+                        ms(*at),
+                        format!(
+                            "task {} waited {:.1} ms ran {:.1} ms",
+                            class.name(),
+                            waited.as_secs_f64() * 1e3,
+                            ran.as_secs_f64() * 1e3
+                        ),
+                    )
+                })
+                .chain(slow.lock().unwrap().iter().map(|(at, took)| {
+                    (
+                        ms(*at),
+                        format!("search took {:.1} ms", took.as_secs_f64() * 1e3),
+                    )
+                }))
+                .collect();
+            lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (at, line) in lines {
+                println!("TRACE {at:9.1} ms {line}");
+            }
+        }
+        phase.store(3, Relaxed);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let times = std::mem::take(&mut *times.lock().unwrap());
+        let report = |mut times: Vec<u32>, over: Duration| {
+            if times.is_empty() {
+                return "no searches".to_string();
+            }
+            times.sort_unstable();
+            let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+            format!(
+                "{:.0} q/s p50 {} p90 {} p99 {} max {} us",
+                times.len() as f64 / over.as_secs_f64(),
+                at(0.5),
+                at(0.9),
+                at(0.99),
+                at(1.0)
+            )
+        };
+        let [before, during] = times;
+        println!(
+            "BUILD|{class}|{searchers} searchers, think {} ms|{rows} rows served, {build_rows} built|alone: {}|beside the build: {}|rows sent in {:.1}s, searchable in {:.1}s",
+            think.as_millis(),
+            report(before, alone),
+            report(during, searchable),
+            sent.as_secs_f64(),
+            searchable.as_secs_f64(),
+        );
+    }
+
     /// CDC changes that lag behind the table hold the repair back while they arrive, however
     /// many fresh rows pile up; once they stop, the idle ticks repair everything. AWS run 7a300b9d
     /// repaired while its indexes ingested a load minutes behind, and caught up 2.8x later.
