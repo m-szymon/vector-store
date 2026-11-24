@@ -591,8 +591,11 @@ where
         }
         let key = self.key.clone();
         let commit_threshold = self.commit_threshold;
+        // A row of a full scan builds an index nobody searches yet: it waits for the searches
+        // and the live writes of the other indexes.
+        let background = in_progress.is_fullscan();
         self.worker
-            .spawn_indexing_blocking(move || {
+            .spawn_write_blocking(background, move || {
                 let doc = make_doc(&index);
                 let pending = add_document(&index, primary_id, commit_key, doc, in_progress);
                 if pending >= commit_threshold {
@@ -612,8 +615,10 @@ where
         };
         let key = self.key.clone();
         let commit_threshold = self.commit_threshold;
+        // In the class of the add that follows it, so that the two run in the order sent.
+        let background = in_progress.is_fullscan();
         self.worker
-            .spawn_indexing_blocking(move || {
+            .spawn_write_blocking(background, move || {
                 let pending = remove_document(&index, primary_id, in_progress);
                 if pending >= commit_threshold {
                     commit(&index, &key);

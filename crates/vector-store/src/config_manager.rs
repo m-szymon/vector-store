@@ -235,13 +235,16 @@ impl ConfigManager {
         // Check the worker pool's scheduling
         if old_config.indexing_queue_budget != new_config.indexing_queue_budget
             || old_config.min_search_share_pct != new_config.min_search_share_pct
+            || old_config.min_background_share_pct != new_config.min_background_share_pct
         {
             changes.push(format!(
-                "Worker scheduling: budget {:?}, minimum search share {:?}% -> budget {:?}, minimum search share {:?}%",
+                "Worker scheduling: budget {:?}, minimum search share {:?}%, minimum background share {:?}% -> budget {:?}, minimum search share {:?}%, minimum background share {:?}%",
                 old_config.indexing_queue_budget,
                 old_config.min_search_share_pct,
+                old_config.min_background_share_pct,
                 new_config.indexing_queue_budget,
-                new_config.min_search_share_pct
+                new_config.min_search_share_pct,
+                new_config.min_background_share_pct
             ));
         }
 
@@ -451,6 +454,18 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
             "VECTOR_STORE_MIN_SEARCH_SHARE is a percentage, 0 to 100, not {pct}"
         );
         config.min_search_share_pct = Some(pct);
+    }
+
+    if let Some(pct) = env("VECTOR_STORE_MIN_BACKGROUND_SHARE")
+        .ok()
+        .map(|v| v.parse::<u8>())
+        .transpose()?
+    {
+        anyhow::ensure!(
+            pct <= 100,
+            "VECTOR_STORE_MIN_BACKGROUND_SHARE is a percentage, 0 to 100, not {pct}"
+        );
+        config.min_background_share_pct = Some(pct);
     }
 
     if let Some(budget) = env("VECTOR_STORE_PATTERN_SEARCH_BUDGET")
@@ -907,10 +922,12 @@ mod tests {
         let config = load_config(env).await.unwrap();
         assert_eq!(config.indexing_queue_budget, None);
         assert_eq!(config.min_search_share_pct, None);
+        assert_eq!(config.min_background_share_pct, None);
 
         let env = mock_env(HashMap::from([
             ("VECTOR_STORE_INDEXING_QUEUE_BUDGET", "250ms".into()),
             ("VECTOR_STORE_MIN_SEARCH_SHARE", "40".into()),
+            ("VECTOR_STORE_MIN_BACKGROUND_SHARE", "0".into()),
         ]));
         let config = load_config(env).await.unwrap();
         assert_eq!(
@@ -918,12 +935,15 @@ mod tests {
             Some(Duration::from_millis(250))
         );
         assert_eq!(config.min_search_share_pct, Some(40));
+        assert_eq!(config.min_background_share_pct, Some(0));
 
-        let env = mock_env(HashMap::from([(
+        for share in [
             "VECTOR_STORE_MIN_SEARCH_SHARE",
-            "140".into(),
-        )]));
-        assert!(load_config(env).await.is_err());
+            "VECTOR_STORE_MIN_BACKGROUND_SHARE",
+        ] {
+            let env = mock_env(HashMap::from([(share, "140".into())]));
+            assert!(load_config(env).await.is_err());
+        }
     }
 
     #[tokio::test]

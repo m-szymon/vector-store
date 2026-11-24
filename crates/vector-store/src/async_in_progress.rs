@@ -57,6 +57,8 @@ pub struct AsyncInProgress {
     _dirty: Option<DirtyFlag>,
     _state: State,
     applied: Option<Applied>,
+    /// Whether the change is of a row of a full scan: kept by the guards made from this one.
+    fullscan: bool,
 }
 
 impl AsyncInProgress {
@@ -65,6 +67,7 @@ impl AsyncInProgress {
             _dirty: None,
             _state: State::None,
             applied: None,
+            fullscan: false,
         }
     }
 
@@ -73,6 +76,7 @@ impl AsyncInProgress {
             _dirty: None,
             _state: State::Fullscan(tx),
             applied: None,
+            fullscan: true,
         }
     }
 
@@ -84,6 +88,7 @@ impl AsyncInProgress {
                 timestamp,
             })),
             applied: None,
+            fullscan: false,
         }
     }
 
@@ -98,12 +103,14 @@ impl AsyncInProgress {
     }
 
     /// A guard for another change of the same row, which marks the index dirty when dropped as
-    /// this one does, and holds nothing else.
+    /// this one does, and holds nothing else. It is of a full scan when this one is: the changes
+    /// of one row then wait in one queue of the worker pool, and run in the order they were sent.
     pub(crate) fn marker(&self) -> Self {
         Self {
             _dirty: self._dirty.clone(),
             _state: State::None,
             applied: None,
+            fullscan: self.fullscan,
         }
     }
 
@@ -133,9 +140,10 @@ impl AsyncInProgress {
         matches!(self._state, State::None)
     }
 
-    /// Whether the change this stands for is a row of a full scan.
+    /// Whether the change this stands for is of a row of a full scan: the row itself, or the
+    /// removal of its old value that goes before it.
     pub(crate) fn is_fullscan(&self) -> bool {
-        matches!(self._state, State::Fullscan(_))
+        self.fullscan
     }
 
     /// How long ago the change this stands for was written to the table, for a change read
@@ -145,5 +153,26 @@ impl AsyncInProgress {
             State::Cdc(cdc) => Some(cdc.timestamp.elapsed()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The later changes of a row of a full scan are of the full scan too: the worker pool
+    /// keeps them in one queue with the row's add, in the order they were sent.
+    #[test]
+    fn the_guards_made_from_a_full_scan_row_are_of_the_full_scan() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut row = AsyncInProgress::fullscan(tx);
+        assert!(row.is_fullscan());
+        assert!(row.marker().is_fullscan());
+        let taken = row.take();
+        assert!(taken.is_fullscan());
+        assert!(row.is_fullscan());
+
+        assert!(!AsyncInProgress::none().is_fullscan());
+        assert!(!AsyncInProgress::none().marker().is_fullscan());
     }
 }

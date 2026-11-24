@@ -682,6 +682,11 @@ mod tests {
             TEST_COMMIT_THRESHOLD,
         );
         let (tx, mut rx) = mpsc::channel(1);
+        // The commit interval's first tick comes at once. Let it pass with nothing to commit: a
+        // tick that found the first document there would commit it, and the two left would
+        // never make a threshold's worth. The rows of a full scan wait for the worker pool's
+        // word that it has room, which is time enough for that.
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
         for primary in 1..=TEST_COMMIT_THRESHOLD as u64 {
             sender

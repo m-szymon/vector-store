@@ -226,6 +226,9 @@ pub struct Config {
     /// The minimum share of the workers' time, in percent, searches get while they wait; see
     /// `worker::Scheduling`. `None`: `worker::DEFAULT_MIN_SEARCH_SHARE`.
     pub min_search_share_pct: Option<u8>,
+    /// The minimum share of the workers' time, in percent, the writes of a full scan get while
+    /// other work waits; see `worker::Scheduling`. `None`: `worker::DEFAULT_MIN_BACKGROUND_SHARE`.
+    pub min_background_share_pct: Option<u8>,
     /// How long one pattern search request may take before it returns what it has settled, with
     /// a cursor to go on from. `None`: `pattern_index::DEFAULT_SEARCH_BUDGET`. Zero: no limit.
     pub pattern_search_budget: Option<Duration>,
@@ -266,6 +269,7 @@ impl Default for Config {
             threads: None,
             indexing_queue_budget: None,
             min_search_share_pct: None,
+            min_background_share_pct: None,
             pattern_search_budget: None,
             memory_limit: None,
             memory_usage_check_interval: None,
@@ -1373,6 +1377,9 @@ pub async fn run(
             min_search_share: config
                 .min_search_share_pct
                 .map_or(defaults.min_search_share, |pct| f64::from(pct) / 100.0),
+            min_background_share: config
+                .min_background_share_pct
+                .map_or(defaults.min_background_share, |pct| f64::from(pct) / 100.0),
         })
     };
 
