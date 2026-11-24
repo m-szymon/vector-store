@@ -225,14 +225,8 @@ impl ConfigManager {
             ));
         }
 
-        if old_config.pattern_search_budget != new_config.pattern_search_budget {
-            changes.push(format!(
-                "Pattern search budget: {:?} -> {:?}",
-                old_config.pattern_search_budget, new_config.pattern_search_budget
-            ));
-        }
-
-        // The worker pool's scheduling takes effect without a restart: the pool follows it.
+        // The worker pool's scheduling and the pattern search budget take effect without a
+        // restart: the pool and the searches follow the configuration.
 
         // Log all changes if any were detected
         if !changes.is_empty() {

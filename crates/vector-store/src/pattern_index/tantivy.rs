@@ -73,11 +73,13 @@ use tantivy::schema::TextFieldIndexing;
 use tantivy::schema::TextOptions;
 use tantivy::schema::Value;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::Config;
 use crate::IndexKey;
 use crate::IndexOptionsPattern;
 use crate::Limit;
@@ -115,7 +117,7 @@ pub(crate) struct Factory {
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
     metrics: Arc<Metrics>,
-    search_budget: Option<Duration>,
+    config: watch::Receiver<Arc<Config>>,
 }
 
 /// What one search request may spend before it returns what it has settled, with a cursor the
@@ -137,6 +139,35 @@ pub(crate) struct SearchBudget {
 /// worker not to be missed.
 pub(crate) const DEFAULT_SEARCH_BUDGET: Duration = Duration::from_millis(50);
 
+/// Where a search request reads its budget as it starts: the node's configuration, which may be
+/// reloaded while the index serves.
+pub(crate) struct SearchBudgetSource(Box<dyn Fn() -> SearchBudget + Send + Sync>);
+
+impl From<SearchBudget> for SearchBudgetSource {
+    fn from(fixed: SearchBudget) -> Self {
+        Self(Box::new(move || fixed))
+    }
+}
+
+impl From<watch::Receiver<Arc<Config>>> for SearchBudgetSource {
+    fn from(config: watch::Receiver<Arc<Config>>) -> Self {
+        Self(Box::new(move || SearchBudget::of(&config.borrow())))
+    }
+}
+
+impl SearchBudget {
+    /// The budget a configuration asks for. A time of zero is no limit.
+    fn of(config: &Config) -> Self {
+        let time = config
+            .pattern_search_budget
+            .unwrap_or(DEFAULT_SEARCH_BUDGET);
+        Self {
+            time: (!time.is_zero()).then_some(time),
+            work: None,
+        }
+    }
+}
+
 impl PatternIndexFactory for Factory {
     fn create_index(
         &self,
@@ -151,10 +182,7 @@ impl PatternIndexFactory for Factory {
             COMMIT_INTERVAL,
             MAX_UNCOMMITTED_THRESHOLD,
             Some(Arc::clone(&self.metrics)),
-            SearchBudget {
-                time: self.search_budget,
-                work: None,
-            },
+            self.config.clone(),
         )
     }
 }
@@ -163,13 +191,13 @@ pub(super) fn new_factory(
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
     metrics: Arc<Metrics>,
-    search_budget: Option<Duration>,
+    config: watch::Receiver<Arc<Config>>,
 ) -> Factory {
     Factory {
         worker,
         memory,
         metrics,
-        search_budget,
+        config,
     }
 }
 
@@ -3402,8 +3430,9 @@ pub(crate) fn new(
     commit_interval: Duration,
     commit_threshold: usize,
     metrics: Option<Arc<Metrics>>,
-    search_budget: SearchBudget,
+    search_budget: impl Into<SearchBudgetSource>,
 ) -> mpsc::Sender<PatternIndex> {
+    let search_budget = search_budget.into();
     let (tx, mut rx) = mpsc::channel::<PatternIndex>(perf::channel_size().into());
     tokio::spawn(async move {
         let key = index.key.clone();
@@ -3512,6 +3541,7 @@ pub(crate) fn new(
                                 continue;
                             };
                             let table = Arc::clone(&table);
+                            let search_budget = (search_budget.0)();
                             worker
                                 .spawn_blocking(move || {
                                     let result = handle_like(
@@ -7859,6 +7889,26 @@ mod tests {
         let widened = piece(500, layout(3, 0), layout(4, u64::MAX), 3);
         let segments = [segments[0], segments[1], widened];
         assert_eq!(ordered_tier(&segments), [true, true, false]);
+    }
+
+    /// A request reads its budget from the configuration as it starts: a reload changes it for
+    /// the requests that follow, without a restart.
+    #[test]
+    fn the_search_budget_follows_a_configuration_reload() {
+        let config = |budget| {
+            Arc::new(Config {
+                pattern_search_budget: budget,
+                ..Config::default()
+            })
+        };
+        let (tx, rx) = watch::channel(config(None));
+        let source = SearchBudgetSource::from(rx);
+        assert_eq!((source.0)().time, Some(DEFAULT_SEARCH_BUDGET));
+        tx.send(config(Some(Duration::from_millis(7)))).unwrap();
+        assert_eq!((source.0)().time, Some(Duration::from_millis(7)));
+        // Zero is no limit.
+        tx.send(config(Some(Duration::ZERO))).unwrap();
+        assert_eq!((source.0)().time, None);
     }
 
     #[rstest]

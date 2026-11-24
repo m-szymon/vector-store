@@ -1363,10 +1363,7 @@ pub async fn run(
     let db_driver = db_driver::new_scylla();
     let internals = internals::new(db_driver.clone());
     let memory = memory::new(internals.clone(), config_rx.clone());
-    let pattern_search_budget = config_rx
-        .borrow()
-        .pattern_search_budget
-        .unwrap_or(pattern_index::DEFAULT_SEARCH_BUDGET);
+    let pattern_config_rx = config_rx.clone();
     let worker = {
         // The pool follows the configuration as it is reloaded.
         let scheduling = |config: &Config| {
@@ -1433,13 +1430,8 @@ pub async fn run(
     let indexes = Arc::new(RwLock::new(Indexes::new()));
     let fts_index_factory =
         fts_index::new_fts_index_factory_tantivy(worker.clone(), memory.clone());
-    let pattern_index_factory = pattern_index::new_factory_tantivy(
-        worker,
-        memory,
-        Arc::clone(&metrics),
-        // Zero is no limit.
-        (!pattern_search_budget.is_zero()).then_some(pattern_search_budget),
-    );
+    let pattern_index_factory =
+        pattern_index::new_factory_tantivy(worker, memory, Arc::clone(&metrics), pattern_config_rx);
     let engine = engine::new(
         db_actor,
         engine::IndexFactories {

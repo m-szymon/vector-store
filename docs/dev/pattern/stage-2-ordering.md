@@ -631,7 +631,8 @@ up on it.
 
 A request now has a budget of time, `VECTOR_STORE_PATTERN_SEARCH_BUDGET`, 50 ms by default, a
 setting of the node (the workers it keeps free are shared by the node's indexes); `0s` is no
-limit. When the budget ends:
+limit. A request reads it as it starts, so a reload of the configuration changes it for the
+requests that follow. When the budget ends:
 
 - The walk stops, and the page is cut at the highest layout key it has not examined. The rows
   over that key are final and are returned. The cursor is that key with no row, which takes

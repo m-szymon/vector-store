@@ -12,6 +12,7 @@ mod like;
 mod order;
 mod tantivy;
 
+use crate::Config;
 use crate::memory::Memory;
 use crate::metrics::Metrics;
 use crate::worker::Worker;
@@ -27,18 +28,16 @@ pub(crate) use order::PREFIX_SLOTS;
 pub(crate) use order::SortPrefix;
 pub(crate) use order::is_key_type_supported;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
-pub(crate) use tantivy::DEFAULT_SEARCH_BUDGET;
-
-/// `search_budget` is how long one search request may take before it returns what it has
-/// settled; None for no limit.
+/// A search request's budget of time is read from `config` as each request starts, so a
+/// configuration reload changes it for the requests that follow.
 pub(crate) fn new_factory_tantivy(
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
     metrics: Arc<Metrics>,
-    search_budget: Option<Duration>,
+    config: watch::Receiver<Arc<Config>>,
 ) -> Box<dyn PatternIndexFactory + Send + Sync> {
-    Box::new(tantivy::new_factory(worker, memory, metrics, search_budget))
+    Box::new(tantivy::new_factory(worker, memory, metrics, config))
 }

@@ -179,7 +179,6 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
 - **The monitor waits with its build.** While a build's rows wait for their share, the CDC
   changes of that index wait behind them. Harmless while the index does not serve; a priority
   inversion should a full scan ever run on one that does.
-- **The search budget on a reload of the configuration**: it still needs a restart.
 
 ## Open problems
 
