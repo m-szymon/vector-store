@@ -158,6 +158,29 @@ notes are those of the old base. The ScyllaDB side still sends what it
 sent; what it may now send (any pattern) and what it must expect (the 400 above) is its part of
 the move.
 
+## The worker pool: left out (2026-11-24)
+
+From the plan to give every kind of index one scheduling policy in the pool; see "A build
+beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
+
+- **A budget for indexing by default** (`VECTOR_STORE_INDEXING_QUEUE_BUDGET` from 0 to about
+  100 ms: searches first unless a write has waited that long). It has to change the repair's
+  gate with it: the repair holds while indexing tasks wait more than 1 ms on average
+  (`INDEXING_WAIT_LIMIT`), and with a budget they wait by design whenever searches are busy, so
+  the repair would never run under a query load.
+- **The repair in the pool.** It runs on Tokio's blocking pool, because a step holds the writer
+  for seconds and once took every worker. As a background task it would need the cap to count
+  it, and a cap of one for an index.
+- **The vector index's writes as indexing.** Everything of it is in the search class, its adds,
+  removals and reserves too, which counts them into the share the searches' floor protects.
+- **The build's own commit.** It holds two workers for about 30 ms, ten times a second: the
+  rest of the p99 beside a build. A commit off the pool, or the writes of a build sent a batch
+  at a time (VECTOR-1186), would leave them.
+- **The monitor waits with its build.** While a build's rows wait for their share, the CDC
+  changes of that index wait behind them. Harmless while the index does not serve; a priority
+  inversion should a full scan ever run on one that does.
+- **The search budget on a reload of the configuration**: it still needs a restart.
+
 ## Open problems
 
 - **A stray row in the ordered tier makes a wide cluster.** A segment that overlaps no other is

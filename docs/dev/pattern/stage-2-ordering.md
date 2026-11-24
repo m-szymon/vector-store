@@ -792,6 +792,99 @@ known before any row is, and the segments of one stretch from commit after commi
 into ordered ones with no repair. Not started.
 
 
+#### A build beside the searches of other indexes (2026-11-24)
+
+The pool of workers has three classes since this date (`worker.rs`): searches, indexing (the
+live writes, served first so that the lag holds), and background, for the writes nobody waits
+for: the rows of a full scan, building an index that does not serve yet. Before, a build's rows
+were indexing, ahead of the searches of every other index for as long as it lasted. Background
+tasks run when neither of the other classes waits, and otherwise up to a minimum share of the
+workers' time (`VECTOR_STORE_MIN_BACKGROUND_SHARE`, 10%), so that a build under a steady load
+still ends. The three scheduling settings follow a reload of the configuration.
+
+Three things the first version got wrong, each found by a test or by the benchmark
+(`a_build_beside_the_searches_of_another_index`: a settled index of 1M rows searched, a second
+of 1M rows built by a full scan, one pool of 4 workers):
+
+- **One row's changes in one queue.** A row of a full scan that replaces an older value is a
+  removal and then an add. The removal's guard did not say it was of the full scan, so the two
+  would have waited in different queues and could have run in the other order. The guards made
+  from a full-scan row's guard keep the mark. A change of the row read from CDC was safe
+  already: the monitor holds it until the row's add is applied.
+- **Room is told to the sender, not waited for in the channel.** Every class comes through one
+  channel; a background task waiting in it for room would have held up the searches and the
+  live writes sent after it. The pool queues it at once and answers its sender when the queue
+  has room.
+- **At most half of the workers run background tasks at once.** They all take their index's
+  writer, and a commit holds it for about 30 ms: uncapped, every free worker took one in a
+  moment with no search waiting and sat behind the commit.
+
+Measured, 8 clients with 5 ms between their searches, the build beside them (single runs
+except where two are given; the laptop was shared, so differences under 10-15% are noise):
+
+| Build's rows as            | searches against no build | wait for a worker | p90     | p99      |
+| -------------------------- | ------------------------- | ----------------- | ------- | -------- |
+| indexing (before)          | -25%                      |                   | 15 ms   | 27 ms    |
+| background, no cap         | -20%, -20%                | 1.5 ms            | 2.4 ms  | 25-27 ms |
+| background, capped         | -8%, -8%                  | 0.5-0.6 ms        | 1.7 ms  | 18-21 ms |
+| and the lock fix (below)   | -6%, -7%                  | 0.18 ms           | 1.6 ms  | 5.3 ms   |
+
+Without the build: p90 1.0 ms, p99 1.6 ms. With the workers saturated (8 clients, no pause) the
+searches kept 11% more of their throughput as background than as indexing, and the build took
+50 s against 34 s (8 s alone); with 2 clients nothing changed, the searches 29% slower either
+way.
+
+**The lock that slept 100 ms.** The p99 left after the cap was one worker asleep: an indexing
+task of 100.4 ms after nearly every commit of the build. A reload of the reader takes the
+directory's meta lock to open the segments; Tantivy's removal of unused files takes it in every
+commit and after every merge; and in the RAM directory the lock is a file, which Tantivy waits
+for by sleeping 100 ms between tries (`directory.rs`, since its #482 of 2019; a file so that
+another process can read an index being written, and on any platform). The reload starts when
+the commit writes the meta, just before the removal, so the two often meet, and whoever comes
+second sleeps: the reload on a worker, with two more on the build's commit and none left, or
+the removal inside the commit, which holds the index's writer.
+
+So the indexes live in a directory of our own (`tantivy/directory.rs`): the RAM directory's
+files, with a meta lock that is a mutex and a condition variable and wakes whoever waits as it
+is released, as Tantivy's file system directory does with an operating system lock. Counted in
+the directory during the build of 1M rows beside searches (10 s, twice): with the RAM
+directory's lock 89 and 85 takes of the lock waited, 8.9 s and 8.5 s in all; with this one 1
+and 2 takes waited a millisecond or more, under 10 ms in all.
+
+It is not this index's doing, as first thought. With the merges this index asks for switched
+off, the reloads of a 1M-row build found the lock held more often, not less (77-80% of them
+against 66-68%, and for 0.64 ms against 0.25 ms): it is the removal after each commit, and it
+takes longer the more segments there are. A full-text index of 1M documents, committed as in
+production, finds it held for 76% of its reloads on this branch. On upstream's master
+(`8568c14`) the same build has 13 of its 134 reloads take 100 ms, in 5.1 s: one commit in four,
+and a worker asleep for a quarter of the build. Upstream's unit tests do not show it (3 of 127
+reloads), since they index a few documents.
+
+The crate's unit tests take 8.5 s since, from 37.
+
+**Each search runs longer beside a build: the cores it shares (2026-11-25).** Beside a build
+each search ran 20-35% longer on its worker, and two threads that only compute, in the build's
+place, cost 2-3%. The runs were pinned to CPUs 0-7 of the laptop, which are four cores of two
+hyperthreads each: two searches and two computing threads have a core each, and a build, with
+its two workers and Tantivy's indexing and merge threads, puts a thread beside a search on one
+core. Measured with 2 clients, two runs each (`build_smt.sh`):
+
+| CPUs                                | beside                | a search on its worker | searches |
+| ----------------------------------- | --------------------- | ---------------------- | -------- |
+| 0-7: four cores, two threads each   | the build             | +33%, +33%             | -29%     |
+| the same                            | six computing threads | +90%, +89%             | -42%     |
+| six cores, one thread of each       | the build             | +8%, +8%               | -12%, -11% |
+| eight cores without hyperthreads    | the build             | +32%, +25%             | -28%, -24% |
+| the same                            | two computing threads | +16%, +18%             | -14%, -15% |
+
+On a core of its own a search loses 8% beside the build, what the two threads copying memory
+cost (7-9%): the caches and the memory, not the allocator or the runtime's threads. The cores
+without hyperthreads are the laptop's efficiency cores, which share a cache in fours and slow
+down together: two computing threads alone cost 16-18% there. So the figure is the machine's,
+and on a node whose vCPUs are whole cores (the c8g of the AWS runs) about 8% is what to
+expect, with the build's threads then competing for the cores themselves when all are busy.
+
+
 ### Measured at 10M names (AWS, 2026-09-27, one run, six index variants)
 
 i4i.xlarge Scylla, c8g.xlarge vector-store (4 cores), 20 rows per page, 10k queries/s offered
