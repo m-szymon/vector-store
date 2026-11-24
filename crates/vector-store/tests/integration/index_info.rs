@@ -307,6 +307,7 @@ async fn indexes_lists_all_indexes_with_options() {
                 min_gram: 2,
                 max_gram: 4,
                 case_sensitive: false,
+                partition_order: "scattered".to_string(),
             }),
         ),
     ]);

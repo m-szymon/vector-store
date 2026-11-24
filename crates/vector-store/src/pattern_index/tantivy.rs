@@ -2142,7 +2142,8 @@ fn read_prefix(
         prefix.0[slot] = if column.descending { !key } else { key };
     }
     let primary_key = table.primary_key(partition_id, primary_id)?;
-    prefix.0[columns.len()] = key_layout.token_key(&primary_key)?;
+    prefix.0[columns.len()] =
+        key_layout.partition_order_key(&primary_key, options.partition_order)?;
     Some(prefix)
 }
 
@@ -3644,6 +3645,7 @@ mod tests {
             // The matching tests run in table order and sort what they get; the order has tests
             // of its own.
             order_by: OrderBy::Table,
+            partition_order: crate::PartitionOrder::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
             rarest_grams: RarestGrams::default(),
@@ -3678,10 +3680,16 @@ mod tests {
         }
     }
 
-    /// The token of the row whose key is `id`, as the index keeps it.
+    /// The place of the partition of the row whose key is `id`, as an index with the default
+    /// `partition_order` keeps it.
     fn token_of(id: u64) -> u64 {
+        partition_place(id, crate::PartitionOrder::default())
+    }
+
+    /// The same for the given `partition_order`.
+    fn partition_place(id: u64, order: crate::PartitionOrder) -> u64 {
         test_layout()
-            .token_key(&PrimaryKey::from(vec![CqlValue::BigInt(id as i64)]))
+            .partition_order_key(&PrimaryKey::from(vec![CqlValue::BigInt(id as i64)]), order)
             .unwrap()
     }
 
@@ -5729,15 +5737,23 @@ mod tests {
         }
     }
 
-    /// An index without `order_by` answers in table order -- by token for a table without
-    /// clustering columns -- pages through it with a cursor, and a smaller limit is a prefix of a
-    /// larger one.
+    /// An index without `order_by` answers in the order of its partitions -- by token, as a scan
+    /// of the table, or by the scrambled token, as `partition_order` says -- pages through it
+    /// with a cursor, and a smaller limit is a prefix of a larger one.
     #[rstest]
+    #[case::scattered(crate::PartitionOrder::Scattered)]
+    #[case::token(crate::PartitionOrder::Token)]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
-    async fn an_index_without_order_by_answers_in_table_order() {
+    async fn an_index_without_order_by_answers_in_the_order_of_its_partitions(
+        #[case] partition_order: crate::PartitionOrder,
+    ) {
+        let token_of = |id: u64| partition_place(id, partition_order);
         let sender = make_sender_for(
-            IndexOptionsPattern::default(),
+            IndexOptionsPattern {
+                partition_order,
+                ..IndexOptionsPattern::default()
+            },
             make_table(bigint_key, |_, _| None),
             test_layout(),
         );
@@ -5762,8 +5778,8 @@ mod tests {
         );
     }
 
-    /// Rows of one partition come in clustering order, honouring a `DESC` clustering column, and
-    /// partitions in token order; a page boundary inside a partition resumes exactly.
+    /// Rows of one partition come together and in clustering order, honouring a `DESC` clustering
+    /// column, and partitions in the index's partition order; a page boundary inside a partition resumes exactly.
     #[rstest]
     #[timeout(Duration::from_secs(10))]
     #[tokio::test]
@@ -5790,9 +5806,13 @@ mod tests {
         for id in &ids {
             add_doc(&sender, *id, &format!("user{id}将军")).await;
         }
-        let token = |id: u64| layout.token_key(&key_of(id)).unwrap();
+        let token = |id: u64| {
+            layout
+                .partition_order_key(&key_of(id), crate::PartitionOrder::default())
+                .unwrap()
+        };
         let mut expected = ids.clone();
-        // By token, then clustering descending.
+        // By the partition's place, then clustering descending.
         expected.sort_by_key(|id| (token(*id), Reverse(id % 10)));
         let expected: Vec<PrimaryKey> = expected.into_iter().map(key_of).collect();
 
@@ -6689,6 +6709,10 @@ mod tests {
     ///   time and committed as in production, every MATRIX_COMMIT_MS (1000) or at 10000 rows,
     ///   as rows stamped with the time arrive.
     ///
+    /// MATRIX_PARTITION (token or scattered) makes it an index without ordering columns in that
+    /// order of its partitions, loaded by token as a full scan loads it; the `stream` state then
+    /// commits as in production and waits for the repair.
+    ///
     /// Run with `--ignored --nocapture`; MATRIX_ROWS sets the size, MATRIX_CAP the segment cap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
@@ -6717,9 +6741,22 @@ mod tests {
             Relaxed,
         );
         let tiers = state == "tiers";
+        // MATRIX_PARTITION (token or scattered): an index without ordering columns, in that
+        // order of its partitions, with the rows arriving by token, as a full scan sends them.
+        let partition_order: Option<crate::PartitionOrder> = std::env::var("MATRIX_PARTITION")
+            .ok()
+            .map(|order| order.parse().unwrap());
         let options = IndexOptionsPattern {
             rewrite_wide_segments: RewriteWideSegments::from(state != "unrepaired"),
             ..capped_options(cap)
+        };
+        let options = match partition_order {
+            Some(partition_order) => IndexOptionsPattern {
+                order_by: OrderBy::Table,
+                partition_order,
+                ..options
+            },
+            None => options,
         };
         let table = if tiers {
             make_table(bigint_key, |id, _| Some(CqlValue::BigInt((id % 5) as i64)))
@@ -6757,7 +6794,11 @@ mod tests {
         let stream = state == "stream";
         let batch: usize =
             std::env::var("MATRIX_BATCH").map_or(10_000, |batch| batch.parse().unwrap());
-        let ids: Vec<u64> = if stream {
+        let ids: Vec<u64> = if partition_order.is_some() {
+            let mut ids: Vec<u64> = (1..=rows).collect();
+            ids.sort_by_cached_key(|id| partition_place(*id, crate::PartitionOrder::Token));
+            ids
+        } else if stream {
             (1..=rows).collect()
         } else if std::env::var("MATRIX_RANDOM").is_ok() {
             // In no order at all: every commit's rows lie all over the order. The other

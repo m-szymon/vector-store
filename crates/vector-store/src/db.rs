@@ -32,6 +32,7 @@ use crate::MinGram;
 use crate::NonemptyArc;
 use crate::NonemptyIteratorExt;
 use crate::OrderBy;
+use crate::PartitionOrder;
 use crate::Positions;
 use crate::Quantization;
 use crate::RarestGrams;
@@ -638,11 +639,13 @@ fn pattern_index_options(options: &BTreeMap<String, String>) -> IndexOptionsPatt
         RewriteWideSegments::from(segment_max_docs.as_ref().is_some())
     };
     let rarest_grams: RarestGrams = parse_index_option(options, "rarest_grams");
+    let partition_order: PartitionOrder = parse_index_option(options, "partition_order");
     IndexOptionsPattern {
         min_gram,
         max_gram,
         case_sensitive,
         order_by,
+        partition_order,
         segment_max_docs,
         rewrite_wide_segments,
         rarest_grams,
@@ -1727,6 +1730,17 @@ pub(crate) mod tests {
             Some(DEFAULT_SEGMENT_ROWS)
         );
         assert!(*table_order.rewrite_wide_segments.as_ref());
+        // Its partitions are scattered unless the index asks for the order of a scan; a value
+        // that is neither is the default, as for the other options.
+        assert_eq!(table_order.partition_order, PartitionOrder::Scattered);
+        assert_eq!(
+            options(&[("partition_order", "Token")]).partition_order,
+            PartitionOrder::Token
+        );
+        assert_eq!(
+            options(&[("partition_order", "ring")]).partition_order,
+            PartitionOrder::Scattered
+        );
 
         // A value that does not parse is kept, to be refused, rather than read as table order.
         assert!(matches!(

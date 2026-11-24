@@ -285,6 +285,11 @@ impl From<&IndexOptionsPattern> for PatternIndexOptions {
             min_gram: options.min_gram.as_ref().get(),
             max_gram: options.max_gram.as_ref().get(),
             case_sensitive: *options.case_sensitive.as_ref(),
+            partition_order: match options.partition_order {
+                crate::PartitionOrder::Scattered => "scattered",
+                crate::PartitionOrder::Token => "token",
+            }
+            .to_string(),
         }
     }
 }
@@ -1360,8 +1365,9 @@ The pattern rules are the same as the LIKE operator in ScyllaDB: '%' and '_' are
 '\\' is the escape character, and matching is case-sensitive unless the index was created \
 with 'case_sensitive' set to false. \
 The rows come in the index's order, a page at a time: an index created without 'order_by' keeps table order \
-(by token, then partition key, then clustering key), one with 'order_by' columns keeps the order of those columns \
-and then table order, and 'order' names the direction along the first of them. \
+(partition after partition, each one's rows by clustering key; the partitions by a fixed scramble of the token, \
+or by token when the index was created with 'partition_order' set to 'token'), one with 'order_by' columns keeps \
+the order of those columns and then table order, and 'order' names the direction along the first of them. \
 'min_sort_value' and 'max_sort_value' restrict the search to a range of the first ordering column. \
 the optional 'limit' parameter in the payload is the size of a page, and a response that filled its page \
 carries 'next_cursor', which the next request passes back as 'cursor' to read the following page. \

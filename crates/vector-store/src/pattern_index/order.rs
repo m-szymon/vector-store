@@ -12,8 +12,15 @@
 //! of one partition with equal ordering values, or on a token collision. Table order -- the order
 //! of a scan of the table -- is token, then partition key, then clustering key in the schema's
 //! clustering order; this module reproduces ScyllaDB's comparators for the key types it supports.
+//!
+//! The token's slot holds the token itself only for an index with `partition_order` `'token'`.
+//! By default it holds a fixed scramble of it ([`scattered_key`]): the rows of a partition still
+//! come together and in clustering order, but neighbouring partitions are from unrelated places
+//! of the token ring, so the rows of a page are read from every tablet and shard alike. In token
+//! order the first page of every frequent pattern is the ring's lowest tokens -- one tablet.
 
 use crate::MAX_ORDER_COLUMNS;
+use crate::PartitionOrder;
 use crate::PrimaryKey;
 use scylla::cluster::metadata::ColumnType;
 use scylla::cluster::metadata::NativeType;
@@ -51,6 +58,16 @@ impl SortPrefix {
 /// A token as a sort key: biased so that the signed order of tokens is the unsigned order of keys.
 pub(crate) fn token_key(token: i64) -> u64 {
     (token as u64) ^ (1 << 63)
+}
+
+/// A token's sort key scrambled: a fixed one-to-one mapping (the finalizer of SplitMix64) after
+/// which neighbouring keys are tokens from unrelated places of the ring. One-to-one, so two rows
+/// share a scrambled key exactly when they share a token.
+pub(crate) fn scattered_key(token_key: u64) -> u64 {
+    let mut key = token_key;
+    key = (key ^ (key >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    key = (key ^ (key >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    key ^ (key >> 31)
 }
 
 /// How an index's primary keys are laid out, for table order and tokens.
@@ -96,6 +113,19 @@ impl KeyLayout {
         let mut hasher = Murmur3Partitioner.build_hasher();
         hasher.write(&bytes);
         Some(token_key(hasher.finish().value()))
+    }
+
+    /// The partition's place in the index's order: the token's key, as it is or scrambled.
+    pub(crate) fn partition_order_key(
+        &self,
+        key: &PrimaryKey,
+        order: PartitionOrder,
+    ) -> Option<u64> {
+        let token = self.token_key(key)?;
+        Some(match order {
+            PartitionOrder::Token => token,
+            PartitionOrder::Scattered => scattered_key(token),
+        })
     }
 
     /// Table order of two rows already known to share a token: partition key bytes, then the
@@ -545,6 +575,36 @@ mod tests {
             partition_key_count,
             clustering_descending: clustering_descending.into(),
         }
+    }
+
+    /// The scramble maps different tokens to different keys and leaves no trace of their order:
+    /// of neighbouring tokens, about half come out in the other order.
+    #[test]
+    fn the_scattered_key_is_one_to_one_and_keeps_no_order() {
+        // The values tests outside this repository derive their expected order from.
+        assert_eq!(
+            scattered_key(token_key(-4069959284402364209)),
+            17617827331281151840
+        );
+        assert_eq!(
+            scattered_key(token_key(-3248873570005575792)),
+            3357659323546929151
+        );
+        let keys: Vec<u64> = (0..10_000u64).map(|i| scattered_key(i << 40)).collect();
+        let distinct: std::collections::HashSet<u64> = keys.iter().copied().collect();
+        assert_eq!(distinct.len(), keys.len());
+        let rising = keys.windows(2).filter(|pair| pair[0] < pair[1]).count();
+        assert!((4_500..5_500).contains(&rising), "rising pairs: {rising}");
+        // Spread over the ring too: the lowest hundred scrambled keys come from tokens of
+        // every sixteenth of the ring.
+        let mut lowest: Vec<(u64, u64)> = (0..10_000u64)
+            .map(|i| i * (u64::MAX / 10_000))
+            .map(|token| (scattered_key(token), token))
+            .collect();
+        lowest.sort_unstable();
+        let parts: std::collections::HashSet<u64> =
+            lowest[..100].iter().map(|(_, token)| token >> 60).collect();
+        assert_eq!(parts.len(), 16);
     }
 
     #[test]

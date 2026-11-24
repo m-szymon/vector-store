@@ -841,6 +841,36 @@ fn parse_flag(name: &str, s: &str) -> anyhow::Result<bool> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+/// The order of partitions wherever the ordering columns do not decide it: the `partition_order`
+/// option. Either way the rows of a partition stay together, in clustering order, and the order
+/// is the same for every request, so it can be paged.
+///
+/// - `'scattered'`, the default: by a fixed scramble of the token. The first rows of a common
+///   keyword are then partitions from all over the token ring, so the reads of their rows spread
+///   over every tablet, shard and node, whatever the topology is.
+/// - `'token'`: by token, the order a scan of the table returns. The first rows of every common
+///   keyword are then the lowest tokens, all in the first tablet, and its replicas serve every
+///   first page. In exchange a full scan delivers the rows already in the index's order.
+pub enum PartitionOrder {
+    #[default]
+    Scattered,
+    Token,
+}
+
+impl FromStr for PartitionOrder {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // In any letter case, as ScyllaDB validates the option.
+        match s.to_ascii_lowercase().as_str() {
+            "scattered" => Ok(Self::Scattered),
+            "token" => Ok(Self::Token),
+            _ => anyhow::bail!("partition_order must be 'scattered' or 'token': {s}"),
+        }
+    }
+}
+
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, derive_more::AsRef, derive_more::From,
 )]
@@ -1035,6 +1065,9 @@ pub struct IndexOptionsPattern {
     pub case_sensitive: CaseSensitive,
     /// What the index answers in: table order, no order, or the declared columns.
     pub order_by: OrderBy,
+    /// The order of partitions where the ordering columns do not decide it. The
+    /// `partition_order` option.
+    pub partition_order: PartitionOrder,
     /// The largest segment the index's own merge policy will build, in rows; none keeps Tantivy's
     /// default policy. The `segment_rows` option.
     pub segment_max_docs: SegmentMaxDocs,
@@ -1063,6 +1096,7 @@ impl IndexOptionsPattern {
             // come back in the wrong order rather than failing.
             return Self {
                 order_by: self.order_by,
+                partition_order: self.partition_order,
                 segment_max_docs: self.segment_max_docs,
                 rewrite_wide_segments: self.rewrite_wide_segments,
                 ..Self::default()
@@ -1600,6 +1634,7 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            partition_order: crate::PartitionOrder::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
             rarest_grams: RarestGrams::default(),
@@ -1613,6 +1648,7 @@ mod tests {
             max_gram: "3".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: "registered_at".parse().unwrap(),
+            partition_order: crate::PartitionOrder::default(),
             segment_max_docs: "250000".parse().unwrap(),
             rewrite_wide_segments: RewriteWideSegments::from(true),
             rarest_grams: RarestGrams::default(),
@@ -1632,6 +1668,7 @@ mod tests {
             max_gram: "2".parse().unwrap(),
             case_sensitive: CaseSensitive::from(false),
             order_by: OrderBy::default(),
+            partition_order: crate::PartitionOrder::default(),
             segment_max_docs: SegmentMaxDocs::default(),
             rewrite_wide_segments: RewriteWideSegments::default(),
             rarest_grams: RarestGrams::default(),

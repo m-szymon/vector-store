@@ -206,6 +206,13 @@ pub struct PatternIndexOptions {
     pub max_gram: usize,
     /// Whether matching distinguishes letter case.
     pub case_sensitive: bool,
+    /// The order of partitions where `order_by` does not decide it: `scattered`, a fixed order unrelated to the token, or `token`, the order of a table scan.
+    #[serde(default = "default_partition_order")]
+    pub partition_order: String,
+}
+
+fn default_partition_order() -> String {
+    "scattered".to_string()
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
