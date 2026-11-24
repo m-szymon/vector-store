@@ -742,6 +742,56 @@ together count: where the runs follow one another (the stream and the settled in
 one or a few of them, and the threshold there was right as it was. So it is 256 matches, four
 pages, and eight for each run the walk would read together (`Runs::overlap`).
 
+#### The order of partitions is an option (2026-11-24)
+
+AWS run `0818814c` showed where table order stops: `char2` in table order or `tier` order
+served 9,400 q/s with one ScyllaDB shard at 100% and the node at 49%, against 17,000 q/s in the
+time orders with every shard near 90%. The profile of the node has every read of a row on shard
+0, and the tablet map has the ring's first tablet there. The first page of a frequent pattern in
+token order is its matches with the lowest tokens, all inside that tablet (1/64 of a 10M-row
+table holds more than a page of them), so every first page of every such pattern is read from
+one tablet's replicas, on any cluster and whatever the keyword. `tier` order has the same first
+page: rows that tie on the column fall back to table order.
+
+What a client needs from table order is less than the order of a scan: the rows of a partition
+together and in clustering order, and one fixed order, so that pages resume exactly. The token's
+slot of the sort prefix therefore holds what the `partition_order` option says:
+
+- `scattered` (the default): the token through a fixed one-to-one mixing function
+  (`order::scattered_key`, the finalizer of SplitMix64). Neighbours in the index are partitions
+  from unrelated places of the ring, so a page's rows come from as many tablets as it has
+  partitions. The index needs to know nothing of the topology, and a split, merge or move of
+  tablets changes nothing: places taken at random on the ring are spread under any layout.
+  One-to-one, so the tie-break on a shared slot is the token collision it was.
+- `token`: the token, the order of a scan and of a filtered `LIKE`. For a client that needs
+  that order, and it keeps what the default gives up: a full scan delivers the rows already in
+  the index's order.
+
+Nothing else differs: the cursor, the layout key, the merge policy and the repair work on the
+slot's value, whichever it is. ScyllaDB validates the option and does not read it.
+
+Page cost, 2M rows without ordering columns, loaded by token as a full scan loads them,
+budget 50 ms (`MATRIX_PARTITION`, logs `walk_matrix_part_*`): the build with the repair took
+58 s for `token` and 64 s for `scattered`, both to 3 disjoint segments; settled, the 60 cells
+are the same within noise (page of 20: 0.02-0.07 ms both; of 1000: 0.5-1.3 ms both; the
+worst keyword's page of 20, 8.8 against 11.0 ms). Before the repair a `scattered` index is the
+unrepaired index of the other orders: a page of 20 costs 0.15-0.4 ms, a verified page of 1000
+8-9 ms, the worst keyword's page of 200 twenty requests. The throughput on a cluster is not
+measured yet.
+
+At 10M rows the build is another matter (2026-11-25, the same load, cap 1M, logs
+`walk_matrix_part10m_*`): 113 s for `token`, to 15 segments, and 374 s for `scattered`, to 14.
+By token the rows arrive in the index's order and its segments are adopted as they are, with
+nothing to repair; scattered they arrive in no order, and the build is the load of 10M rows in
+no order measured above, about 90 s of indexing and 200 s of repair, each row written twice.
+Settled, a page of 20 costs the same (median 12 and 21 us over the matrix, one build each). So
+an index created on a large table pays for the spread of its reads with a build three times as
+long. What would take that away is rows dealt to a commit's segments by stretch of the order,
+not in turn: the keys of both orders are spread evenly over 64 bits, so the stretches are
+known before any row is, and the segments of one stretch from commit after commit would merge
+into ordered ones with no repair. Not started.
+
+
 ### Measured at 10M names (AWS, 2026-09-27, one run, six index variants)
 
 i4i.xlarge Scylla, c8g.xlarge vector-store (4 cores), 20 rows per page, 10k queries/s offered

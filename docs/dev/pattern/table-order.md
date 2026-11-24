@@ -1,5 +1,12 @@
 # Substring search: ordering and table order
 
+> Since 2026-11-24 the token's place in the order described below is taken by the partition's
+> place, which is the token only for an index created with `'partition_order': 'token'`. By
+> default it is a fixed scramble of the token (`scattered`): the rows of a partition still come
+> together and in clustering order, and the order is still total and the same for every request,
+> but it is not the order of a scan. Read "token" below as "the partition's place"; why is in
+> `stage-2-ordering.md`, "The order of partitions is an option".
+
 Status: implemented on the index node (vector-store, `pattern_index/order.rs` and the ordered walk
 in `pattern_index/tantivy.rs`) and in ScyllaDB (`pattern_index::parse_order` and `check_order`,
 `pattern_search::fit_ordering` and `index_for`, `ordered_pattern_select_statement`). It builds on follow-up 4 of
