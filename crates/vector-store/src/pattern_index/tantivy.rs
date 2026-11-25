@@ -2434,6 +2434,7 @@ const OFF_TAKE: u32 = 2;
 const OFF_HALVING: u32 = 4;
 const OFF_SWEEP: u32 = 8;
 const OFF_WHOLE_READ: u32 = 16;
+const OFF_SPREAD: u32 = 4096;
 /// What the walk of segments did, for a benchmark test to report: passes over a segment's runs,
 /// regions scanned, scorers made, and the nanoseconds of the scans, the verifications and the
 /// sweeps.
@@ -2931,6 +2932,8 @@ impl RegionWalk<'_> {
         } else {
             2 * page.limit
         };
+        // The runs a pass reads to their ends before one of them sets the floor.
+        let mut spread = 1usize;
         // Whether the runs holding no match have been told apart.
         let mut swept = walk_off(OFF_SWEEP);
         let mut regions: Vec<Region> = Vec::new();
@@ -2963,11 +2966,14 @@ impl RegionWalk<'_> {
                 return Ok(Some(highest));
             }
             // The runs with rows at the floor or over it, and the floor: the highest key a run
-            // among them has left, or ends at, once its stretch is read.
+            // among them has left, or ends at, once its stretch is read. A run its stretch
+            // reads to the end sets no floor, for `spread` runs a pass less one: so many runs
+            // that follow one another are read in one pass.
             regions.clear();
             {
                 reading.clear();
                 let mut floor = 0u128;
+                let mut ended = 1;
                 while let Some(&(key, index)) = unread.peek() {
                     if key < floor {
                         break;
@@ -2975,7 +2981,12 @@ impl RegionWalk<'_> {
                     unread.pop();
                     let run = &runs[index as usize];
                     let (from, to) = stretch(run, next[index as usize], width);
+                    let ends = if forward { to == run.len() } else { from == 0 };
                     let reached = match run.blocks {
+                        _ if ends && ended < spread => {
+                            ended += 1;
+                            0
+                        }
                         None => oriented(columns.layout_key(run.doc_at(if forward {
                             to - 1
                         } else {
@@ -3078,6 +3089,17 @@ impl RegionWalk<'_> {
                 return Ok(Some(unexamined));
             }
             width = width.saturating_mul(4);
+            // A keyword in few rows needs many runs for a page, and a pass costs a reader of
+            // the postings: more runs after a pass that met matches, and fewer than a page
+            // of them. One that met none says nothing of the runs to come, which the
+            // sweep has told apart; one that met a page's worth is of a keyword in many rows,
+            // whose runs are worth a pass each.
+            // As many times the runs as the page is short by at that rate, four at most.
+            let found = (tally.postings_scanned - scanned) as usize;
+            if !walk_off(OFF_SPREAD) && found > 0 {
+                let short = page.limit.saturating_sub(found) / found;
+                spread = spread.saturating_mul(short.clamp(1, 4));
+            }
             // More of each run only once the matches of this many were not enough.
             if tally.postings_scanned > scanned {
                 take = take.saturating_mul(4);
@@ -6610,14 +6632,18 @@ mod tests {
         if (5_000..9_000).contains(&primary) {
             name += "中段之人";
         }
+        if primary.is_multiple_of(700) {
+            name += "千中稀客";
+        }
         name
     }
 
     /// Every page of a search, followed from its cursor in either direction, holds the rows a
     /// full read would give, in order, whatever the segments' rows are laid out as: sorted runs
     /// a repair wrote, coarse runs rows arriving in order leave, and rows in no order at all.
-    /// For a keyword every row holds, one a third of them hold, one past max_gram, verified, and
-    /// ones the rows of one stretch of the order hold, far from either end.
+    /// For a keyword every row holds, one a third of them hold, one past max_gram, verified,
+    /// ones the rows of one stretch of the order hold, far from either end, and ones in a row of
+    /// 700, a page of which lies in many runs.
     #[rstest]
     #[case::repaired("repaired")]
     #[case::in_order("stream")]
@@ -6673,12 +6699,14 @@ mod tests {
             assert!(scanned <= 2_048, "{scanned} postings: {:?}", stats.segments);
         }
         type Holds = fn(&i64) -> bool;
-        let keywords: [(&str, Holds); 5] = [
+        let keywords: [(&str, Holds); 7] = [
             ("将军", |_| true),
             ("逢三之", |id| id % 3 == 0),
             ("逢三之数", |id| id % 3 == 0),
             ("中段", |id| (5_000..9_000).contains(id)),
             ("中段之人", |id| (5_000..9_000).contains(id)),
+            ("千中", |id| id % 700 == 0),
+            ("千中稀客", |id| id % 700 == 0),
         ];
         for (keyword, holds) in keywords {
             let expected: Vec<i64> = (1..=rows as i64).filter(holds).collect();
@@ -6792,6 +6820,7 @@ mod tests {
                 Ok("halving") => OFF_HALVING,
                 Ok("sweep") => OFF_SWEEP,
                 Ok("whole_read") => OFF_WHOLE_READ,
+                Ok("spread") => OFF_SPREAD,
                 // The rows of a commit written as they came, not in the order of their keys.
                 Ok("sorted_commits") => OFF_SORTED_COMMITS,
                 Ok(other) => panic!("MATRIX_OFF: {other}"),
@@ -7016,6 +7045,7 @@ mod tests {
                 ("halving", OFF_HALVING),
                 ("sweep", OFF_SWEEP),
                 ("whole_read", OFF_WHOLE_READ),
+                ("spread", OFF_SPREAD),
             ]
         } else {
             Vec::new()
@@ -7095,7 +7125,15 @@ mod tests {
                     let mut probes = [[0u64; 6]; 3];
                     for turn in 0..9 {
                         let side = turn % 3;
-                        WALK_OFF.store([OFF_WHOLE_READ, FORCE_WHOLE_READ, 0][side], Relaxed);
+                        // MATRIX_WHOLE=spread: the walk without the spread of runs in place
+                        // of the one that never reads whole.
+                        let runs_side = if std::env::var("MATRIX_WHOLE").as_deref() == Ok("spread")
+                        {
+                            OFF_SPREAD
+                        } else {
+                            OFF_WHOLE_READ
+                        };
+                        WALK_OFF.store([runs_side, FORCE_WHOLE_READ, 0][side], Relaxed);
                         let before = sender.stats(make_index_key()).await.unwrap().walk;
                         let probed = WALK_PROBE.each_ref().map(|probe| probe.load(Relaxed));
                         let clock = Instant::now();
