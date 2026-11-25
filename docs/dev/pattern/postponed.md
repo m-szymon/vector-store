@@ -166,10 +166,9 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
   its turn in the pool" in `stage-2-ordering.md`): at 100 ms the writes under a heavy query
   load took 67% longer and the searches gained nothing. A budget would need the queue to hand
   over more than one short batch each time it runs out.
-- **A repair's holds park the writes of its index on the workers.** A write waits for the
-  writer on the worker that took it, for up to the hold's 0.7 s, and with enough of them every
-  worker waits: the p99 of 275 ms with a repair during a load. A write that found the writer
-  held could go back to its queue, or the holds be shorter.
+- **The cap on background tasks, again.** It was for the rows of a build waiting on their
+  index's writer behind a commit. They no longer wait there (a change that finds the writer
+  held is left for its holder), so the cap may not be needed; not measured without it.
 - **Merges are outside the pool.** They run on Tantivy's threads, as the repair's own writing
   of segments does; a place covers only the repair's thread.
 - **The vector index's writes as indexing.** Everything of it is in the search class, its adds,

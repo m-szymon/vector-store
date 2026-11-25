@@ -978,6 +978,28 @@ run on, on the writer. A 10M-row repair with a row written every 10 ms took 195 
 with the rows searchable within a second 87% against 91% (89% without the place); the repair
 of 10M rows under searches 242 s against 265. Neither is outside the noise.
 
+**A change that finds the writer held is left for its holder.** That p99 was the writes of
+the index waiting for its writer on the workers that took them, for as long as a hold lasted,
+until every worker waited and the searches with them. A change (an add, a removal, a commit)
+now goes into a queue of its index, and whoever has the writer applies the queue in order:
+the change's own worker if the writer is free, else the holder as it lets go
+(`Index::change`, `WriterGuard` in `tantivy/mod.rs`). With 65,536 changes waiting, one more
+waits on its worker as before, so that a reader faster than a long hold is still slowed. The
+same loads, before and after (`queue_chain.sh`; 8 searchers twice):
+
+| 3M rows written shuffled, searches beside | writes wait on workers | left for the holder |
+| ----------------------------------------- | ---------------------- | ------------------- |
+| 8 searchers: rows indexed in              | 62 s, 58 s             | 60 s, 57 s          |
+| searches done                             | 31,700, 29,000         | 45,000, 44,100      |
+| search p50 / p99 / longest                | 2.6 / 267 / 898 ms, 2.5 / 278 / 840 ms | 3.1 / 20 / 87 ms, 2.9 / 18 / 45 ms |
+| 32 searchers: rows indexed in             | 367 s                  | 365 s               |
+| search p50 / p99 / longest                | 8.4 / 36 / 912 ms      | 8.6 / 39 / 94 ms    |
+
+A 10M-row repair with a writer of a row every 10 ms took 192 s against 197, and took in
+17,284 of the writer's rows instead of 1,801: the writer itself used to wait out each hold.
+Their time until searchable is the same (within a second 92% against 89%). A build beside
+the searches of another index is unchanged (p99 3.4 ms against 3.8).
+
 **The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
 100 ms, searches first unless a write has waited that long, the same load with 32 searchers
 took 643 s to index instead of 384, and the searches gained nothing: as many a second, p50
