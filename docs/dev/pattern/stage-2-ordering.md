@@ -1011,9 +1011,19 @@ build beside the searches of another index):
 | 5 ms between searches | 1180-1203 a second, 3.3-3.7 ms, 7.6-7.9 s | 1186-1189 a second, 3.2-3.3 ms, 7.7 s |
 | no pause           | 7671-7801 a second, 3.5 ms, 40.0-40.4 s     | 7704-8266 a second, 3.4-3.6 ms, 38.5-41.0 s |
 
-What it bounds now is the places lent to the repairs' holds: each keeps a worker idle for most
-of a second, and without the cap the repairs of several indexes could take every worker at
-once. That case is not measured.
+What it bounds now is the places lent to the repairs' holds: each keeps a worker idle for
+about 0.3 s here, and without the cap the repairs of several indexes take every worker at
+once. Measured (2026-11-26, `repairs_chain.sh`, twice each): four indexes of 1M shuffled rows
+built and then repaired at once, beside 8 clients searching a fifth, 5 ms between searches,
+4 workers; the searches while the four repair:
+
+| cap | searches a second | p50 | p90 | p99 | longest | wait for a worker | repaired in |
+| --- | ----------------- | --- | --- | --- | ------- | ----------------- | ----------- |
+| on  | 1044, 1057        | 0.6 ms | 2.1, 2.0 ms | 6.7, 7.8 ms | 18, 43 ms   | 0.18, 0.24 ms | 31.1, 30.6 s |
+| off | 746, 731          | 0.6 ms | 6.2, 6.5 ms | 75, 70 ms   | 443, 466 ms | 3.8, 4.1 ms   | 29.1, 27.5 s |
+
+Alone the searches do 1214 a second with a p99 of 1.2 ms. The cap costs the repairs 2-3 s of
+30, and their holds wait 0.2 s for a place instead of 0.01-0.02 s.
 
 **The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
 100 ms, searches first unless a write has waited that long, the same load with 32 searchers
