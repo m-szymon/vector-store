@@ -7,11 +7,15 @@ pub(crate) mod directory;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::mem;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::RwLockWriteGuard;
+use std::sync::TryLockError;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -363,10 +367,67 @@ impl Reader {
 
 /// A tantivy index with its writer and reader, and `state`: whatever a kind of index keeps
 /// alongside, such as caches of per-segment data. The full-text index keeps nothing.
+/// A change to an index, as it waits for the writer: see `Index::change`.
+enum Change {
+    Add {
+        primary_id: PrimaryId,
+        commit_key: Option<CommitKey>,
+        doc: TantivyDocument,
+        in_progress: AsyncInProgress,
+        /// The uncommitted documents at which the change commits.
+        commit_threshold: usize,
+    },
+    Remove {
+        primary_id: PrimaryId,
+        in_progress: AsyncInProgress,
+        commit_threshold: usize,
+    },
+    Commit,
+}
+
+/// The most changes that wait for a held writer in an index's queue. One more waits for the
+/// writer on its worker instead, which slows the reader that sends them: a holder of seconds
+/// would otherwise let the queue grow with everything written meanwhile.
+const CHANGES_WAITING_MAX: usize = 65_536;
+
+/// The writer of an index, held. As it is let go, it applies the changes that came while it
+/// was held: see `Index::change`.
+pub(crate) struct WriterGuard<'a, E> {
+    index: &'a Index<E>,
+    held: Option<RwLockWriteGuard<'a, Writer>>,
+}
+
+impl<E> Deref for WriterGuard<'_, E> {
+    type Target = Writer;
+
+    fn deref(&self) -> &Writer {
+        self.held.as_ref().unwrap()
+    }
+}
+
+impl<E> DerefMut for WriterGuard<'_, E> {
+    fn deref_mut(&mut self) -> &mut Writer {
+        self.held.as_mut().unwrap()
+    }
+}
+
+impl<E> Drop for WriterGuard<'_, E> {
+    fn drop(&mut self) {
+        if let Some(mut writer) = self.held.take() {
+            self.index.apply_changes(&mut writer);
+        }
+        // One queued between the last look at the queue and the writer let go.
+        self.index.apply_changes_waiting();
+    }
+}
+
 pub(crate) struct Index<E = ()> {
     pub(crate) index: tantivy::Index,
     writer: RwLock<Writer>,
-    /// The additions, removals and commits waiting for the writer now: see `let_writes_in`.
+    /// The changes that found the writer held, in the order they came: see `change`.
+    changes: Mutex<VecDeque<Change>>,
+    /// The changes waiting for the writer on their workers now, the queue being full: see
+    /// `let_writes_in`.
     writes_waiting: AtomicU64,
     pub(crate) reader: Reader,
     pub(crate) schema: Schema,
@@ -408,6 +469,7 @@ impl<E> Index<E> {
         Ok(Self {
             index,
             writer,
+            changes: Mutex::new(VecDeque::new()),
             writes_waiting: AtomicU64::new(0),
             reader,
             schema,
@@ -417,32 +479,116 @@ impl<E> Index<E> {
 
     /// Replaces Tantivy's default merge policy.
     pub(crate) fn set_merge_policy(&self, policy: Box<dyn MergePolicy>) {
-        self.writer.read().unwrap().writer.set_merge_policy(policy);
+        self.lock_writer().writer.set_merge_policy(policy);
     }
 
     /// Whether the writer holds uncommitted documents, or None while someone holds the writer.
     /// Never waits for the writer: the actors ask on their ticks, and a writer held for seconds --
     /// a pattern index moving rows between segments -- would stop an actor answering anything.
     pub(crate) fn has_uncommitted_docs(&self) -> Option<bool> {
+        // A change left in the queue is uncommitted, and the commit asked for it applies it.
+        if !self.changes.lock().unwrap().is_empty() {
+            return Some(true);
+        }
         let writer = self.writer.try_read().ok()?;
         Some(writer.has_uncommitted_docs())
     }
 
     /// The writer, locked, for a caller that has to read the index and write what it read back
-    /// with nothing written in between, as moving rows between segments does.
-    pub(crate) fn lock_writer(&self) -> RwLockWriteGuard<'_, Writer> {
-        self.writer.write().unwrap()
+    /// with nothing written in between, as moving rows between segments does. The changes that
+    /// come meanwhile are applied as the caller lets it go.
+    pub(crate) fn lock_writer(&self) -> WriterGuard<'_, E> {
+        WriterGuard {
+            index: self,
+            held: Some(self.writer.write().unwrap()),
+        }
     }
 
-    /// The writer, locked for an addition, a removal or a commit, counted while it waits.
-    fn write(&self) -> RwLockWriteGuard<'_, Writer> {
-        self.writes_waiting.fetch_add(1, Ordering::Relaxed);
-        let writer = self.writer.write().unwrap();
-        self.writes_waiting.fetch_sub(1, Ordering::Relaxed);
-        writer
+    /// Applies `change` after those that came before it, without waiting for the writer.
+    ///
+    /// A change runs on a worker, and a writer may be held for most of a second: by a repair
+    /// of a pattern index moving rows, by a commit for tens of milliseconds. Waiting for it
+    /// there, the changes of one index took every worker in turn, and the searches of every
+    /// index waited for the hold to end (p99 275 ms beside a repair). So a change goes into the
+    /// index's queue, and whoever has the writer applies the queue in order: this change's
+    /// worker if the writer is free, else the holder as it lets go (`WriterGuard`). Only with
+    /// `CHANGES_WAITING_MAX` changes waiting does a change wait for the writer on its worker.
+    fn change(&self, change: Change) {
+        let full = {
+            let mut changes = self.changes.lock().unwrap();
+            changes.push_back(change);
+            changes.len() > CHANGES_WAITING_MAX
+        };
+        if full {
+            self.writes_waiting.fetch_add(1, Ordering::Relaxed);
+            let writer = self.lock_writer();
+            self.writes_waiting.fetch_sub(1, Ordering::Relaxed);
+            drop(writer);
+        } else {
+            self.apply_changes_waiting();
+        }
     }
 
-    /// Waits, for `limit` at most, until no addition, removal or commit waits for the writer.
+    /// Applies the changes in the queue if the writer is free; if it is held, its holder does.
+    fn apply_changes_waiting(&self) {
+        while !self.changes.lock().unwrap().is_empty() {
+            let mut writer = match self.writer.try_write() {
+                Ok(writer) => writer,
+                Err(TryLockError::WouldBlock) => return,
+                Err(TryLockError::Poisoned(err)) => panic!("tantivy: writer lock poisoned: {err}"),
+            };
+            self.apply_changes(&mut writer);
+        }
+    }
+
+    /// Applies the changes in the queue to `writer`, in the order they came.
+    fn apply_changes(&self, writer: &mut Writer) {
+        loop {
+            // The queue is not held while a change is applied: a commit takes long.
+            let Some(change) = self.changes.lock().unwrap().pop_front() else {
+                return;
+            };
+            let commit = match change {
+                Change::Add {
+                    primary_id,
+                    commit_key,
+                    doc,
+                    in_progress,
+                    commit_threshold,
+                } => {
+                    let pending = writer
+                        .add_document(primary_id, commit_key, doc, in_progress)
+                        .unwrap_or_else(|err| {
+                            error!("tantivy: failed to add document {primary_id:?}: {err}");
+                            writer.uncommitted_docs()
+                        });
+                    pending >= commit_threshold
+                }
+                Change::Remove {
+                    primary_id,
+                    in_progress,
+                    commit_threshold,
+                } => {
+                    let term = create_term(&self.schema, primary_id);
+                    writer.rm_document(primary_id, term, in_progress) >= commit_threshold
+                }
+                Change::Commit => writer.has_uncommitted_docs(),
+            };
+            if commit {
+                match writer.commit() {
+                    Ok((commit_opstamp, guards)) => self
+                        .reader
+                        .drop_guards_when_searchable(commit_opstamp, guards),
+                    Err(err) => error!(
+                        "tantivy: failed to commit for {}: {err}",
+                        self.reader.inner.key
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Waits, for `limit` at most, until no change waits for the writer on its worker.
     /// For a caller of `lock_writer` that takes the writer again and again: the lock is not
     /// handed over in the order it was asked for, and a thread that releases it and asks at once
     /// gets it back before the ones waiting have woken, so they would wait for the last of its
@@ -485,45 +631,9 @@ fn create_doc(schema: &Schema, primary_id: PrimaryId, document: &str) -> Tantivy
     doc
 }
 
-fn commit<E>(index: &Index<E>, key: &IndexKey) {
-    let result = index.write().commit();
-    match result {
-        Ok((commit_opstamp, guards)) => index
-            .reader
-            .drop_guards_when_searchable(commit_opstamp, guards),
-        Err(err) => error!("tantivy: failed to commit for {key}: {err}"),
-    }
-}
-
-fn add_document<E>(
-    index: &Index<E>,
-    primary_id: PrimaryId,
-    commit_key: Option<CommitKey>,
-    doc: TantivyDocument,
-    in_progress: AsyncInProgress,
-) -> usize {
-    let mut writer = index.write();
-    match writer.add_document(primary_id, commit_key, doc, in_progress) {
-        Ok(pending) => pending,
-        Err(err) => {
-            error!("tantivy: failed to add document {primary_id:?}: {err}");
-            writer.uncommitted_docs()
-        }
-    }
-}
-
 fn create_term(schema: &Schema, primary_id: PrimaryId) -> tantivy::Term {
     let primary_id_field = schema.get_field("primary_id").unwrap();
     tantivy::Term::from_field_u64(primary_id_field, u64::from(primary_id))
-}
-
-fn remove_document<E>(
-    index: &Index<E>,
-    primary_id: PrimaryId,
-    in_progress: AsyncInProgress,
-) -> usize {
-    let term = create_term(&index.schema, primary_id);
-    index.write().rm_document(primary_id, term, in_progress)
 }
 
 /// The tantivy indexes of one index key, one per index id.
@@ -598,7 +708,6 @@ where
         if !self.can_allocate_memory() {
             return;
         }
-        let key = self.key.clone();
         let commit_threshold = self.commit_threshold;
         // A row of a full scan builds an index nobody searches yet: it waits for the searches
         // and the live writes of the other indexes.
@@ -606,10 +715,13 @@ where
         self.worker
             .spawn_write_blocking(background, move || {
                 let doc = make_doc(&index);
-                let pending = add_document(&index, primary_id, commit_key, doc, in_progress);
-                if pending >= commit_threshold {
-                    commit(&index, &key);
-                }
+                index.change(Change::Add {
+                    primary_id,
+                    commit_key,
+                    doc,
+                    in_progress,
+                    commit_threshold,
+                });
             })
             .await;
     }
@@ -622,16 +734,16 @@ where
         let Some(index) = self.get_or_create() else {
             return;
         };
-        let key = self.key.clone();
         let commit_threshold = self.commit_threshold;
         // In the class of the add that follows it, so that the two run in the order sent.
         let background = in_progress.is_fullscan();
         self.worker
             .spawn_write_blocking(background, move || {
-                let pending = remove_document(&index, primary_id, in_progress);
-                if pending >= commit_threshold {
-                    commit(&index, &key);
-                }
+                index.change(Change::Remove {
+                    primary_id,
+                    in_progress,
+                    commit_threshold,
+                });
             })
             .await;
     }
@@ -666,9 +778,8 @@ where
             };
             if uncommitted {
                 let index = Arc::clone(index);
-                let key = self.key.clone();
                 self.worker
-                    .spawn_indexing_blocking(move || commit(&index, &key))
+                    .spawn_indexing_blocking(move || index.change(Change::Commit))
                     .await;
             } else if index.reader.needs_reload() {
                 index.reader.request_reload();
@@ -766,7 +877,6 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use tantivy::schema::STORED;
@@ -871,39 +981,45 @@ mod tests {
         );
     }
 
-    /// A write that waits for the writer gets it before a holder that lets the writes in takes
-    /// it again; without that the holder, asking at once, would get it back first.
+    /// A change that finds the writer held does not wait for it: the holder applies it as it
+    /// lets the writer go, after the changes that came before.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_waiting_write_goes_before_the_next_hold() {
+    async fn a_change_that_finds_the_writer_held_is_applied_by_its_holder() {
         let mut schema = Schema::builder();
         schema.add_u64_field("primary_id", INDEXED | STORED | FAST);
         schema.add_text_field("text", TEXT | STORED);
-        let index = Arc::new(
-            Index::new(
-                schema.build(),
-                "default",
-                TextAnalyzer::from(SimpleTokenizer::default()),
-                &make_index_key(),
-                crate::worker::new(),
-            )
-            .unwrap(),
-        );
-        for round in 1..=20 {
-            let held = index.lock_writer();
-            let waiter = std::thread::spawn({
-                let index = Arc::clone(&index);
-                move || remove_document(&index, PrimaryId::from(1), AsyncInProgress::none())
-            });
-            while index.writes_waiting.load(Ordering::Relaxed) == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            drop(held);
-            index.let_writes_in(Duration::from_secs(10));
-            // The waiting write has the writer or has had it: the next hold comes after it.
-            let held = index.lock_writer();
-            assert_eq!(held.uncommitted_docs(), round);
-            drop(held);
-            waiter.join().unwrap();
-        }
+        let index = Index::new(
+            schema.build(),
+            "default",
+            TextAnalyzer::from(SimpleTokenizer::default()),
+            &make_index_key(),
+            crate::worker::new(),
+        )
+        .unwrap();
+        let add = |id: u64, text: &str| Change::Add {
+            primary_id: id.into(),
+            commit_key: None,
+            doc: create_doc(&index.schema, id.into(), text),
+            in_progress: AsyncInProgress::none(),
+            commit_threshold: 4,
+        };
+        let held = index.lock_writer();
+        index.change(add(1, "old"));
+        index.change(Change::Remove {
+            primary_id: 1.into(),
+            in_progress: AsyncInProgress::none(),
+            commit_threshold: 4,
+        });
+        index.change(add(1, "new"));
+        assert_eq!(held.uncommitted_docs(), 0);
+        assert_eq!(index.has_uncommitted_docs(), Some(true));
+        drop(held);
+        assert_eq!(index.lock_writer().uncommitted_docs(), 3);
+        // With the writer free a change is applied at once, and the fourth commits.
+        index.change(add(2, "two"));
+        assert_eq!(index.lock_writer().uncommitted_docs(), 0);
+        index.reader.inner.reload().unwrap();
+        let searcher = index.reader.searcher();
+        assert_eq!(searcher.num_docs(), 2);
     }
 }
