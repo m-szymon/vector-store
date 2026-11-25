@@ -23,8 +23,8 @@
 //! workers from the searches of every other index for as long as the build lasts. They run when
 //! neither of the other classes waits, and otherwise get a small minimum share of the workers'
 //! time, so that a build under a steady load still ends. At most half of the workers run them at
-//! once ([`background_cap`]): they all take their index's writer, and would otherwise all sit
-//! behind one commit. The pool takes them into their queue
+//! once ([`background_cap`]), so that the places lent to long holds (below) never leave the
+//! searches without a worker. The pool takes them into their queue
 //! at once and tells the sender when the queue has room
 //! ([`WorkerExt::spawn_background_blocking`]): a full scan then waits for that, at the pace of
 //! its share, without holding up what the other classes send through the same channel.
@@ -258,10 +258,16 @@ impl WorkerExt for Sender<Worker> {
     }
 }
 
-/// The most background tasks that run at once: half of the workers. The writes of a build all
-/// take their index's writer, one at a time, and a commit holds it for tens of milliseconds;
-/// uncapped, every worker picked one in a moment with no search waiting and sat behind the
-/// commit, and the searches of the other indexes that came next waited for it to end.
+/// The most background tasks that run at once: half of the workers. A [`Place`] keeps its
+/// worker for as long as the work it was lent to runs, most of a second for a hold of the
+/// writer by a repair; uncapped, the repairs of several indexes could take every worker in a
+/// moment with no search waiting, and the searches that came next would wait for a hold to
+/// end.
+///
+/// It was made for the writes of a build, which waited for their index's writer on their
+/// workers, behind a commit. They no longer wait there (`tantivy::Index::change`), and for them
+/// alone the cap changes nothing: a build beside the searches of another index measured the
+/// same with it and without, three runs each.
 fn background_cap(workers: usize) -> usize {
     #[cfg(test)]
     if BACKGROUND_CAP_OFF.load(Ordering::Relaxed) {

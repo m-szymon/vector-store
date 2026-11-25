@@ -166,9 +166,9 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
   its turn in the pool" in `stage-2-ordering.md`): at 100 ms the writes under a heavy query
   load took 67% longer and the searches gained nothing. A budget would need the queue to hand
   over more than one short batch each time it runs out.
-- **The cap on background tasks, again.** It was for the rows of a build waiting on their
-  index's writer behind a commit. They no longer wait there (a change that finds the writer
-  held is left for its holder), so the cap may not be needed; not measured without it.
+- **The cap on background tasks with several repairs at once.** The cap is kept for the
+  places lent to the repairs' holds (see "The repair takes its turn in the pool"); the case
+  it is kept for, several pattern indexes repairing beside searches, is not measured.
 - **Merges are outside the pool.** They run on Tantivy's threads, as the repair's own writing
   of segments does; a place covers only the repair's thread.
 - **The vector index's writes as indexing.** Everything of it is in the search class, its adds,

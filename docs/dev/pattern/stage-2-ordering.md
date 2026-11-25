@@ -1000,6 +1000,20 @@ A 10M-row repair with a writer of a row every 10 ms took 192 s against 197, and 
 Their time until searchable is the same (within a second 92% against 89%). A build beside
 the searches of another index is unchanged (p99 3.4 ms against 3.8).
 
+**The cap on background tasks is kept, for another reason.** It was made for the rows of a
+build, which waited on their index's writer behind a commit and took every worker. They no
+longer wait there, and for them the cap changes nothing (`cap_chain.sh`, three runs each, the
+build beside the searches of another index):
+
+| 8 clients          | cap on: searches, p99, build's rows sent in | cap off |
+| ------------------ | ------------------------------------------- | ------- |
+| 5 ms between searches | 1180-1203 a second, 3.3-3.7 ms, 7.6-7.9 s | 1186-1189 a second, 3.2-3.3 ms, 7.7 s |
+| no pause           | 7671-7801 a second, 3.5 ms, 40.0-40.4 s     | 7704-8266 a second, 3.4-3.6 ms, 38.5-41.0 s |
+
+What it bounds now is the places lent to the repairs' holds: each keeps a worker idle for most
+of a second, and without the cap the repairs of several indexes could take every worker at
+once. That case is not measured.
+
 **The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
 100 ms, searches first unless a write has waited that long, the same load with 32 searchers
 took 643 s to index instead of 384, and the searches gained nothing: as many a second, p50
