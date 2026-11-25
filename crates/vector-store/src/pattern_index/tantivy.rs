@@ -7649,6 +7649,8 @@ mod tests {
     /// searches are kept going on a settled index of MATRIX_ROWS rows, each BUILD_THINK_MS (0)
     /// after the last; after 10 s of them alone, a second index takes BUILD_ROWS rows of a full
     /// scan. BUILD_CLASS=indexing sends those as indexing, as before the background class.
+    /// BUILD_INDEXES (1) indexes are built at once, each of BUILD_ROWS rows; with BUILD_REPAIR
+    /// the searches go on until every one of them is repaired, and are reported for that time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn a_build_beside_the_searches_of_another_index() {
@@ -7700,9 +7702,9 @@ mod tests {
         }
         settled(&served, 3600, |stats| stats.overlap.fresh_rows == 0).await;
 
-        // 0: warm-up, 1: the searches alone, 2: beside the build, 3: done.
+        // 0: warm-up, 1: the searches alone, 2: beside the build, 3: beside the repairs, 4: done.
         let phase = Arc::new(AtomicU32::new(0));
-        let times = Arc::new(Mutex::new([Vec::<u32>::new(), Vec::new()]));
+        let times = Arc::new(Mutex::new([Vec::<u32>::new(), Vec::new(), Vec::new()]));
         // BUILD_TRACE: the searches beside the build that took 5 ms or more, and the pool's
         // tasks that waited or ran 2 ms or more, by the time they started.
         let tracing = std::env::var("BUILD_TRACE").is_ok();
@@ -7714,13 +7716,13 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 loop {
                     let at = phase.load(Relaxed);
-                    if at == 3 {
+                    if at == 4 {
                         break;
                     }
                     let clock = Instant::now();
                     search_ordered(&served, "号玩家1", 200, SearchWindow::default()).await;
                     let took = clock.elapsed().as_micros() as u32;
-                    if at == 1 || at == 2 {
+                    if (1..=3).contains(&at) {
                         times.lock().unwrap()[at as usize - 1].push(took);
                     }
                     if at == 2 && took >= 5000 {
@@ -7823,7 +7825,7 @@ mod tests {
             }
             let over = started.elapsed();
             spent("beside the control", &before, &reading(), over);
-            phase.store(3, Relaxed);
+            phase.store(4, Relaxed);
             for task in tasks {
                 task.await.unwrap();
             }
@@ -7845,32 +7847,58 @@ mod tests {
             }
             return;
         }
-        let built = index(&worker);
-        for primary in shuffled(build_rows) {
-            let (tx, _rx) = mpsc::channel(1);
-            built
-                .add_document(
-                    test_partition_id(),
-                    primary.into(),
-                    matrix_name(primary),
-                    AsyncInProgress::fullscan(tx),
-                )
-                .await
-                .unwrap();
+        let built: Vec<_> = (0..env("BUILD_INDEXES", 1))
+            .map(|_| index(&worker))
+            .collect();
+        let scans: Vec<_> = built
+            .iter()
+            .map(|built| {
+                let built = built.clone();
+                tokio::spawn(async move {
+                    for primary in shuffled(build_rows) {
+                        let (tx, _rx) = mpsc::channel(1);
+                        built
+                            .add_document(
+                                test_partition_id(),
+                                primary.into(),
+                                matrix_name(primary),
+                                AsyncInProgress::fullscan(tx),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for scan in scans {
+            scan.await.unwrap();
         }
         let sent = started.elapsed();
-        while built
-            .stats(make_index_key())
-            .await
-            .unwrap()
-            .tantivy
-            .num_docs
-            < build_rows
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        for built in &built {
+            while built
+                .stats(make_index_key())
+                .await
+                .unwrap()
+                .tantivy
+                .num_docs
+                < build_rows
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
         let searchable = started.elapsed();
         spent("beside the build", &before, &reading(), searchable);
+        let mut repaired = Duration::ZERO;
+        if std::env::var("BUILD_REPAIR").is_ok() {
+            phase.store(3, Relaxed);
+            let before = reading();
+            let started = Instant::now();
+            for built in &built {
+                settled(built, 3600, |stats| stats.overlap.fresh_rows == 0).await;
+            }
+            repaired = started.elapsed();
+            spent("beside the repairs", &before, &reading(), repaired);
+        }
         if let Some(trace) = worker::TRACE.lock().unwrap().take() {
             let ms = |at: Instant| at.saturating_duration_since(started).as_secs_f64() * 1e3;
             let mut lines: Vec<(f64, String)> = trace
@@ -7898,7 +7926,7 @@ mod tests {
                 println!("TRACE {at:9.1} ms {line}");
             }
         }
-        phase.store(3, Relaxed);
+        phase.store(4, Relaxed);
         for task in tasks {
             task.await.unwrap();
         }
@@ -7918,7 +7946,15 @@ mod tests {
                 at(1.0)
             )
         };
-        let [before, during] = times;
+        let [before, during, repairs] = times;
+        if !repaired.is_zero() {
+            println!(
+                "BUILD repairs|{} indexes|repaired in {:.1}s|searches beside the repairs: {}",
+                built.len(),
+                repaired.as_secs_f64(),
+                report(repairs, repaired),
+            );
+        }
         println!(
             "BUILD meta lock: {} takes waited 1 ms or more, {:.2}s in all",
             crate::tantivy::directory::WAITS[0].load(Relaxed),

@@ -260,9 +260,10 @@ impl WorkerExt for Sender<Worker> {
 
 /// The most background tasks that run at once: half of the workers. A [`Place`] keeps its
 /// worker for as long as the work it was lent to runs, most of a second for a hold of the
-/// writer by a repair; uncapped, the repairs of several indexes could take every worker in a
-/// moment with no search waiting, and the searches that came next would wait for a hold to
-/// end.
+/// writer by a repair; uncapped, the repairs of several indexes take every worker in a
+/// moment with no search waiting, and the searches that come next wait for a hold to end:
+/// with four indexes repairing, the p99 of the searches of a fifth was 70-75 ms against 7-8,
+/// and the longest 0.45 s.
 ///
 /// It was made for the writes of a build, which waited for their index's writer on their
 /// workers, behind a commit. They no longer wait there (`tantivy::Index::change`), and for them
