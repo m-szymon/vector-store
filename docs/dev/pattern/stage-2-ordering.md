@@ -774,6 +774,36 @@ With and without by turns on one index (`MATRIX_WHOLE=spread`), 2M rows, walk ti
 so reads as before, and each measured just after the turn that read its segments whole. Rows
 in no order are as they were: their runs are read together already.
 
+#### Ordered neighbours are not merged across fresh pieces (2026-11-25)
+
+Two ordered clusters were neighbours, and merged when they fit, with no ordered segment
+between them, whatever fresh rows lay there. The merged segment spans those rows, and every
+repair step among them splits it again. A row committed alone at one end of the order was the
+case first seen (the stall of 2026-11-19); the same merge is in the log of a load without one,
+between the first stretches repaired. A run of ordered clusters now ends where a fresh piece
+reaches between two of them, by the pieces' bounds. During a load in no order that is every
+gap, so the stretches a repair leaves are merged once the fresh tier is empty, not as they
+come; a cluster still merges whole at any time, which is what takes the rows repaired into a
+segment's stretch.
+
+10M rows in no order, cap 1M, to the last merge (`the_repair_under_searches_kept_on_one_place`,
+which now goes on until the merges have ended; `HEAT_MERGE_ACROSS=1` for the merges as they
+were), one build, one run each:
+
+| | merged across | not merged across |
+|---|---|---|
+| settled | 293 s | 211 s |
+| settled, with the stray row | 278 s | 193 s |
+| rows the repair moved | 15.3M, 15.1M | 10.0M, 10.0M |
+| rows the merges wrote | 116M, 109M | 121M, 116M |
+| segments at most | 375, 326 | 317, 298 |
+| segments once settled | 15, 14 | 14, 14 |
+
+The merges left for the end take about 6 s after the last repair step. Under a steady stream
+of writes all over the order there is always a fresh piece over every gap, and neighbours do
+not merge until it stops; the clusters there come from splits, half a cap each, so few are
+small. Not measured: such a stream over days, with deletes thinning the ordered segments.
+
 #### The order of partitions is an option (2026-11-24)
 
 AWS run `0818814c` showed where table order stops: `char2` in table order or `tier` order

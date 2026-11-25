@@ -183,17 +183,17 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
 
 ## Open problems
 
-- **A stray row in the ordered tier makes a wide cluster.** A segment that overlaps no other is
-  adopted into the ordered tier; in a shuffled load an early commit of one row sometimes is such
-  a segment (2 of 15 local runs of 10M rows on 2026-11-19). Neighbouring ordered clusters merge
-  when they fit, so that row was merged with 287,286 rows at the other end of the key space, into
-  a segment spanning 7M fresh rows. This caused the repair stall of about 930 s (2 of 18 runs on
-  2026-11-18, 1 of 15 on 2026-11-19): fixed by bounding a hold to the step's range. What is left:
-  each step over such a cluster splits it again, so the repair rewrote 15.0M rows for 10M and
-  took 328 s against about 190 s. Not decided: whether a merge should join clusters across fresh
-  rows, and whether a segment of a few rows should be adopted. To reproduce:
-  `HEAT_STRAY=1` on the test `the_repair_under_searches_kept_on_one_place`
-  (`HEAT_NO_HOLD_BOUND=1` switches the fix off).
+- **A stray row in the ordered tier made a wide cluster** (settled 2026-11-25). A segment that
+  overlaps no other is adopted into the ordered tier; in a shuffled load an early commit of one
+  row sometimes is such a segment (2 of 15 local runs of 10M rows on 2026-11-19). Neighbouring
+  ordered clusters merged when they fit, so that row was merged with 287,286 rows at the other
+  end of the key space, into a segment spanning 7M fresh rows. This caused the repair stall of
+  about 930 s (2 of 18 runs on 2026-11-18, 1 of 15 on 2026-11-19): fixed by bounding a hold to
+  the step's range. Each step over such a cluster then split it again. Ordered neighbours are
+  no longer merged while a fresh piece reaches between them: see "Ordered neighbours are not
+  merged across fresh pieces" in `stage-2-ordering.md`. To reproduce: `HEAT_STRAY=1` on the
+  test `the_repair_under_searches_kept_on_one_place`, with `HEAT_MERGE_ACROSS=1` for the merges
+  as they were (`HEAT_NO_HOLD_BOUND=1` switches the hold's bound off).
 - **No fast test of the hold bound.** A 40,000-row index did not form the wide cluster; only the
   10M run does.
 - **Single cells of the page-cost matrix swing 3-5x between builds of one index.** Measured
