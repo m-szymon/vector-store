@@ -743,6 +743,37 @@ together count: where the runs follow one another (the stream and the settled in
 one or a few of them, and the threshold there was right as it was. So it is 256 matches, four
 pages, and eight for each run the walk would read together (`Runs::overlap`).
 
+#### More runs a pass for a keyword in few rows (2026-11-25)
+
+Where the runs follow one another -- rows that arrived in order, a repaired index -- a pass
+read one run: the next run's rows all lie under the floor the first one sets. A keyword in few
+rows needs many runs for a page, and each pass makes a reader of the postings: 271 passes for a
+page of 200 of a keyword in one row of 10,000 on 2M rows, 0.6 ms of scanning for the three
+grams of `用户42号` and 2.7 ms for the pattern `用户42号%`, beside 1.5 ms of verification that
+reading the segments whole pays too (the walk's probes, `MATRIX_WHOLE=1`).
+
+A run its stretch reads to the end now sets no floor, for so many runs a pass (`spread`), and
+the number grows after a pass that met matches and fewer than a page: by as many times as the
+page is short at that rate, four at most. A pass that met none does not count, since the sweep
+has by then told the runs that hold none; nor one that met a page's worth, whose keyword is in
+many rows. Unconditional growth was tried first: a keyword whose rows are all at the far end of
+the order then cost 1.2 ms for 0.05, the walk arriving there sixteen runs at a time.
+
+With and without by turns on one index (`MATRIX_WHOLE=spread`), 2M rows, walk time:
+
+| keyword in one row of 10,000, verified | without | with | read whole |
+|---|---|---|---|
+| `用户42号`, page of 200, stream | 2.40 ms | 1.83 ms | 1.62 ms |
+| `用户42号%`, page of 200, stream | 4.36 ms | 1.81 ms | 1.63 ms |
+| `用户42号%`, ascending page of 20, stream | 0.65 ms | 0.27 ms | 0.18 ms |
+| `用户42号%`, page of 200, settled | 3.74 ms | 2.22 ms | 2.07 ms |
+| `用户42号`, page of 20, settled | 0.28 ms | 0.23 ms | 0.23 ms |
+
+21 of the 285 cells of five runs are 20-60% faster, all of these two keywords; five are
+6-10 us slower (1.25-1.7x), each of a keyword that meets a page's worth in its first pass and
+so reads as before, and each measured just after the turn that read its segments whole. Rows
+in no order are as they were: their runs are read together already.
+
 #### The order of partitions is an option (2026-11-24)
 
 AWS run `0818814c` showed where table order stops: `char2` in table order or `tier` order

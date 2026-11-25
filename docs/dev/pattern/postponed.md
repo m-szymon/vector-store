@@ -90,10 +90,11 @@ worst cell of the matrix). Index size not estimated.
 Done (2026-11-23): a commit's rows are held and written in the order of their keys; see "A
 commit written in the order of its keys" in `stage-2-ordering.md`. Left open:
 
-- **A keyword that is verified and has many candidates for a few matches** (one row in 10,000
-  of candidates in every row) is read by its runs, since the threshold for reading a segment
-  whole counts candidates; whole is 1.4 to 3.5 times cheaper in every layout (0.54 ms for 1.8 ms
-  on 2M rows in no order, 0.24 for 0.32 ms settled).
+- **A keyword in few rows on rows in no order** still costs three times what the segment read
+  whole does (1.8 ms for 0.5 ms, a page of 20 on 2M rows), where the threshold for reading
+  whole does not take it: its bound on the matches is the rarest gram's rows, 25 times the
+  candidates of `用户42号`. There a pass looks at every run, eight passes. More runs a pass does
+  not help: the runs are all read together already.
 - **The walk reads a segment at a time.** A segment with candidates everywhere and no match is
   verified whole before the next is opened; a merge by key across segments would not.
 
