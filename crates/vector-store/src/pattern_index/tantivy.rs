@@ -54,6 +54,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::anyhow;
+use async_channel::Sender;
 use tantivy::DocSet;
 use tantivy::SegmentReader;
 use tantivy::TERMINATED;
@@ -246,8 +247,6 @@ struct PatternBackend {
     /// Ticks since one last found the CDC changes lagging; back at `LAG_QUIET_TICKS` on a tick
     /// whose changes kept up.
     ticks_since_lag: AtomicU32,
-    /// The worker pool's indexing load at the last tick, to tell whether indexing waited since.
-    indexing_before: Mutex<worker::IndexingLoad>,
     /// Set while a tick's work on this index -- learning the layout, a step of the rewrite -- is
     /// running, so that the next tick does not queue more behind it. See `TickWork`.
     tick_running: AtomicBool,
@@ -291,9 +290,6 @@ const SCAN_QUIET_TICKS: u32 = 5;
 /// Ticks without a CDC change before a stream of lagging ones counts as ended. A stream that
 /// lags comes in bursts with gaps between them, and one tick without a change is not its end.
 const LAG_QUIET_TICKS: u32 = 5;
-/// The mean time indexing tasks may have waited in the worker's queue since the last tick for
-/// a repair step to run while the index ingests.
-const INDEXING_WAIT_LIMIT: Duration = Duration::from_millis(1);
 /// The mean lag of the CDC changes taken in since the last tick -- from the write to the table to
 /// the index taking the change in -- under which a repair step may run while the index ingests.
 /// An index keeping up lags about a second (AWS run 5df052ac, 1.3 s with a writer at 2000 rows a
@@ -1647,13 +1643,17 @@ impl PatternBackend {
     ///   through CDC is repaired once the index has caught up, as a full scan is.
     /// - Writes the index keeps up with: on an idle tick always, so that an idle index converges
     ///   to an empty fresh tier and a disjoint ordered one; while the index ingests, once the
-    ///   fresh tier holds `LOAD_FRESH_ROWS` rows, and only while indexing did not wait in the
-    ///   worker's queue. A burst of writes grows the fresh tier, which searches pay for with an
-    ///   open per fresh segment, rather than the lag. The queue alone did not tell: each row is a
-    ///   task of its own that the queue drains between batches, and AWS run 7a300b9d, loading
-    ///   10M rows through CDC into three indexes, repaired 264 steps while it ingested and caught
-    ///   up 1027 s after the load instead of 364.
-    fn maybe_repair(&self, state: &PatternIndexState, key: &IndexKey, idle: bool) {
+    ///   fresh tier holds `LOAD_FRESH_ROWS` rows. Each hold of the writer by a step then waits
+    ///   for a place among the worker pool's background tasks (`repair_place`), so the searches
+    ///   and the live writes of every index go first, and a burst of writes grows the fresh
+    ///   tier, which searches pay for with an open per fresh segment, rather than the lag.
+    fn maybe_repair(
+        &self,
+        state: &PatternIndexState,
+        key: &IndexKey,
+        idle: bool,
+        worker: &Sender<Worker>,
+    ) {
         if !*self.options.rewrite_wide_segments.as_ref() {
             return;
         }
@@ -1668,8 +1668,6 @@ impl PatternBackend {
         };
         self.ticks_since_scan.store(since_scan, Relaxed);
         let scanning = since_scan < SCAN_QUIET_TICKS;
-        let load = worker::STATS.indexing();
-        let before = std::mem::replace(&mut *self.indexing_before.lock().unwrap(), load);
         let changes = self.cdc_changes.swap(0, Relaxed);
         let lag_millis = self.cdc_lag_millis.swap(0, Relaxed);
         let since_lag = match lag_millis.checked_div(changes) {
@@ -1680,7 +1678,6 @@ impl PatternBackend {
         };
         self.ticks_since_lag.store(since_lag, Relaxed);
         let lagging = since_lag < LAG_QUIET_TICKS;
-        let contended = load.contended_since(&before, INDEXING_WAIT_LIMIT);
         let pieces = self.geometry(&state.reader.searcher());
         let ordered = ordered_tier(&pieces);
         let fresh_rows: u64 = pieces
@@ -1703,17 +1700,11 @@ impl PatternBackend {
         {
             GATE_TICKS[0].fetch_add(1, Relaxed);
             GATE_TICKS[1].fetch_add(u64::from(lagging), Relaxed);
-            GATE_TICKS[2].fetch_add(u64::from(contended), Relaxed);
-            // Held by the contended signal alone: due without it.
-            let alone = contended
-                && repair_due(idle, scanning || lagging, false, fresh_rows, overfull)
-                && !repair_due(idle, scanning || lagging, true, fresh_rows, overfull);
-            GATE_TICKS[3].fetch_add(u64::from(alone), Relaxed);
         }
-        if !repair_due(idle, scanning || lagging, contended, fresh_rows, overfull) {
+        if !repair_due(idle, scanning || lagging, fresh_rows, overfull) {
             return;
         }
-        if let Err(err) = repair_step(state) {
+        if let Err(err) = repair_step(state, worker) {
             error!("pattern: repair of {key} failed: {err}");
         }
     }
@@ -1737,19 +1728,25 @@ impl PatternBackend {
 /// Whether a repair step may run now, given what there is to repair: never while the index is
 /// `catching_up` -- a full scan going on, or CDC changes lagging behind the table; on an idle
 /// tick always; while the index ingests, once the fresh tier holds
-/// `LOAD_FRESH_ROWS` rows or an ordered stretch is past the cap, and only if indexing has not
-/// been `contended`. Pure, so it can be tested without an index.
-fn repair_due(
-    idle: bool,
-    catching_up: bool,
-    contended: bool,
-    fresh_rows: u64,
-    overfull: bool,
-) -> bool {
+/// `LOAD_FRESH_ROWS` rows or an ordered stretch is past the cap. When the step's work then runs
+/// is the worker pool's to say: see `repair_place`. Pure, so it can be tested without an index.
+fn repair_due(idle: bool, catching_up: bool, fresh_rows: u64, overfull: bool) -> bool {
     if (fresh_rows == 0 && !overfull) || catching_up {
         return false;
     }
-    idle || (!contended && (fresh_rows >= LOAD_FRESH_ROWS || overfull))
+    idle || fresh_rows >= LOAD_FRESH_ROWS || overfull
+}
+
+/// A place among the pool's background tasks for one hold of the writer by a repair step, taken
+/// before the writer and given back after it. The step runs on a thread of its own, a hold
+/// being too long for a worker, and with a place it still waits for the searches and the live
+/// writes of every index as the writes of a build do, runs beside at most as many background
+/// tasks as they may, and counts into their share of the workers' time.
+fn repair_place(worker: &Sender<Worker>) -> Option<worker::Place> {
+    if walk_off(OFF_POOL_PLACE) {
+        return None;
+    }
+    worker.take_background_place()
 }
 
 /// A row a repair step moves: its layout key, the term that deletes its current copy, and the
@@ -1860,7 +1857,7 @@ fn split_parts<T>(rows: Vec<(u128, T)>, size: usize) -> Vec<Vec<(u128, T)>> {
 /// delete of one of those rows from being undone by the re-add: it waits, and lands with a higher
 /// opstamp; a change between two ranges is committed before the next range reads its rows.
 /// Searches take the reader, not this lock. Returns whether rows were moved.
-fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
+fn repair_step(state: &PatternIndexState, worker: &Sender<Worker>) -> anyhow::Result<bool> {
     let backend = state.backend();
     let Some(cap) = *backend.options.segment_max_docs.as_ref() else {
         return Ok(false);
@@ -1878,6 +1875,7 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
 
     repair_phase(10);
     let waiting = Instant::now();
+    let place = repair_place(worker);
     let mut writer = state.lock_writer();
     let held = Instant::now();
     repair_phase(11);
@@ -1975,6 +1973,7 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
     }
     drop(searcher);
     drop(writer);
+    drop(place);
     if keys.is_empty() {
         return Ok(false);
     }
@@ -1994,6 +1993,7 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
     for &(low, high, planned) in &ranges {
         repair_phase(20);
         let waiting = Instant::now();
+        let place = repair_place(worker);
         let mut writer = state.lock_writer();
         let held = Instant::now();
         repair_phase(21);
@@ -2067,6 +2067,7 @@ fn repair_step(state: &PatternIndexState) -> anyhow::Result<bool> {
         // The writes that waited through this hold go before the next one.
         drop(searcher);
         drop(writer);
+        drop(place);
         repair_phase(25);
         if !walk_off(OFF_HANDOVER) {
             state.let_writes_in(REPAIR_HANDOVER_LIMIT);
@@ -2120,7 +2121,6 @@ fn new_index(
         cdc_lag_millis: AtomicU64::new(0),
         cdc_changes: AtomicU64::new(0),
         ticks_since_lag: AtomicU32::new(LAG_QUIET_TICKS),
-        indexing_before: Mutex::new(worker::STATS.indexing()),
         tick_running: AtomicBool::new(false),
         merging: Mutex::new(MergesInFlight::default()),
         options: options.clone(),
@@ -2458,15 +2458,11 @@ const OFF_HANDOVER: u32 = 256;
 const OFF_HOLD_BOUND: u32 = 512;
 const OFF_SORTED_COMMITS: u32 = 1024;
 const OFF_FRESH_BETWEEN: u32 = 2048;
-/// Ticks with a repair pending, and of those: with changes lagging, with indexing contended, and
-/// held by the contended signal alone. For a benchmark test.
+/// The repair's holds of the writer without a place in the worker pool.
+const OFF_POOL_PLACE: u32 = 8192;
+/// Ticks with a repair pending, and of those with changes lagging. For a benchmark test.
 #[cfg(test)]
-static GATE_TICKS: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static GATE_TICKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 const OFF_LOCK_CHUNKS: u32 = 128;
 /// Where a repair step is, for a benchmark test that watches one stall: see `repair_phase`.
 #[cfg(test)]
@@ -3644,11 +3640,12 @@ pub(crate) fn new(
                             continue;
                         };
                         let key = key.clone();
+                        let worker = worker.clone();
                         tokio::task::spawn_blocking(move || {
                             let state = &work.0;
                             let backend = state.backend();
                             backend.after_reload(state);
-                            backend.maybe_repair(state, &key, idle);
+                            backend.maybe_repair(state, &key, idle, &worker);
                         });
                     }
                     mark_dirty(&index.key);
@@ -7263,6 +7260,9 @@ mod tests {
             add_batch(&sender, [0], matrix_name).await;
         }
         let total = rows + u64::from(std::env::var("HEAT_STRAY").is_ok());
+        if std::env::var("REPAIR_NO_PLACE").is_ok() {
+            WALK_OFF.fetch_or(OFF_POOL_PLACE, Relaxed);
+        }
         if std::env::var("HEAT_NO_HOLD_BOUND").is_ok() {
             WALK_OFF.fetch_or(OFF_HOLD_BOUND, Relaxed);
         }
@@ -7358,6 +7358,11 @@ mod tests {
                 | OFF_TRACE_REPAIR
                 | if std::env::var("MATRIX_NO_HANDOVER").is_ok() {
                     OFF_HANDOVER
+                } else {
+                    0
+                }
+                | if std::env::var("REPAIR_NO_PLACE").is_ok() {
+                    OFF_POOL_PLACE
                 } else {
                     0
                 },
@@ -7474,6 +7479,9 @@ mod tests {
         MATRIX_ROWS.store(rows, Relaxed);
         let fifo = std::env::var("WORKER").is_ok_and(|worker| worker == "fifo");
         worker::FIFO.store(fifo, Relaxed);
+        if std::env::var("REPAIR_NO_PLACE").is_ok() {
+            WALK_OFF.fetch_or(OFF_POOL_PLACE, Relaxed);
+        }
         let sender = new(
             PatternIndexConfiguration {
                 key: make_index_key(),
@@ -7558,7 +7566,7 @@ mod tests {
         let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
         let gate: Vec<u64> = GATE_TICKS.iter().map(|ticks| ticks.load(Relaxed)).collect();
         println!(
-            "MIXED|{}|{rows}|{searchers}|sent {sent:.0}s|indexed {indexed:.0}s|wait mean {:.2}s|searches {}|p50 {}|p90 {}|p99 {}|max {} us|fresh {}|steps {}|ticks pending {} lagging {} contended {} held by contended alone {}",
+            "MIXED|{}|{rows}|{searchers}|sent {sent:.0}s|indexed {indexed:.0}s|wait mean {:.2}s|searches {}|p50 {}|p90 {}|p99 {}|max {} us|fresh {}|steps {}|ticks pending {} lagging {}",
             if fifo { "fifo" } else { "classes" },
             histogram.get_sample_sum() / histogram.get_sample_count().max(1) as f64,
             times.len(),
@@ -7570,8 +7578,6 @@ mod tests {
             stats.rewrite.steps,
             gate[0],
             gate[1],
-            gate[2],
-            gate[3],
         );
         use prometheus::core::Collector;
         for bucket in histogram.collect()[0].get_metric()[0]
@@ -7927,20 +7933,18 @@ mod tests {
 
     /// Nothing is repaired while a full scan goes on, idle tick or not. After it, an idle tick
     /// repairs whatever there is; while the index ingests, the repair waits for the fresh tier
-    /// to grow past two caps, or a stretch past the cap, and for indexing not to wait.
+    /// to hold `LOAD_FRESH_ROWS` rows, or a stretch past the cap.
     #[test]
-    fn the_repair_waits_for_the_scan_and_gives_way_to_indexing() {
+    fn the_repair_waits_for_the_scan_and_for_rows_to_repair() {
         let under = LOAD_FRESH_ROWS - 1;
-        // (idle, catching up, contended, fresh rows, overfull)
-        assert!(!repair_due(true, false, false, 0, false));
-        assert!(repair_due(true, false, true, 1, false));
-        assert!(!repair_due(true, true, false, LOAD_FRESH_ROWS, true));
-        assert!(!repair_due(false, true, false, LOAD_FRESH_ROWS, true));
-        assert!(!repair_due(false, false, false, under, false));
-        assert!(repair_due(false, false, false, LOAD_FRESH_ROWS, false));
-        assert!(!repair_due(false, false, true, LOAD_FRESH_ROWS, false));
-        assert!(repair_due(false, false, false, 0, true));
-        assert!(!repair_due(false, false, true, 0, true));
+        // (idle, catching up, fresh rows, overfull)
+        assert!(!repair_due(true, false, 0, false));
+        assert!(repair_due(true, false, 1, false));
+        assert!(!repair_due(true, true, LOAD_FRESH_ROWS, true));
+        assert!(!repair_due(false, true, LOAD_FRESH_ROWS, true));
+        assert!(!repair_due(false, false, under, false));
+        assert!(repair_due(false, false, LOAD_FRESH_ROWS, false));
+        assert!(repair_due(false, false, 0, true));
     }
 
     /// A segment holding the last tokens of one value and the first of the next spans what its

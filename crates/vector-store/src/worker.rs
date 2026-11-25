@@ -29,6 +29,11 @@
 //! ([`WorkerExt::spawn_background_blocking`]): a full scan then waits for that, at the pace of
 //! its share, without holding up what the other classes send through the same channel.
 //!
+//! Work too long for a worker -- the repair of a pattern index holds its writer for most of a
+//! second, and a worker is a task of the runtime -- runs on a thread of its own and takes a
+//! [`Place`] among the background tasks for as long as it runs: a worker lends it in the turn
+//! of a background task and waits until it is given back.
+//!
 //! The policy can change while the node runs: the workers read [`Scheduling`] from a watch
 //! channel for every task they take.
 
@@ -117,12 +122,24 @@ pub(crate) enum Worker {
     SpawnAsyncBlocking {
         f: NewTaskFuture,
     },
+    /// A worker's place, asked for by work that runs on a thread of its own: see [`Place`].
+    Lend {
+        class: TaskClass,
+        lent: oneshot::Sender<Place>,
+    },
 }
+
+/// A worker's place in the pool, held by work that runs on a thread of its own: the worker that
+/// lent it runs nothing until this is dropped, and the time counts as its class's. For work too
+/// long for a worker -- a worker is a task of the runtime, and one that runs for a second keeps
+/// a runtime thread from everything else -- that still has to wait its turn among the classes
+/// and count into their shares.
+pub(crate) struct Place(#[allow(dead_code)] oneshot::Sender<()>);
 
 impl Worker {
     fn class(&self) -> TaskClass {
         match self {
-            Worker::SpawnBlocking { class, .. } => *class,
+            Worker::SpawnBlocking { class, .. } | Worker::Lend { class, .. } => *class,
             _ => TaskClass::Search,
         }
     }
@@ -148,6 +165,10 @@ pub(crate) trait WorkerExt {
             self.spawn_indexing_blocking(f).await
         }
     }
+    /// Waits for a place among the background tasks, for work the caller's own thread does
+    /// while it holds it: see [`Place`]. Blocks, so not for a thread of the runtime. `None`: the
+    /// pool is gone.
+    fn take_background_place(&self) -> Option<Place>;
     async fn spawn_async_non_blocking<Fut>(&self, f: impl FnOnce() -> Fut + Send + 'static)
     where
         Fut: Future<Output = ()> + Send + 'static;
@@ -200,6 +221,16 @@ impl WorkerExt for Sender<Worker> {
         .expect("WorkerExt::spawn_background_blocking: internal actor should receive request");
         // An error is the pool gone, with the task: nothing to wait for.
         _ = admitted_rx.await;
+    }
+
+    fn take_background_place(&self) -> Option<Place> {
+        let (lent_tx, lent_rx) = oneshot::channel();
+        self.send_blocking(Worker::Lend {
+            class: TaskClass::Background,
+            lent: lent_tx,
+        })
+        .ok()?;
+        lent_rx.blocking_recv().ok()
     }
 
     #[hotpath::measure]
@@ -425,7 +456,6 @@ impl Queues {
             class
         };
         let queued = self.by_class[class.index()].pop_front()?;
-        STATS.queued[class.index()].fetch_sub(1, Ordering::Relaxed);
         if class == TaskClass::Background {
             self.background_running += 1;
             if let Some(admitted) = self.not_admitted.pop_front() {
@@ -457,39 +487,13 @@ pub(crate) struct WorkerStats {
     tasks: [AtomicU64; CLASSES],
     queue_wait_nanos: [AtomicU64; CLASSES],
     busy_nanos: [AtomicU64; CLASSES],
-    /// Tasks in the queues now.
-    queued: [AtomicU64; CLASSES],
 }
 
 pub(crate) static STATS: WorkerStats = WorkerStats {
     tasks: [const { AtomicU64::new(0) }; CLASSES],
     queue_wait_nanos: [const { AtomicU64::new(0) }; CLASSES],
     busy_nanos: [const { AtomicU64::new(0) }; CLASSES],
-    queued: [const { AtomicU64::new(0) }; CLASSES],
 };
-
-/// How the indexing class fares at one moment, over every pool: what background work that
-/// competes with indexing for the node -- the repair of a pattern index's layout -- reads to hold
-/// back while indexing waits. Totals since the process started, so a caller diffs two readings.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IndexingLoad {
-    /// Indexing tasks in the queues now.
-    pub(crate) queued: u64,
-    pub(crate) tasks: u64,
-    pub(crate) queue_wait_nanos: u64,
-}
-
-impl IndexingLoad {
-    /// Whether indexing waited since `before`: tasks are queued now, or the tasks taken since
-    /// waited more than `limit` on average.
-    pub(crate) fn contended_since(&self, before: &IndexingLoad, limit: Duration) -> bool {
-        let tasks = self.tasks.saturating_sub(before.tasks);
-        let waited = self
-            .queue_wait_nanos
-            .saturating_sub(before.queue_wait_nanos);
-        self.queued > 0 || (tasks > 0 && waited / tasks > limit.as_nanos() as u64)
-    }
-}
 
 impl WorkerStats {
     fn record(&self, class: TaskClass, queue_wait: Duration, busy: Duration) {
@@ -497,15 +501,6 @@ impl WorkerStats {
         self.tasks[class].fetch_add(1, Ordering::Relaxed);
         self.queue_wait_nanos[class].fetch_add(queue_wait.as_nanos() as u64, Ordering::Relaxed);
         self.busy_nanos[class].fetch_add(busy.as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    pub(crate) fn indexing(&self) -> IndexingLoad {
-        let i = TaskClass::Indexing.index();
-        IndexingLoad {
-            queued: self.queued[i].load(Ordering::Relaxed),
-            tasks: self.tasks[i].load(Ordering::Relaxed),
-            queue_wait_nanos: self.queue_wait_nanos[i].load(Ordering::Relaxed),
-        }
     }
 
     /// Per class: (class, tasks run, seconds queued, seconds running).
@@ -559,7 +554,16 @@ async fn run_in_thread(
 
 #[cfg(test)]
 pub(crate) fn new() -> Sender<Worker> {
-    with_scheduling(watch::channel(Scheduling::default()).1)
+    // A benchmark test's switch: WORKER_BUDGET_MS sets the indexing queue budget.
+    let scheduling = Scheduling {
+        indexing_queue_budget: std::env::var("WORKER_BUDGET_MS")
+            .map_or(Scheduling::default().indexing_queue_budget, |millis| {
+                Duration::from_millis(millis.parse().unwrap())
+            }),
+        ..Scheduling::default()
+    };
+    // Kept for the pool's life: its workers read the policy from the receiver.
+    with_scheduling(watch::channel(scheduling).1)
 }
 
 /// A pool whose workers follow `scheduling` as it changes.
@@ -618,7 +622,6 @@ pub(crate) fn with_scheduling(scheduling: watch::Receiver<Scheduling>) -> Sender
                                 msg,
                                 enqueued: Instant::now(),
                             });
-                            STATS.queued[class.index()].fetch_add(1, Ordering::Relaxed);
                             if let Some(admitted) = admitted {
                                 if queues.by_class[class.index()].len() <= capacity {
                                     _ = admitted.send(());
@@ -698,6 +701,13 @@ pub(crate) fn with_scheduling(scheduling: watch::Receiver<Scheduling>) -> Sender
                                 f();
                             }
                         }
+                        Worker::Lend { lent, .. } => {
+                            // Until the place is dropped, or at once if nobody waits for it.
+                            let (returned_tx, returned_rx) = oneshot::channel();
+                            if lent.send(Place(returned_tx)).is_ok() {
+                                _ = returned_rx.await;
+                            }
+                        }
                         Worker::SpawnAsyncBlocking { f } => {
                             if try_acquire_thread(id, in_flow, workers, &thread_operations_in_flow)
                             {
@@ -747,36 +757,6 @@ mod tests {
         min_search_share: 0.25,
         min_background_share: 0.10,
     };
-
-    /// Indexing is contended while tasks wait in its queue, or when the tasks taken since the
-    /// last reading waited past the limit on average; a reading with nothing taken and nothing
-    /// queued is not.
-    #[test]
-    fn indexing_is_contended_while_its_tasks_wait() {
-        let limit = Duration::from_millis(1);
-        let before = IndexingLoad {
-            queued: 0,
-            tasks: 100,
-            queue_wait_nanos: 1_000_000,
-        };
-        assert!(!before.contended_since(&before, limit));
-        let quick = IndexingLoad {
-            tasks: 200,
-            queue_wait_nanos: 1_000_000 + 100 * 50_000,
-            ..before
-        };
-        assert!(!quick.contended_since(&before, limit));
-        let slow = IndexingLoad {
-            queue_wait_nanos: 1_000_000 + 100 * 2_000_000,
-            ..quick
-        };
-        assert!(slow.contended_since(&before, limit));
-        let backlog = IndexingLoad {
-            queued: 3,
-            ..before
-        };
-        assert!(backlog.contended_since(&before, limit));
-    }
 
     /// What waits, and the shares to go with it: searches' as given, background's above its
     /// minimum unless a test says otherwise.
@@ -919,7 +899,6 @@ mod tests {
         };
         for _ in 0..2 {
             queues.by_class[TaskClass::Background.index()].push_back(background());
-            STATS.queued[TaskClass::Background.index()].fetch_add(1, Ordering::Relaxed);
         }
         let scheduling = Scheduling::default();
         assert!(queues.take(&scheduling, now).is_some());
@@ -1031,6 +1010,58 @@ mod tests {
         let sent = [Background, Background, Search, Indexing, Search];
         let ran = run_order(scheduling, &sent).await;
         assert_eq!(&ran[3..], &[Background, Background], "{ran:?}");
+    }
+
+    /// A place is lent in the turn of a background task, after a search queued behind it, and
+    /// its worker runs nothing else until it is given back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_place_waits_its_turn_and_keeps_its_worker_until_given_back() {
+        let scheduling = Scheduling {
+            min_background_share: 0.0,
+            ..Scheduling::default()
+        };
+        let worker = with_scheduling(watch::channel(scheduling).1);
+        let (release_tx, release_rx) = async_channel::bounded::<()>(1);
+        let (held_tx, held_rx) = async_channel::unbounded::<()>();
+        worker
+            .spawn_async_non_blocking(move || async move {
+                held_tx.send(()).await.unwrap();
+                _ = release_rx.recv().await;
+            })
+            .await;
+        held_rx.recv().await.unwrap();
+        let (ran_tx, ran_rx) = async_channel::unbounded();
+        let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
+        let thread = thread::spawn({
+            let (worker, ran_tx) = (worker.clone(), ran_tx.clone());
+            move || {
+                let place = worker.take_background_place().unwrap();
+                ran_tx.try_send("place").unwrap();
+                _ = back_rx.recv();
+                drop(place);
+            }
+        });
+        // Let the place be queued before the search.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        worker
+            .spawn_blocking({
+                let ran_tx = ran_tx.clone();
+                move || ran_tx.try_send("search").unwrap()
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release_tx.close();
+        assert_eq!(ran_rx.recv().await.unwrap(), "search");
+        assert_eq!(ran_rx.recv().await.unwrap(), "place");
+        worker
+            .spawn_blocking(move || ran_tx.try_send("after").unwrap())
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(ran_rx.is_empty(), "ran beside a place on the only worker");
+        back_tx.send(()).unwrap();
+        let ran = tokio::time::timeout(Duration::from_secs(5), ran_rx.recv()).await;
+        assert_eq!(ran.unwrap().unwrap(), "after");
+        thread.join().unwrap();
     }
 
     /// The pool takes as many background tasks as its queue has room for; the sender of one
