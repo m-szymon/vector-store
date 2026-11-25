@@ -410,11 +410,12 @@ When a step may run depends on what brings the rows. During a full scan, which b
 and serves no queries, no step runs: the scan gets the node, and the repair then works from every
 row at once (the scan counts as ended five ticks after its last row). After it, an idle tick
 always takes a step, so an idle index converges to an empty fresh tier and a disjoint ordered
-one; while the index ingests, a step waits until the fresh tier holds two caps, and runs only
-while indexing does not wait in the worker's queue (nothing queued, and the tasks since the last
-tick waited under 1 ms on average). A step holds the writer lock, so the writes waiting for it
-back the queue up and the next tick holds off: a burst of writes grows the fresh tier, which
-searches pay for with an open per fresh segment, rather than the lag.
+one; while the index ingests, a step waits until the fresh tier holds 400,000 rows, and each of
+its holds of the writer then waits for a place among the worker pool's background tasks, behind
+the searches and the live writes of every index: a burst of writes grows the fresh tier, which
+searches pay for with an open per fresh segment, rather than the lag. (Until 2026-11-25 a step
+ran only while indexing tasks had waited under 1 ms on average in the worker's queue since the
+last tick; see "The repair takes its turn in the pool" for what replaced that and why.)
 
 The searches say where the overlap costs them. An ordered search counts the segments it opened
 that put no row on its page (`pattern_search_segments_wasted_total`), and the last 4096 that
