@@ -946,6 +946,47 @@ down together: two computing threads alone cost 16-18% there. So the figure is t
 and on a node whose vCPUs are whole cores (the c8g of the AWS runs) about 8% is what to
 expect, with the build's threads then competing for the cores themselves when all are busy.
 
+#### The repair takes its turn in the pool (2026-11-25)
+
+A repair step runs on a thread of its own, because one hold of the writer lasts most of a
+second and a worker is a task of the runtime. That left it outside the pool's policy, and what
+held it back while the index ingested was a signal read on the tick: no step if indexing tasks
+had waited more than 1 ms in the queue on average. Now each hold of the writer first takes a
+place among the pool's background tasks (`worker::Place`, `repair_place`): a worker lends it
+in the turn of a background task and runs nothing until the hold ends, while the work stays on
+the repair's thread. So a hold waits for the searches and the live writes of every index as a
+build's rows do, counts into the cap on background tasks and into their share, and the signal
+is gone: a step is due on an idle tick, or once the fresh tier holds 400,000 rows.
+
+Measured on the laptop, 4 workers on CPUs 0-3, single runs (`sched_chain.sh`; runs of one
+benchmark differ by up to 20% from day to day):
+
+| 3M rows written shuffled, searches beside | before | place in the pool | new gate, no place |
+| ----------------------------------------- | ------ | ----------------- | ------------------ |
+| 8 searchers: rows indexed in              | 98 s   | 63 s              | 57 s               |
+| search p50 / p99                          | 6.9 / 50 ms | 2.9 / 275 ms | 2.4 / 278 ms       |
+| repair steps, fresh rows left             | 9, 1.02M | 22, 0.41M       | 25, 0.38M          |
+| 32 searchers: rows indexed in             | 490 s  | 384 s             | 338 s              |
+| search p50 / p99                          | 14 / 52 ms | 8.2 / 42 ms   | 7.9 / 39 ms        |
+| repair steps, fresh rows left             | 23, 0.39M | 22, 0.38M      | 21, 0.34M          |
+
+What changed the figures is the gate, not the place: the old signal alone held the repair on
+69 of 86 ticks with 8 searchers, and the fresh tier it left made every search and so every
+write slower. The p99 with 8 searchers is the repair done inside the run instead of after it:
+22 steps in a minute, each with holds that park the writes of the index, and the workers they
+run on, on the writer. A 10M-row repair with a row written every 10 ms took 195 s against 197,
+with the rows searchable within a second 87% against 91% (89% without the place); the repair
+of 10M rows under searches 242 s against 265. Neither is outside the noise.
+
+**The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
+100 ms, searches first unless a write has waited that long, the same load with 32 searchers
+took 643 s to index instead of 384, and the searches gained nothing: as many a second, p50
+10.6 ms against 8.2. With 8 searchers nothing changed (58 s against 63). The indexing queue
+is short, twelve tasks on four workers, so that a CDC reader waits on its sends; a write let
+through after 100 ms is followed by ones that have only just been queued, and the rate of
+writes under a full query load falls towards a queue's worth every 100 ms. That is the lag of
+AWS run 5df052ac again, which the indexing class was made to stop.
+
 
 ### Measured at 10M names (AWS, 2026-09-27, one run, six index variants)
 

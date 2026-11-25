@@ -104,8 +104,6 @@ commit written in the order of its keys" in `stage-2-ordering.md`. Left open:
   (0.11 ms against 0.05 for a page of 20 on a stream index); they save 2 to 10 times in nine
   other cells. What they cost dense keywords before commits were sorted (1.6-1.8x) is gone:
   1.25x in one cell.
-- The "indexing contended" signal alone holds the repair on 60-80% of ticks under mixed load.
-  Whether it should hold it that much is not measured.
 - A dense page of 1000 on a stream index costs about 1.5 ms in sorted-vector inserts.
 - Time order under random writes: 123 us against 89 us before, one run each, not investigated.
 
@@ -164,14 +162,16 @@ the move.
 From the plan to give every kind of index one scheduling policy in the pool; see "A build
 beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
 
-- **A budget for indexing by default** (`VECTOR_STORE_INDEXING_QUEUE_BUDGET` from 0 to about
-  100 ms: searches first unless a write has waited that long). It has to change the repair's
-  gate with it: the repair holds while indexing tasks wait more than 1 ms on average
-  (`INDEXING_WAIT_LIMIT`), and with a budget they wait by design whenever searches are busy, so
-  the repair would never run under a query load.
-- **The repair in the pool.** It runs on Tokio's blocking pool, because a step holds the writer
-  for seconds and once took every worker. As a background task it would need the cap to count
-  it, and a cap of one for an index.
+- **A budget for indexing by default.** Measured and not taken (2026-11-25, "The repair takes
+  its turn in the pool" in `stage-2-ordering.md`): at 100 ms the writes under a heavy query
+  load took 67% longer and the searches gained nothing. A budget would need the queue to hand
+  over more than one short batch each time it runs out.
+- **A repair's holds park the writes of its index on the workers.** A write waits for the
+  writer on the worker that took it, for up to the hold's 0.7 s, and with enough of them every
+  worker waits: the p99 of 275 ms with a repair during a load. A write that found the writer
+  held could go back to its queue, or the holds be shorter.
+- **Merges are outside the pool.** They run on Tantivy's threads, as the repair's own writing
+  of segments does; a place covers only the repair's thread.
 - **The vector index's writes as indexing.** Everything of it is in the search class, its adds,
   removals and reserves too, which counts them into the share the searches' floor protects.
 - **The build's own commit.** It holds two workers for about 30 ms, ten times a second: the
