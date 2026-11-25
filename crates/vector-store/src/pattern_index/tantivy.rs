@@ -7494,6 +7494,11 @@ mod tests {
             std::env::var("BUILD_CAP").is_ok_and(|cap| cap == "off"),
             Relaxed,
         );
+        // BUILD_META_LOCK=sleeping: the meta lock as a file of Tantivy's RAM directory.
+        crate::tantivy::directory::SLEEPING.store(
+            std::env::var("BUILD_META_LOCK").is_ok_and(|lock| lock == "sleeping"),
+            Relaxed,
+        );
         MATRIX_ROWS.store(rows.max(build_rows), Relaxed);
         let worker = worker::new();
         let index = |worker: &async_channel::Sender<Worker>| {
@@ -7742,6 +7747,11 @@ mod tests {
             )
         };
         let [before, during] = times;
+        println!(
+            "BUILD meta lock: {} takes waited 1 ms or more, {:.2}s in all",
+            crate::tantivy::directory::WAITS[0].load(Relaxed),
+            crate::tantivy::directory::WAITS[1].load(Relaxed) as f64 / 1e9,
+        );
         println!(
             "BUILD|{class}|{searchers} searchers, think {} ms|{rows} rows served, {build_rows} built|alone: {}|beside the build: {}|rows sent in {:.1}s, searchable in {:.1}s",
             think.as_millis(),

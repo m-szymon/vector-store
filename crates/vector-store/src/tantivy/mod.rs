@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+pub(crate) mod directory;
+
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
@@ -392,7 +394,14 @@ impl<E> Index<E> {
         worker: async_channel::Sender<Worker>,
         state: E,
     ) -> anyhow::Result<Self> {
-        let index = tantivy::Index::create_in_ram(schema.clone());
+        // In a directory whose meta lock wakes its waiter: a reload and Tantivy's removal of
+        // unused files meet on that lock, and the RAM directory's sleeps 100 ms between tries.
+        let index = tantivy::Index::create(
+            directory::MemoryDirectory::default(),
+            schema.clone(),
+            tantivy::IndexSettings::default(),
+        )
+        .map_err(|e| anyhow!("tantivy: failed to create index: {e}"))?;
         index.tokenizers().register(tokenizer_name, tokenizer);
         let reader = Reader::new(&index, key, worker)?;
         let writer = RwLock::new(Writer::new(&index)?);
@@ -768,6 +777,42 @@ mod tests {
 
     use super::test_support::make_index_key;
     use super::*;
+
+    /// A reload that finds the meta lock held, as Tantivy holds it after a commit while it looks
+    /// for files to delete, goes on as soon as the lock is released, not up to 100 ms later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_goes_on_as_soon_as_the_meta_lock_is_released() {
+        use tantivy::directory::META_LOCK;
+        let mut schema = Schema::builder();
+        schema.add_u64_field("primary_id", INDEXED | STORED | FAST);
+        schema.add_text_field("text", TEXT | STORED);
+        let index = Index::new(
+            schema.build(),
+            "default",
+            TextAnalyzer::from(SimpleTokenizer::default()),
+            &make_index_key(),
+            crate::worker::new(),
+        )
+        .unwrap();
+        let held = index.index.directory().acquire_lock(&META_LOCK).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            // Taken before the release, so the reload cannot have the lock earlier.
+            let released = std::time::Instant::now();
+            drop(held);
+            released
+        });
+        index.reader.inner.reload().unwrap();
+        let reloaded = std::time::Instant::now();
+        let released = release.join().unwrap();
+        assert!(reloaded >= released);
+        // With Tantivy's RAM directory the reload would retry 90 ms after the release.
+        let after_release = reloaded - released;
+        assert!(
+            after_release < Duration::from_millis(50),
+            "{after_release:?}"
+        );
+    }
 
     /// The documents added with a key are written at the commit in the order of the keys; a row
     /// removed before the commit is not written, and one added again after that is there once,
