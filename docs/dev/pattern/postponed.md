@@ -192,9 +192,9 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
   no longer merged while a fresh piece reaches between them: see "Ordered neighbours are not
   merged across fresh pieces" in `stage-2-ordering.md`. To reproduce: `HEAT_STRAY=1` on the
   test `the_repair_under_searches_kept_on_one_place`, with `HEAT_MERGE_ACROSS=1` for the merges
-  as they were (`HEAT_NO_HOLD_BOUND=1` switches the hold's bound off).
-- **No fast test of the hold bound.** A 40,000-row index did not form the wide cluster; only the
-  10M run does.
+  as they were (`HEAT_NO_HOLD_BOUND=1` switches the hold's bound off). The bound has a fast
+  test, `a_step_over_a_wide_segment_moves_only_its_range`: a first commit of the lowest rows
+  and one row above every other is such a segment at 3,000 rows.
 - **Single cells of the page-cost matrix swing 3-5x between builds of one index.** Measured
   2026-11-19 at six commits from `69aeb32` to `2044e34`, one build of the index each: on an
   unrepaired index of 10M rows a keyword in one row of five, page of 1000, scanned 35k-57k

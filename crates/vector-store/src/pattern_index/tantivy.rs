@@ -6416,6 +6416,58 @@ mod tests {
             .0
     }
 
+    /// A hold of the writer by a repair step moves the fresh rows of the step's range and no
+    /// others, however far the ordered segment it splits reaches. A commit of the lowest rows
+    /// and one row above every other overlaps nothing, so it is taken as ordered, and spans
+    /// every fresh row loaded after it: the part of the split that holds its last row reaches
+    /// from the step's range to the top, and took every fresh row on the way in one hold. (At
+    /// 10M rows that hold lasted 930 s: see the stray row in docs/dev/pattern/postponed.md.)
+    #[rstest]
+    #[timeout(Duration::from_secs(90))]
+    #[tokio::test]
+    async fn a_step_over_a_wide_segment_moves_only_its_range() {
+        let cap = 100u32;
+        let rows = 3000u64;
+        let sender = make_sender_with_threshold(capped_options(cap), 5000);
+        add_batch(&sender, (1..=60).chain([rows]), named).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            if stats.tantivy.num_docs == 61 && stats.overlap.fresh_rows == 0 {
+                assert_eq!(stats.rewrite.steps, 0, "{:?}", stats.rewrite);
+                break;
+            }
+            assert!(Instant::now() < deadline, "{:?}", stats.overlap);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        add_batch(&sender, shuffled(rows - 61).map(|id| id + 60), named).await;
+        // A step moves at most a cap of fresh rows, and with them the rows of the segments it
+        // splits: here never more than three caps. Unbounded, the first step moved them all.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut quiet = 0;
+        while quiet < 3 {
+            let stats = sender.stats(make_index_key()).await.unwrap();
+            assert!(
+                stats.rewrite.docs_rewritten <= stats.rewrite.steps * 3 * u64::from(cap),
+                "{:?}",
+                stats.rewrite
+            );
+            let still = stats.rewrite.steps > 0
+                && !stats.rewrite.pending
+                && stats.merges.running == 0
+                && stats.tantivy.num_docs == rows
+                && stats.overlap.fresh_rows == 0;
+            quiet = if still { quiet + 1 } else { 0 };
+            assert!(
+                Instant::now() < deadline,
+                "not settled: {:?} {:?}",
+                stats.rewrite,
+                stats.overlap
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// An idle index converges: no fresh rows left, and ordered segments that overlap nowhere.
     #[rstest]
     #[timeout(Duration::from_secs(60))]
