@@ -2434,6 +2434,23 @@ const OFF_TAKE: u32 = 2;
 const OFF_HALVING: u32 = 4;
 const OFF_SWEEP: u32 = 8;
 const OFF_WHOLE_READ: u32 = 16;
+/// What the walk of segments did, for a benchmark test to report: passes over a segment's runs,
+/// regions scanned, scorers made, and the nanoseconds of the scans, the verifications and the
+/// sweeps.
+#[cfg(test)]
+static WALK_PROBE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Adds to `WALK_PROBE[what]`: `amount`, or with a clock the time since it.
+fn probe(what: usize, amount: u64, since: Option<Instant>) {
+    #[cfg(test)]
+    WALK_PROBE[what].fetch_add(
+        since.map_or(amount, |since| since.elapsed().as_nanos() as u64),
+        Relaxed,
+    );
+    #[cfg(not(test))]
+    let _ = (what, amount, since);
+}
+
 /// Not off but always on: every segment read whole, to find where the two readings cross.
 const FORCE_WHOLE_READ: u32 = 32;
 const OFF_HANDOVER: u32 = 256;
@@ -2571,12 +2588,16 @@ impl RegionWalk<'_> {
             return Ok(());
         };
         self.before.1 = tally.store_reads;
+        probe(1, regions.len() as u64, None);
         let mut scorer = match self.scorer.take() {
             Some(scorer) if scorer.doc() <= first => scorer,
-            _ => match self.like.candidates(self.segment)? {
-                Some(scorer) => scorer,
-                None => return Ok(()),
-            },
+            _ => {
+                probe(2, 1, None);
+                match self.like.candidates(self.segment)? {
+                    Some(scorer) => scorer,
+                    None => return Ok(()),
+                }
+            }
         };
         let forward = self.window.complement;
         let mut last: Vec<u32> = Vec::new();
@@ -2999,7 +3020,10 @@ impl RegionWalk<'_> {
             }
             regions.sort_unstable_by_key(|region| region.from);
             let scanned = tally.postings_scanned;
+            probe(0, 1, None);
+            let clock = cfg!(test).then(Instant::now);
             self.scan(page, tally, candidates, &mut regions, take)?;
+            probe(3, 0, clock);
             // A region comes back cut to what was read of it; one that reached no floor, as it
             // was.
             for region in &regions {
@@ -3016,6 +3040,7 @@ impl RegionWalk<'_> {
             // from, and the runs between, read a stretch a pass, are as many passes. One pass of
             // the postings over the runs left, in doc order, tells the ones that hold a match
             // from the ones that hold none, which are left out from here on.
+            let clock = cfg!(test).then(Instant::now);
             if !swept && tally.postings_scanned == scanned && !unread.is_empty() {
                 swept = true;
                 self.scorer = None;
@@ -3041,11 +3066,15 @@ impl RegionWalk<'_> {
                     }
                 }
             }
+            probe(5, 0, clock);
             if unread.is_empty() {
                 break;
             }
             let left = unread.peek().map_or(0, |&(key, _)| key);
-            if let Some(unexamined) = self.verify(page, tally, candidates, budget, left)? {
+            let clock = cfg!(test).then(Instant::now);
+            let stopped = self.verify(page, tally, candidates, budget, left)?;
+            probe(4, 0, clock);
+            if let Some(unexamined) = stopped {
                 return Ok(Some(unexamined));
             }
             width = width.saturating_mul(4);
@@ -7063,10 +7092,12 @@ mod tests {
                 if std::env::var("MATRIX_WHOLE").is_ok() {
                     // [runs, whole, as chosen] x (searches, postings, walk nanos)
                     let mut sides = [[0u64; 3]; 3];
+                    let mut probes = [[0u64; 6]; 3];
                     for turn in 0..9 {
                         let side = turn % 3;
                         WALK_OFF.store([OFF_WHOLE_READ, FORCE_WHOLE_READ, 0][side], Relaxed);
                         let before = sender.stats(make_index_key()).await.unwrap().walk;
+                        let probed = WALK_PROBE.each_ref().map(|probe| probe.load(Relaxed));
                         let clock = Instant::now();
                         let mut searches = 0u64;
                         while searches < 30
@@ -7079,6 +7110,9 @@ mod tests {
                         sides[side][0] += searches;
                         sides[side][1] += after.postings_scanned - before.postings_scanned;
                         sides[side][2] += after.walk_nanos - before.walk_nanos;
+                        for (what, probe) in WALK_PROBE.iter().enumerate() {
+                            probes[side][what] += probe.load(Relaxed) - probed[what];
+                        }
                     }
                     WALK_OFF.store(0, Relaxed);
                     let per = |side: usize, what: usize| {
@@ -7092,6 +7126,18 @@ mod tests {
                         per(1, 2) / 1e3,
                         per(2, 2) / 1e3,
                     );
+                    for (side, name) in ["runs", "whole", "chosen"].iter().enumerate() {
+                        let per = |what: usize| probes[side][what] as f64 / sides[side][0] as f64;
+                        println!(
+                            "PROBE|{label}|{shape}|{limit_n}|{name}|passes {:.1}|regions {:.0}|scorers {:.1}|scan {:.0} us|verify {:.0} us|sweep {:.0} us",
+                            per(0),
+                            per(1),
+                            per(2),
+                            per(3) / 1e3,
+                            per(4) / 1e3,
+                            per(5) / 1e3,
+                        );
+                    }
                 }
                 // MATRIX_AB: each mechanism of the walk off and on by turns on this one index,
                 // so that the layout, which differs from build to build, is the same for both.
