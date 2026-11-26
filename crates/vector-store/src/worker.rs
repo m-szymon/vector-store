@@ -274,6 +274,10 @@ fn background_cap(workers: usize) -> usize {
     if BACKGROUND_CAP_OFF.load(Ordering::Relaxed) {
         return workers;
     }
+    #[cfg(test)]
+    if let cap @ 1.. = BACKGROUND_CAP_IS.load(Ordering::Relaxed) {
+        return cap as usize;
+    }
     (workers / 2).max(1)
 }
 
@@ -420,6 +424,10 @@ pub(crate) type Traced = (Instant, TaskClass, Duration, Duration);
 #[cfg(test)]
 pub(crate) static BACKGROUND_CAP_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// A benchmark test's switch: the cap on background tasks, when not zero.
+#[cfg(test)]
+pub(crate) static BACKGROUND_CAP_IS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 pub(crate) static BACKGROUND_OFF: std::sync::atomic::AtomicBool =

@@ -85,7 +85,19 @@ pub(crate) struct Writer {
 
 impl Writer {
     fn new(index: &tantivy::Index) -> anyhow::Result<Self> {
-        let threads: usize = perf::num_workers().into();
+        // Half as many threads as the pool has workers. They are the writer's own, outside the
+        // pool and its policy, and every index has a writer: with as many as workers, four
+        // indexes built at once on four cores had sixteen, and the searches of a fifth a p99 of
+        // 10.6 ms; with half, 8.2 ms, the builds as fast. What it costs is the repair of a
+        // pattern index, which writes through them: 12% longer on an idle node.
+        let workers: usize = perf::num_workers().into();
+        let threads = (workers / 2).max(1);
+        // A benchmark test's switch: another number of threads.
+        #[cfg(test)]
+        let threads = match WRITER_THREADS.load(Ordering::Relaxed) {
+            0 => threads,
+            threads => threads as usize,
+        };
         let options = IndexWriterOptions::builder()
             .num_worker_threads(threads)
             .build();
@@ -639,6 +651,10 @@ fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 pub(crate) static TICK_COMMIT_INDEXING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// A benchmark test's switch: the threads a writer indexes with, when not zero.
+#[cfg(test)]
+pub(crate) static WRITER_THREADS: AtomicU64 = AtomicU64::new(0);
 
 /// A benchmark test's switch: commits on the runtime thread their worker is on.
 #[cfg(test)]

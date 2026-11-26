@@ -7687,6 +7687,10 @@ mod tests {
             std::env::var("BUILD_CAP").is_ok_and(|cap| cap == "off"),
             Relaxed,
         );
+        // BUILD_CAP_IS, BUILD_WRITER_THREADS: the cap on background tasks and the threads of
+        // each writer, when given.
+        worker::BACKGROUND_CAP_IS.store(env("BUILD_CAP_IS", 0), Relaxed);
+        crate::tantivy::WRITER_THREADS.store(env("BUILD_WRITER_THREADS", 0), Relaxed);
         crate::tantivy::TICK_COMMIT_INDEXING.store(
             std::env::var("BUILD_TICK").is_ok_and(|tick| tick == "indexing"),
             Relaxed,
