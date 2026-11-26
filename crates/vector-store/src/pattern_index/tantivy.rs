@@ -7668,6 +7668,11 @@ mod tests {
             std::env::var("BUILD_CAP").is_ok_and(|cap| cap == "off"),
             Relaxed,
         );
+        // BUILD_COMMIT=inline: commits on the runtime thread their worker is on.
+        crate::tantivy::OFF_THE_RUNTIME_OFF.store(
+            std::env::var("BUILD_COMMIT").is_ok_and(|commit| commit == "inline"),
+            Relaxed,
+        );
         // BUILD_META_LOCK=sleeping: the meta lock as a file of Tantivy's RAM directory.
         crate::tantivy::directory::SLEEPING.store(
             std::env::var("BUILD_META_LOCK").is_ok_and(|lock| lock == "sleeping"),

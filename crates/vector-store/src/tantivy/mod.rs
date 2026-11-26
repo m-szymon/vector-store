@@ -575,7 +575,7 @@ impl<E> Index<E> {
                 Change::Commit => writer.has_uncommitted_docs(),
             };
             if commit {
-                match writer.commit() {
+                match off_the_runtime(|| writer.commit()) {
                     Ok((commit_opstamp, guards)) => self
                         .reader
                         .drop_guards_when_searchable(commit_opstamp, guards),
@@ -613,6 +613,32 @@ impl<E> Index<E> {
         self.reader.inner.reload()
     }
 }
+
+/// Runs `f`, which takes long, so that the runtime thread it may be on keeps nothing waiting.
+///
+/// A worker of the pool is a task of the runtime and runs its work on a runtime thread. A
+/// commit takes tens of milliseconds, and for that long whatever the thread had just woken --
+/// the request waiting for the search the worker finished before -- sat in the thread's own
+/// slot, which no other thread takes from: a search that took 69 ms beside a commit of 69 ms.
+/// `block_in_place` hands the thread's tasks to another before `f` runs. Outside a
+/// multi-threaded runtime (the pool's own thread, a repair's) there is nothing to hand over.
+fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    if OFF_THE_RUNTIME_OFF.load(Ordering::Relaxed) {
+        return f();
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
+/// A benchmark test's switch: commits on the runtime thread their worker is on.
+#[cfg(test)]
+pub(crate) static OFF_THE_RUNTIME_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn build_schema(text_options: TextOptions) -> Schema {
     let mut schema_builder = Schema::builder();
