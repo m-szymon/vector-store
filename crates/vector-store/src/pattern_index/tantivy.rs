@@ -2458,6 +2458,8 @@ const OFF_HANDOVER: u32 = 256;
 const OFF_HOLD_BOUND: u32 = 512;
 const OFF_SORTED_COMMITS: u32 = 1024;
 const OFF_FRESH_BETWEEN: u32 = 2048;
+/// No whole read of what is left once the passes have met few candidates.
+const OFF_WHOLE_AFTER: u32 = 16384;
 /// The repair's holds of the writer without a place in the worker pool.
 const OFF_POOL_PLACE: u32 = 8192;
 /// Ticks with a repair pending, and of those with changes lagging. For a benchmark test.
@@ -2825,7 +2827,7 @@ impl RegionWalk<'_> {
         tally: &mut WalkTally,
         candidates: &mut Vec<(SortPrefix, u32)>,
         runs: &Runs,
-        matches: u32,
+        (matches, whole_read): (u32, usize),
         budget: &Spending,
     ) -> anyhow::Result<Option<u128>> {
         let columns = self.columns;
@@ -2934,6 +2936,8 @@ impl RegionWalk<'_> {
         };
         // The runs a pass reads to their ends before one of them sets the floor.
         let mut spread = 1usize;
+        // The rows the passes have read, and the candidates met in them: see the end of a pass.
+        let (mut rows_read, mut met) = (0u64, 0u64);
         // Whether the runs holding no match have been told apart.
         let mut swept = walk_off(OFF_SWEEP);
         let mut regions: Vec<Region> = Vec::new();
@@ -3031,6 +3035,10 @@ impl RegionWalk<'_> {
             }
             regions.sort_unstable_by_key(|region| region.from);
             let scanned = tally.postings_scanned;
+            rows_read += regions
+                .iter()
+                .map(|region| u64::from(region.to - region.from))
+                .sum::<u64>();
             probe(0, 1, None);
             let clock = cfg!(test).then(Instant::now);
             self.scan(page, tally, candidates, &mut regions, take)?;
@@ -3096,6 +3104,20 @@ impl RegionWalk<'_> {
             // whose runs are worth a pass each.
             // As many times the runs as the page is short by at that rate, four at most.
             let found = (tally.postings_scanned - scanned) as usize;
+            // The matches were bounded by the rows of the pattern's rarest piece, and the rows
+            // holding all its pieces may be far fewer: a keyword of several pieces in one row
+            // of a thousand had a bound 25 times its candidates, a first stretch as much too
+            // short, and pass after pass over every run where rows lie in no order. What the
+            // passes met says how many the segment holds; if that is what would have been read
+            // whole, the next pass reads all that is left.
+            met += found as u64;
+            if !walk_off(OFF_WHOLE_AFTER)
+                && met > 0
+                && met * u64::from(self.segment.max_doc()) <= whole_read as u64 * rows_read
+            {
+                width = u32::MAX;
+                take = usize::MAX;
+            }
             if !walk_off(OFF_SPREAD) && found > 0 {
                 let short = page.limit.saturating_sub(found) / found;
                 spread = spread.saturating_mul(short.clamp(1, 4));
@@ -3258,23 +3280,25 @@ fn collect_matches_ordered(
         // The runs cost the walk a look at each it reads together and a pass or more of the
         // postings; the segment read whole costs it every match, in one pass. So few matches
         // are read whole.
+        let whole_read = |runs: &Runs| {
+            WHOLE_READ_MATCHES + WHOLE_READ_PAGES * page.limit + WHOLE_READ_PER_RUN * runs.overlap()
+        };
         let runs = columns.runs.clone().filter(|runs| {
             !walk_off(FORCE_WHOLE_READ)
-                && (walk_off(OFF_WHOLE_READ)
-                    || matches_bound as usize
-                        > WHOLE_READ_MATCHES
-                            + WHOLE_READ_PAGES * page.limit
-                            + WHOLE_READ_PER_RUN * runs.overlap())
+                && (walk_off(OFF_WHOLE_READ) || matches_bound as usize > whole_read(runs))
         });
         let left = match runs {
-            Some(runs) => walk.walk_runs(
-                &mut page,
-                &mut tally,
-                &mut candidates,
-                &runs,
-                matches_bound,
-                budget,
-            )?,
+            Some(runs) => {
+                let whole_read = whole_read(&runs);
+                walk.walk_runs(
+                    &mut page,
+                    &mut tally,
+                    &mut candidates,
+                    &runs,
+                    (matches_bound, whole_read),
+                    budget,
+                )?
+            }
             None => {
                 #[cfg(test)]
                 if columns.runs.is_none() {
@@ -6888,6 +6912,7 @@ mod tests {
                 Ok("halving") => OFF_HALVING,
                 Ok("sweep") => OFF_SWEEP,
                 Ok("whole_read") => OFF_WHOLE_READ,
+                Ok("whole_after") => OFF_WHOLE_AFTER,
                 Ok("spread") => OFF_SPREAD,
                 // The rows of a commit written as they came, not in the order of their keys.
                 Ok("sorted_commits") => OFF_SORTED_COMMITS,
@@ -7195,11 +7220,12 @@ mod tests {
                         let side = turn % 3;
                         // MATRIX_WHOLE=spread: the walk without the spread of runs in place
                         // of the one that never reads whole.
-                        let runs_side = if std::env::var("MATRIX_WHOLE").as_deref() == Ok("spread")
-                        {
-                            OFF_SPREAD
-                        } else {
-                            OFF_WHOLE_READ
+                        // MATRIX_WHOLE=after: the walk that does not turn to a whole read
+                        // after a pass.
+                        let runs_side = match std::env::var("MATRIX_WHOLE").as_deref() {
+                            Ok("spread") => OFF_SPREAD,
+                            Ok("after") => OFF_WHOLE_AFTER,
+                            _ => OFF_WHOLE_READ,
                         };
                         WALK_OFF.store([runs_side, FORCE_WHOLE_READ, 0][side], Relaxed);
                         let before = sender.stats(make_index_key()).await.unwrap().walk;
