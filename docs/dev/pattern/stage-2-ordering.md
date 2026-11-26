@@ -775,6 +775,24 @@ With and without by turns on one index (`MATRIX_WHOLE=spread`), 2M rows, walk ti
 so reads as before, and each measured just after the turn that read its segments whole. Rows
 in no order are as they were: their runs are read together already.
 
+##### Read whole once the passes show few candidates (2026-11-26)
+
+That last case, rows in no order and a keyword of several pieces in one row of ten thousand,
+was eight or nine passes over two segments of 670 runs each, 1.9-2.5 ms a page of 20 where the
+segments read whole cost 0.55. The bound on the matches is the rows of the rarest piece, 25
+times the candidates; the first stretch is sized by it and is as much too short, and each pass
+reads a little more of every run. Now the passes count what they meet: once they have met some
+candidates, and at that rate the segment holds no more than would have been read whole from
+the start, the next pass reads all that is left. Five passes: 1.45-1.6 ms a page of 20, 3.5
+against 5.0 ms a page of 200 (`after_chain.sh`, `MATRIX_WHOLE=after`). Where runs follow one
+another nothing changes: the 1/10000 cells of the stream and settled indexes within 3%, and
+in every other cell the same passes and regions as before. Cells of 10-30 us differ by up to
+30% either way between turns of one run, with the walk doing the same.
+
+It stops short of the whole read's cost because the first pass meets nothing, and that does
+not tell a rare keyword from one whose matches lie at the far end of the order, where a whole
+read costs every match.
+
 #### Ordered neighbours are not merged across fresh pieces (2026-11-25)
 
 Two ordered clusters were neighbours, and merged when they fit, with no ordered segment
@@ -1055,6 +1073,25 @@ built, before any repair, the searches of the fifth had a p99 of 15-21 ms and a 
   the hand-over, the change showed nothing: a commit then stalled the runtime thread whichever
   class it ran in.) What is left at 30-46 ms waits behind the reloads after those commits,
   which are indexing still.
+
+**A writer with half as many threads as there are workers (2026-11-26).** A writer indexes
+with threads of its own, outside the pool, and every index has one: with as many as workers,
+four builds on four cores had sixteen. Measured on 4 CPUs, twice each (`small_chain.sh`),
+searches of a fifth index beside four builds and beside one, and (`threads_chain.sh`) a build
+of 3M rows and its repair on an idle node:
+
+| writer threads, cap | four builds: p99, searches a second, done in | one build: p99, done in | 3M alone: build, repair |
+| ------------------- | -------------------------------------------- | ----------------------- | ----------------------- |
+| 4, 2 (as it was)    | 10.6 ms, 1062, 23.1 s                        | 4.3 ms, 6.0-7.0 s       | 17.0 s, 36.2 s          |
+| 2, 2 (now)          | 8.2 ms, 1134, 21.2-22.1 s                    | 3.5-4.1 ms, 6.0 s       | 15.0 s, 41.2 s          |
+| 1, 2                | 5.2 ms, 1200, 21.1 s                         | 2.6-3.0 ms, 6.0 s       | 14.0 s, 48.2 s          |
+| 4, 1                | 6.6 ms, 1123, 24.2 s                         | 3.5 ms, 8.1 s           |                         |
+| 1, 1                | 3.3 ms, 1208, 29.2-30.1 s                    | 1.3-1.5 ms, 9.0 s       |                         |
+
+Fewer threads cost a build nothing here, where the feed of rows is what limits it, and the
+searches gain; the repair pays, since it writes its rows through those threads (the same on
+16 CPUs: 36, 40 and 50 s). A lower cap on background tasks helps the searches as much and
+slows the builds by a third to a half. Half the workers is the middle taken.
 
 **The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
 100 ms, searches first unless a write has waited that long, the same load with 32 searchers

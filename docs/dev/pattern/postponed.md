@@ -90,11 +90,11 @@ worst cell of the matrix). Index size not estimated.
 Done (2026-11-23): a commit's rows are held and written in the order of their keys; see "A
 commit written in the order of its keys" in `stage-2-ordering.md`. Left open:
 
-- **A keyword in few rows on rows in no order** still costs three times what the segment read
-  whole does (1.8 ms for 0.5 ms, a page of 20 on 2M rows), where the threshold for reading
-  whole does not take it: its bound on the matches is the rarest gram's rows, 25 times the
-  candidates of `用户42号`. There a pass looks at every run, eight passes. More runs a pass does
-  not help: the runs are all read together already.
+- **A keyword in few rows on rows in no order** still costs nearly three times what the
+  segment read whole does (1.45 ms for 0.55 ms, a page of 20 on 2M rows; 1.9 ms before the
+  walk turned to a whole read after a pass that met few). Its bound on the matches is the
+  rarest gram's rows, 25 times the candidates of `用户42号`, and the first pass meets nothing.
+  A bound from two grams' rows, or a sweep that counts, would tell sooner.
 - **The walk reads a segment at a time.** A segment with candidates everywhere and no match is
   verified whole before the next is opened; a merge by key across segments would not.
 
@@ -169,8 +169,9 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
 - **Searches beside several builds at once.** Four indexes built together on four CPUs
   cost the searches of a fifth a p99 of 12-14 ms, mostly for want of cores (4.4 ms on 16);
   see "Searches beside four builds at once". Open: the reloads of a build's index are
-  indexing still (searches of 30-46 ms behind them); and whether fewer background tasks at
-  once, or a writer with fewer threads, is worth a slower build on a small node.
+  indexing still (searches of 30-46 ms behind them). A writer has half as many threads as
+  there are workers since; one thread, or one background task at a time, would give the
+  searches more and cost the repair or the build a third.
 - **Merges are outside the pool.** They run on Tantivy's threads, as the repair's own writing
   of segments does; a place covers only the repair's thread.
 - **The vector index's writes as indexing.** Everything of it is in the search class, its adds,
