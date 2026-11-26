@@ -1025,6 +1025,29 @@ built and then repaired at once, beside 8 clients searching a fifth, 5 ms betwee
 Alone the searches do 1214 a second with a p99 of 1.2 ms. The cap costs the repairs 2-3 s of
 30, and their holds wait 0.2 s for a place instead of 0.01-0.02 s.
 
+**Searches beside four builds at once (2026-11-26).** While the four indexes above were
+built, before any repair, the searches of the fifth had a p99 of 15-21 ms and a longest of
+77-157 ms, against 4 ms and 10-18 ms beside one build. Three things looked at
+(`builds_chain.sh`, and the benchmark's trace):
+
+- **It is the cores, mostly.** The pool had 2.1 of its 4 workers busy on average, but its
+  threads got 1.8 cores where they wanted 2.7: four writers and their merges share the same
+  four CPUs. On 16 CPUs, still with 4 workers, the p99 is 4.4 ms and the searches lose
+  nothing (1236 a second). A background task is not interrupted, so work started while no
+  search waited is still on a core when the next search comes.
+- **A commit kept its runtime thread's last wake-up waiting.** A search that took 69.5 ms had
+  neither waited in the pool nor run long: it ended beside a commit of 69.0 ms. A worker is a
+  task of the runtime; the request it had just answered was woken into the slot of the
+  worker's own thread, which no other thread takes from, and the worker's next task was the
+  commit. A commit now hands the thread's tasks over first (`off_the_runtime`,
+  `block_in_place`): p99 12.0-14.3 ms against 16.5-20.6 with four builds (three runs and
+  two), p90 2.8 ms against 3.5; nothing changes with one build. The longest searches stay
+  at 66-91 ms, not explained.
+- **The tick's commit of a build as background work: no gain.** It is indexing, so ahead of
+  the searches and outside the cap. Sent as background it changed the p99 from 14.7-15.8 to
+  13.3-13.6 ms, within the noise, and the repair of a single build then took 21 s instead of
+  17-18. Left as it was.
+
 **The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
 100 ms, searches first unless a write has waited that long, the same load with 32 searchers
 took 643 s to index instead of 384, and the searches gained nothing: as many a second, p50

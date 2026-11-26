@@ -166,9 +166,11 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
   its turn in the pool" in `stage-2-ordering.md`): at 100 ms the writes under a heavy query
   load took 67% longer and the searches gained nothing. A budget would need the queue to hand
   over more than one short batch each time it runs out.
-- **Searches beside several builds at once.** Four indexes of 1M rows built together cost
-  the searches of a fifth a p99 of 18 ms and a longest of 154 ms (one run, with the cap);
-  not looked into. The repairs that follow cost 7-8 ms with the cap.
+- **Searches beside several builds at once.** Four indexes built together on four CPUs
+  cost the searches of a fifth a p99 of 12-14 ms, mostly for want of cores (4.4 ms on 16);
+  see "Searches beside four builds at once". Open: the longest searches, 66-91 ms; and
+  whether fewer background tasks at once, or a writer with fewer threads, is worth a slower
+  build on a small node.
 - **Merges are outside the pool.** They run on Tantivy's threads, as the repair's own writing
   of segments does; a place covers only the repair's thread.
 - **The vector index's writes as indexing.** Everything of it is in the search class, its adds,
