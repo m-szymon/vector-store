@@ -2464,6 +2464,10 @@ const OFF_POOL_PLACE: u32 = 8192;
 #[cfg(test)]
 static GATE_TICKS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 const OFF_LOCK_CHUNKS: u32 = 128;
+/// A benchmark test's trace: while it holds a list, for each search its actor took in, when it
+/// was received, handed to the pool, started on a worker and finished there.
+#[cfg(test)]
+static LIKE_TRACE: Mutex<Option<Vec<[Instant; 4]>>> = Mutex::new(None);
 /// Where a repair step is, for a benchmark test that watches one stall: see `repair_phase`.
 #[cfg(test)]
 static REPAIR_PHASE: AtomicU32 = AtomicU32::new(0);
@@ -3589,8 +3593,14 @@ pub(crate) fn new(
                             };
                             let table = Arc::clone(&table);
                             let search_budget = (search_budget.0)();
+                            #[cfg(test)]
+                            let (received, sent) = (Instant::now(), Arc::new(Mutex::new(None)));
+                            #[cfg(test)]
+                            let sent_at = Arc::clone(&sent);
                             worker
                                 .spawn_blocking(move || {
+                                    #[cfg(test)]
+                                    let started = Instant::now();
                                     let result = handle_like(
                                         &state,
                                         table.as_ref(),
@@ -3600,9 +3610,18 @@ pub(crate) fn new(
                                         window,
                                         search_budget,
                                     );
+                                    #[cfg(test)]
+                                    if let Some(trace) = LIKE_TRACE.lock().unwrap().as_mut() {
+                                        let sent = sent_at.lock().unwrap().unwrap_or(started);
+                                        trace.push([received, sent, started, Instant::now()]);
+                                    }
                                     _ = tx.send(result);
                                 })
                                 .await;
+                            #[cfg(test)]
+                            {
+                                *sent.lock().unwrap() = Some(Instant::now());
+                            }
                         }
                         PatternIndex::Stats { index_key, tx } => {
                             let Some(state) = indexes.get(&index_key)
@@ -7668,6 +7687,10 @@ mod tests {
             std::env::var("BUILD_CAP").is_ok_and(|cap| cap == "off"),
             Relaxed,
         );
+        crate::tantivy::TICK_COMMIT_INDEXING.store(
+            std::env::var("BUILD_TICK").is_ok_and(|tick| tick == "indexing"),
+            Relaxed,
+        );
         // BUILD_COMMIT=inline: commits on the runtime thread their worker is on.
         crate::tantivy::OFF_THE_RUNTIME_OFF.store(
             std::env::var("BUILD_COMMIT").is_ok_and(|commit| commit == "inline"),
@@ -7796,6 +7819,7 @@ mod tests {
         let started = Instant::now();
         if tracing {
             *worker::TRACE.lock().unwrap() = Some(Vec::new());
+            *LIKE_TRACE.lock().unwrap() = Some(Vec::new());
         }
         // Controls in place of a build, BUILD_SPIN threads for 10 s: BUILD_CLASS=spin keeps
         // them computing, which takes cores and nothing else; BUILD_CLASS=memory keeps them
@@ -7906,6 +7930,7 @@ mod tests {
         }
         if let Some(trace) = worker::TRACE.lock().unwrap().take() {
             let ms = |at: Instant| at.saturating_duration_since(started).as_secs_f64() * 1e3;
+            let likes = LIKE_TRACE.lock().unwrap().take().unwrap_or_default();
             let mut lines: Vec<(f64, String)> = trace
                 .iter()
                 .map(|(at, class, waited, ran)| {
@@ -7920,9 +7945,30 @@ mod tests {
                     )
                 })
                 .chain(slow.lock().unwrap().iter().map(|(at, took)| {
+                    // The stages of the search this was, by the times that fit inside it:
+                    // until its actor took it, until it was in the pool's channel, until a
+                    // worker started it, while it ran, and until the client had the answer.
+                    let end = *at + *took;
+                    let stages = likes
+                        .iter()
+                        .filter(|like| like[0] >= *at && like[3] <= end)
+                        .min_by_key(|like| (like[0] - *at) + (end - like[3]))
+                        .map_or(String::new(), |like| {
+                            let part = |from: Instant, to: Instant| {
+                                to.saturating_duration_since(from).as_secs_f64() * 1e3
+                            };
+                            format!(
+                                ": actor {:.1}, channel {:.1}, queue {:.1}, ran {:.1}, answer {:.1}",
+                                part(*at, like[0]),
+                                part(like[0], like[1]),
+                                part(like[1], like[2]),
+                                part(like[2], like[3]),
+                                part(like[3], end),
+                            )
+                        });
                     (
                         ms(*at),
-                        format!("search took {:.1} ms", took.as_secs_f64() * 1e3),
+                        format!("search took {:.1} ms{stages}", took.as_secs_f64() * 1e3),
                     )
                 }))
                 .collect();

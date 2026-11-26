@@ -635,6 +635,11 @@ fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// A benchmark test's switch: the tick's commit of an index being built as indexing.
+#[cfg(test)]
+pub(crate) static TICK_COMMIT_INDEXING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A benchmark test's switch: commits on the runtime thread their worker is on.
 #[cfg(test)]
 pub(crate) static OFF_THE_RUNTIME_OFF: std::sync::atomic::AtomicBool =
@@ -672,6 +677,9 @@ pub(crate) struct Indexes<T, F, E = ()> {
     indexes: BTreeMap<IndexId, Arc<Index<E>>>,
     allocate_rx: watch::Receiver<Allocate>,
     allocate_prev: Allocate,
+    /// Whether the last write was a row of a full scan: the commits of the tick are then the
+    /// build's too, and wait as its rows do. See `commit_or_reload`.
+    building: bool,
     new_index: F,
 }
 
@@ -702,6 +710,7 @@ where
             indexes: BTreeMap::new(),
             allocate_rx,
             allocate_prev: Allocate::Can,
+            building: false,
             new_index,
         }
     }
@@ -738,6 +747,7 @@ where
         // A row of a full scan builds an index nobody searches yet: it waits for the searches
         // and the live writes of the other indexes.
         let background = in_progress.is_fullscan();
+        self.building = background;
         self.worker
             .spawn_write_blocking(background, move || {
                 let doc = make_doc(&index);
@@ -763,6 +773,7 @@ where
         let commit_threshold = self.commit_threshold;
         // In the class of the add that follows it, so that the two run in the order sent.
         let background = in_progress.is_fullscan();
+        self.building = background;
         self.worker
             .spawn_write_blocking(background, move || {
                 index.change(Change::Remove {
@@ -804,8 +815,13 @@ where
             };
             if uncommitted {
                 let index = Arc::clone(index);
+                // BUILD_TICK=indexing, a benchmark test's switch: as before.
+                #[cfg(test)]
+                let building = self.building && !TICK_COMMIT_INDEXING.load(Ordering::Relaxed);
+                #[cfg(not(test))]
+                let building = self.building;
                 self.worker
-                    .spawn_indexing_blocking(move || index.change(Change::Commit))
+                    .spawn_write_blocking(building, move || index.change(Change::Commit))
                     .await;
             } else if index.reader.needs_reload() {
                 index.reader.request_reload();
