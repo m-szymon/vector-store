@@ -1041,12 +1041,20 @@ built, before any repair, the searches of the fifth had a p99 of 15-21 ms and a 
   worker's own thread, which no other thread takes from, and the worker's next task was the
   commit. A commit now hands the thread's tasks over first (`off_the_runtime`,
   `block_in_place`): p99 12.0-14.3 ms against 16.5-20.6 with four builds (three runs and
-  two), p90 2.8 ms against 3.5; nothing changes with one build. The longest searches stay
-  at 66-91 ms, not explained.
-- **The tick's commit of a build as background work: no gain.** It is indexing, so ahead of
-  the searches and outside the cap. Sent as background it changed the p99 from 14.7-15.8 to
-  13.3-13.6 ms, within the noise, and the repair of a single build then took 21 s instead of
-  17-18. Left as it was.
+  two), p90 2.8 ms against 3.5; nothing changes with one build. The longest searches stayed
+  at 66-91 ms: the next point.
+- **The tick's commits of the builds took every worker at once.** The longest searches all
+  waited 60-70 ms for a worker, in bunches just after a whole second (the benchmark's trace of
+  a search by stage: its actor, the pool's channel, the queue, the run, the answer). The tick
+  commits every index that has rows to commit, as indexing: ahead of the searches and outside
+  the cap, 60-90 ms each, four of them at once. The tick's commit of an index whose last write
+  was a row of a full scan is now background work, as the rows are. With the hand-over above
+  in both (`BUILD_TICK=indexing` for before, twice each): searches of 30 ms or more 80 and 97
+  against 14 and 9, the longest 70 and 84 ms against 42 and 46, p99 12.6 and 13.5 ms against
+  10.1 and 11.5. With one build nothing changes, its repair included. (Tried first without
+  the hand-over, the change showed nothing: a commit then stalled the runtime thread whichever
+  class it ran in.) What is left at 30-46 ms waits behind the reloads after those commits,
+  which are indexing still.
 
 **The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
 100 ms, searches first unless a write has waited that long, the same load with 32 searchers
