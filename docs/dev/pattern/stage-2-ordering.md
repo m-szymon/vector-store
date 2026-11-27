@@ -1132,6 +1132,23 @@ built, before any repair, the searches of the fifth had a p99 of 15-21 ms and a 
   class it ran in.) What is left at 30-46 ms waits behind the reloads after those commits,
   which are indexing still.
 
+**The reloads of an index being built are background work (2026-11-27).** A commit is
+followed by a reload of the reader, a task of the pool, and that was indexing whatever the
+index: with four indexes being built, forty reloads a second went before the searches of
+the fifth. The reader now knows whether its index's last write was a row of a full scan,
+and its reload then waits as the build's rows and commits do. Four builds of 1M rows held
+by stretch beside 8 searchers 5 ms apart, on 4 CPUs (`BUILD_RELOAD=indexing` for the old
+way; five rounds, one of the new way's left out, its searches three times slower before the
+builds began):
+
+| reloads of a build's index | p99 | searches of 30 ms or more, of 28,000 | builds searchable in |
+| --- | --- | --- | --- |
+| indexing | 7.3-8.7 ms | 17, 3, 2, 11, 9 | 24.6-25.4 s |
+| background | 5.0-7.7 ms | 0, 1, 2, 3 | 25.2-26.4 s |
+
+One build alone: p99 2.8 ms either way. The longest search of a run is not explained by
+this: 23-186 ms the new way, 36-136 ms the old, and 137 ms once before any build began.
+
 **A writer with half as many threads as there are workers (2026-11-26).** A writer indexes
 with threads of its own, outside the pool, and every index has one: with as many as workers,
 four builds on four cores had sixteen. Measured on 4 CPUs, twice each (`small_chain.sh`),

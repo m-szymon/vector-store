@@ -174,10 +174,11 @@ beside the searches of other indexes" in `stage-2-ordering.md` for what is done.
   over more than one short batch each time it runs out.
 - **Searches beside several builds at once.** Four indexes built together on four CPUs
   cost the searches of a fifth a p99 of 12-14 ms, mostly for want of cores (4.4 ms on 16);
-  see "Searches beside four builds at once". Open: the reloads of a build's index are
-  indexing still (searches of 30-46 ms behind them). A writer has half as many threads as
-  there are workers since; one thread, or one background task at a time, would give the
-  searches more and cost the repair or the build a third.
+  see "Searches beside four builds at once". The reloads of a build's index are background
+  work too since 2026-11-27. A writer has half as many threads as there are workers; one
+  thread, or one background task at a time, would give the searches more and cost the repair
+  or the build a third. Searches of over 100 ms still turn up, one in a run or none, with a
+  build's reloads in either class and once with no build at all: not looked into.
 - **Merges are outside the pool.** They run on Tantivy's threads, as the repair's own writing
   of segments does; a place covers only the repair's thread.
 - **The vector index's writes as indexing.** Everything of it is in the search class, its adds,
