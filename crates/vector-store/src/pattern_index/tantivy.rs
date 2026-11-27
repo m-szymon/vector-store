@@ -7801,6 +7801,10 @@ mod tests {
             std::env::var("BUILD_STRETCH").is_ok_and(|stretch| stretch == "off"),
             Relaxed,
         );
+        crate::tantivy::RELOAD_INDEXING.store(
+            std::env::var("BUILD_RELOAD").is_ok_and(|reload| reload == "indexing"),
+            Relaxed,
+        );
         crate::tantivy::TICK_COMMIT_INDEXING.store(
             std::env::var("BUILD_TICK").is_ok_and(|tick| tick == "indexing"),
             Relaxed,
@@ -8148,12 +8152,13 @@ mod tests {
             times.sort_unstable();
             let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
             format!(
-                "{:.0} q/s p50 {} p90 {} p99 {} max {} us",
+                "{:.0} q/s p50 {} p90 {} p99 {} max {} us, {} of 30 ms or more",
                 times.len() as f64 / over.as_secs_f64(),
                 at(0.5),
                 at(0.9),
                 at(0.99),
-                at(1.0)
+                at(1.0),
+                times.len() - times.partition_point(|&took| took < 30_000),
             )
         };
         let [before, during, repairs] = times;

@@ -592,6 +592,9 @@ struct ReaderInner {
     // Held across a reload, so that the reload task and a caller reloading on its own
     // (`Index::commit_and_reload`) never store an older searcher or opstamp after a newer one.
     reloading: Mutex<()>,
+    /// Whether the last write of the index was a row of a full scan: its reloads are then the
+    /// build's too, and wait as its rows and commits do.
+    building: std::sync::atomic::AtomicBool,
     worker: async_channel::Sender<Worker>,
 }
 
@@ -624,11 +627,19 @@ impl ReaderInner {
     }
 
     /// Runs the reload on the worker and returns once it has finished.
+    ///
+    /// The reload of an index being built is background work, as the build's rows and commits
+    /// are: nobody searches that index, and as indexing it went before the searches of every
+    /// other one, ten times a second for each index being built.
     async fn reload_on_worker(self: &Arc<Self>) {
         let (done_tx, done_rx) = oneshot::channel();
         let inner = Arc::clone(self);
+        let building = self.building.load(Ordering::Relaxed);
+        // BUILD_RELOAD=indexing, a benchmark test's switch: as before.
+        #[cfg(test)]
+        let building = building && !RELOAD_INDEXING.load(Ordering::Relaxed);
         self.worker
-            .spawn_indexing_blocking(move || {
+            .spawn_write_blocking(building, move || {
                 _ = inner.reload();
                 _ = done_tx.send(());
             })
@@ -654,6 +665,7 @@ impl Reader {
             key: key.clone(),
             reload_state: Mutex::new(ReloadState::default()),
             reloading: Mutex::new(()),
+            building: std::sync::atomic::AtomicBool::new(false),
             worker,
         });
         let (reload_tx, mut reload_rx) = watch::channel(());
@@ -685,6 +697,11 @@ impl Reader {
 
     pub(crate) fn searcher(&self) -> Searcher {
         self.inner.reader.searcher()
+    }
+
+    /// Says whether the index's last write was a row of a full scan: see `ReaderInner::building`.
+    fn set_building(&self, building: bool) {
+        self.inner.building.store(building, Ordering::Relaxed);
     }
 
     fn request_reload(&self) {
@@ -1001,6 +1018,11 @@ fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
 pub(crate) static TICK_COMMIT_INDEXING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// A benchmark test's switch: the reloads of an index being built as indexing.
+#[cfg(test)]
+pub(crate) static RELOAD_INDEXING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A benchmark test's switch: the threads a writer indexes with, when not zero.
 #[cfg(test)]
 pub(crate) static WRITER_THREADS: AtomicU64 = AtomicU64::new(0);
@@ -1114,6 +1136,7 @@ where
         // and the live writes of the other indexes.
         let background = in_progress.is_fullscan();
         self.building = background;
+        index.reader.set_building(background);
         self.worker
             .spawn_write_blocking(background, move || {
                 let doc = make_doc(&index);
@@ -1141,6 +1164,7 @@ where
         // In the class of the add that follows it, so that the two run in the order sent.
         let background = in_progress.is_fullscan();
         self.building = background;
+        index.reader.set_building(background);
         self.worker
             .spawn_write_blocking(background, move || {
                 index.change(Change::Remove {
