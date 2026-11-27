@@ -35,6 +35,7 @@ use tantivy::indexer::IndexWriterOptions;
 use tantivy::indexer::MergePolicy;
 use tantivy::indexer::UserOperation;
 use tantivy::schema::FAST;
+use tantivy::schema::Field;
 use tantivy::schema::INDEXED;
 use tantivy::schema::Schema;
 use tantivy::schema::TextOptions;
@@ -65,6 +66,208 @@ pub(crate) type CommitKey = Box<[u64]>;
 /// The fewest documents of one commit written as a group: see `Writer::write_held`.
 const HELD_GROUP_DOCS: usize = 1024;
 
+/// How many rows a stretch of a build holds, on average, when the fullest one is written: see
+/// `Stretches`. The fullest holds about twice as many, which is what a commit of one writes.
+const STRETCH_HELD_ROWS: usize = 4096;
+
+/// The fewest rows of a build held before its size is estimated and the stretches cut, and the
+/// fewest for each stretch cut.
+const STRETCH_SAMPLE_ROWS: usize = 16_384;
+const STRETCH_SAMPLE_ROWS_EACH: usize = 16;
+
+/// The most stretches a build is cut into.
+const STRETCH_MAX: usize = 65_536;
+
+/// What a row of a build brings for `Stretches`, besides its key.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BuildRow {
+    /// The row's token, as an unsigned key: how densely the first rows' tokens lie on the ring
+    /// says how many rows the table has.
+    pub(crate) token: u64,
+    /// The rows a stretch is to end with.
+    pub(crate) stretch_rows: u32,
+    /// The fast field that says a document was written where it belongs in the order: 1 on
+    /// the documents written by stretch, 0 on the ones written as they came.
+    pub(crate) placed: &'static str,
+}
+
+type HeldRow = (CommitKey, PrimaryId, u64, TantivyDocument, AsyncInProgress);
+
+/// The rows of a build, held by stretch of the order.
+///
+/// A build's rows come in no order, a commit of them makes segments that span the whole order,
+/// and a repair then writes every row again: of a build of 10M rows, 240 s of 300. Held here
+/// instead, by which stretch of the order their key is in, and written a stretch at a time --
+/// the fullest, once `STRETCH_HELD_ROWS` a stretch are held -- they make segments of one
+/// stretch each, which merge into the segment the stretch ends as, and nothing is written
+/// twice: 90 s. A row keeps its guard until the commit that writes it, so the scan that sent
+/// it counts it as indexed only then.
+///
+/// How many stretches depends on how many rows the build brings, which nothing says. It is
+/// estimated from the tokens of the first rows (`estimate_rows`), and the stretches' bounds are
+/// then cut from those rows' keys, as many of them to each. That takes keys that come in no
+/// order; where the estimate is not to be had -- rows that mostly share partitions, which come
+/// together -- the rows are written as they came, as before (`plain`).
+struct Stretches {
+    stretch_rows: usize,
+    placed: Field,
+    /// The lowest key of each stretch but the first; empty until cut, and while it is, the
+    /// rows wait in one bucket.
+    bounds: Vec<CommitKey>,
+    /// Whether the stretches are cut, and the rows held at which to try.
+    cut: bool,
+    cut_at: usize,
+    /// Whether the build's rows are written as they came: no estimate.
+    plain: bool,
+    buckets: Vec<Vec<Option<HeldRow>>>,
+    /// Where each held row's documents are: bucket and place in it.
+    at: HashMap<PrimaryId, Vec<(u32, u32)>>,
+    rows: usize,
+    /// The rows that came since the last commit, and whether any came since the last commit
+    /// of a tick.
+    since_commit: usize,
+    arrived: bool,
+}
+
+/// How many rows a table has, from the tokens of `tokens.len()` of them read by a scan in
+/// flight, or None when they do not say.
+///
+/// A scan reads some ranges of the ring at once, each from its lowest token up, so the tokens
+/// it has read lie in as many clumps, as dense as the table's partitions: the median gap
+/// between neighbours is ln 2 of the mean gap between partitions, whatever lies between the
+/// clumps. The rows are as many times the partitions as the sample's. With fewer than a
+/// quarter as many partitions as rows there is nothing to cut: the rows of a partition come
+/// together and lie together.
+fn estimate_rows(tokens: &mut Vec<u64>) -> Option<u64> {
+    let rows = tokens.len();
+    tokens.sort_unstable();
+    tokens.dedup();
+    if tokens.len() < 2 || tokens.len() * 4 < rows {
+        return None;
+    }
+    let mut gaps: Vec<u64> = tokens.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let middle = gaps.len() / 2;
+    let median = *gaps.select_nth_unstable(middle).1;
+    let partitions = std::f64::consts::LN_2 * 2f64.powi(64) / median as f64;
+    Some((partitions * rows as f64 / tokens.len() as f64) as u64)
+}
+
+impl Stretches {
+    fn new(stretch_rows: usize, placed: Field) -> Self {
+        Self {
+            stretch_rows: stretch_rows.max(1),
+            placed,
+            bounds: Vec::new(),
+            cut: false,
+            cut_at: STRETCH_SAMPLE_ROWS,
+            plain: false,
+            buckets: vec![Vec::new()],
+            at: HashMap::new(),
+            rows: 0,
+            since_commit: 0,
+            arrived: false,
+        }
+    }
+
+    fn add(&mut self, row: HeldRow) {
+        self.since_commit += 1;
+        self.arrived = true;
+        self.hold(row);
+        if !self.cut && self.rows >= self.cut_at {
+            self.cut();
+        }
+    }
+
+    fn hold(&mut self, row: HeldRow) {
+        let bucket = self.bounds.partition_point(|bound| *bound <= row.0);
+        self.at
+            .entry(row.1)
+            .or_default()
+            .push((bucket as u32, self.buckets[bucket].len() as u32));
+        self.buckets[bucket].push(Some(row));
+        self.rows += 1;
+    }
+
+    /// Cuts the order into stretches of as many of the held rows each, if there are enough
+    /// rows for the stretches the build's estimated size asks for; `plain` if it has none, or
+    /// one stretch would do.
+    fn cut(&mut self) {
+        let mut tokens: Vec<u64> = self.buckets[0].iter().flatten().map(|row| row.2).collect();
+        let Some(rows) = estimate_rows(&mut tokens) else {
+            self.plain = true;
+            return;
+        };
+        let count = (rows as usize).div_ceil(self.stretch_rows).min(STRETCH_MAX);
+        if count < 2 {
+            // One stretch is the whole order: nothing to hold the rows for.
+            self.plain = true;
+            return;
+        }
+        if self.rows < count * STRETCH_SAMPLE_ROWS_EACH {
+            self.cut_at = count * STRETCH_SAMPLE_ROWS_EACH;
+            return;
+        }
+        let mut held: Vec<HeldRow> = self.buckets[0].drain(..).flatten().collect();
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        self.bounds = (1..count)
+            .map(|stretch| held[stretch * held.len() / count].0.clone())
+            .collect();
+        self.bounds.dedup();
+        self.cut = true;
+        self.buckets = (0..=self.bounds.len()).map(|_| Vec::new()).collect();
+        self.at.clear();
+        self.rows = 0;
+        for row in held {
+            self.hold(row);
+        }
+    }
+
+    /// Takes out the held documents of `primary_id`, and returns their guards.
+    fn remove(&mut self, primary_id: PrimaryId) -> Vec<AsyncInProgress> {
+        let mut guards = Vec::new();
+        for (bucket, place) in self.at.remove(&primary_id).unwrap_or_default() {
+            if let Some(row) = self.buckets[bucket as usize][place as usize].take() {
+                self.rows -= 1;
+                guards.push(row.4);
+            }
+        }
+        guards
+    }
+
+    /// Whether more rows are held than a build keeps: the fullest stretch is to be written.
+    fn is_full(&self) -> bool {
+        self.cut && self.rows > self.buckets.len() * STRETCH_HELD_ROWS
+    }
+
+    /// The rows of one stretch, in the order of their keys: the fullest, or with `first` the
+    /// first that holds any.
+    fn take(&mut self, first: bool) -> Vec<HeldRow> {
+        let bucket = if first {
+            self.buckets.iter().position(|bucket| !bucket.is_empty())
+        } else {
+            (0..self.buckets.len()).max_by_key(|&bucket| self.buckets[bucket].len())
+        };
+        let Some(bucket) = bucket else {
+            return Vec::new();
+        };
+        let mut held: Vec<HeldRow> = std::mem::take(&mut self.buckets[bucket])
+            .into_iter()
+            .flatten()
+            .collect();
+        for row in &held {
+            if let Some(places) = self.at.get_mut(&row.1) {
+                places.retain(|place| place.0 as usize != bucket);
+                if places.is_empty() {
+                    self.at.remove(&row.1);
+                }
+            }
+        }
+        self.rows -= held.len();
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        held
+    }
+}
+
 pub(crate) struct Writer {
     writer: IndexWriter,
     /// How many threads `writer` indexes with.
@@ -81,6 +284,8 @@ pub(crate) struct Writer {
     held: Vec<Option<(CommitKey, TantivyDocument)>>,
     /// Where in `held` each row's documents are.
     held_at: HashMap<PrimaryId, Vec<usize>>,
+    /// The rows of a build held by stretch of the order, once one has come.
+    stretches: Option<Stretches>,
 }
 
 impl Writer {
@@ -110,6 +315,7 @@ impl Writer {
             uncommitted_docs_in_progress_guards: Vec::new(),
             held: Vec::new(),
             held_at: HashMap::new(),
+            stretches: None,
         })
     }
 
@@ -121,7 +327,28 @@ impl Writer {
         key: Option<CommitKey>,
         doc: TantivyDocument,
         mut in_progress: AsyncInProgress,
+        build: Option<BuildRow>,
     ) -> tantivy::Result<usize> {
+        // A row of a build is held by stretch of the order, or, where the build's size is not
+        // to be had, written as the other rows are: see `Stretches`.
+        let mut doc = doc;
+        if let (Some(_), Some(build)) = (&key, build) {
+            if self.stretches.is_none() {
+                let placed = self.writer.index().schema().get_field(build.placed)?;
+                self.stretches = Some(Stretches::new(build.stretch_rows as usize, placed));
+            }
+            let stretches = self.stretches.as_mut().unwrap();
+            if !stretches.plain {
+                in_progress.applied();
+                let key = key.unwrap();
+                stretches.add((key, primary_id, build.token, doc, in_progress));
+                if stretches.plain {
+                    self.write_plain();
+                }
+                return Ok(self.uncommitted_docs());
+            }
+            doc.add_u64(stretches.placed, 0);
+        }
         match key {
             Some(key) => {
                 self.held_at
@@ -151,6 +378,10 @@ impl Writer {
         // after: the row's are dropped here instead.
         for at in self.held_at.remove(&primary_id).unwrap_or_default() {
             self.held[at] = None;
+        }
+        if let Some(stretches) = &mut self.stretches {
+            let guards = stretches.remove(primary_id);
+            self.uncommitted_docs_in_progress_guards.extend(guards);
         }
         self.writer.delete_term(term);
         self.uncommitted_docs_in_progress_guards.push(in_progress);
@@ -187,11 +418,96 @@ impl Writer {
         }
     }
 
+    /// Writes one stretch of a build's held rows, as contiguous groups in the order of the
+    /// keys, one for each thread, marked as placed: the fullest stretch, or with `first` the
+    /// first that holds any. Their guards go with the next commit's.
+    fn write_stretch(&mut self, first: bool) {
+        let Some(stretches) = &mut self.stretches else {
+            return;
+        };
+        let placed = stretches.placed;
+        let held = stretches.take(first);
+        let groups = (held.len() / HELD_GROUP_DOCS).clamp(1, self.threads);
+        let size = held.len().div_ceil(groups).max(1);
+        let mut group = Vec::with_capacity(size);
+        for (_, _, _, mut doc, guard) in held {
+            doc.add_u64(placed, 1);
+            group.push(UserOperation::Add(doc));
+            self.uncommitted_docs_in_progress_guards.push(guard);
+            if group.len() == size {
+                self.run(std::mem::replace(&mut group, Vec::with_capacity(size)));
+            }
+        }
+        self.run(group);
+    }
+
+    fn run(&mut self, group: Vec<UserOperation>) {
+        if group.is_empty() {
+            return;
+        }
+        if let Err(err) = self.writer.run(group) {
+            error!("tantivy: failed to add documents: {err}");
+        }
+    }
+
+    /// Hands the rows of a build held so far to `held`, as rows written as they came: the
+    /// build's size is not to be had, or the build ended before it was.
+    fn write_plain(&mut self) {
+        let Some(stretches) = &mut self.stretches else {
+            return;
+        };
+        let placed = stretches.placed;
+        while stretches.rows > 0 {
+            for (key, primary_id, _, mut doc, guard) in stretches.take(true) {
+                doc.add_u64(placed, 0);
+                self.held_at
+                    .entry(primary_id)
+                    .or_default()
+                    .push(self.held.len());
+                self.held.push(Some((key, doc)));
+                self.uncommitted_docs_in_progress_guards.push(guard);
+            }
+        }
+    }
+
+    /// The commit of a tick. When no row of a build came since the last one, the build has
+    /// ended or stalled, and the rows held by stretch are all written: a stretch a commit, so
+    /// that no segment holds two.
+    fn commit_on_tick(&mut self) -> tantivy::Result<(Opstamp, Vec<AsyncInProgress>)> {
+        let quiet = self
+            .stretches
+            .as_mut()
+            .is_some_and(|stretches| !std::mem::take(&mut stretches.arrived));
+        if quiet {
+            if self
+                .stretches
+                .as_ref()
+                .is_some_and(|stretches| !stretches.cut)
+            {
+                self.write_plain();
+            }
+            self.write_held();
+            while self.stretches.as_ref().is_some_and(|held| held.rows > 0) {
+                self.write_stretch(true);
+                self.writer.commit()?;
+            }
+        }
+        self.commit()
+    }
+
     /// Commits the documents to the index and returns the commit opstamp with their in-progress
     /// guards.
     fn commit(&mut self) -> tantivy::Result<(Opstamp, Vec<AsyncInProgress>)> {
         self.write_held();
-        let opstamp = self.writer.commit()?;
+        // A stretch a commit: two written in one would share the threads' segments.
+        let mut opstamp = self.writer.commit()?;
+        while self.stretches.as_ref().is_some_and(Stretches::is_full) {
+            self.write_stretch(false);
+            opstamp = self.writer.commit()?;
+        }
+        if let Some(stretches) = &mut self.stretches {
+            stretches.since_commit = 0;
+        }
         Ok((
             opstamp,
             mem::take(&mut self.uncommitted_docs_in_progress_guards),
@@ -200,6 +516,17 @@ impl Writer {
 
     fn uncommitted_docs(&self) -> usize {
         self.uncommitted_docs_in_progress_guards.len()
+            + self
+                .stretches
+                .as_ref()
+                .map_or(0, |stretches| stretches.since_commit)
+    }
+
+    /// Whether a build's rows are held by stretch of the order.
+    fn holds_by_stretch(&self) -> bool {
+        self.stretches
+            .as_ref()
+            .is_some_and(|stretches| stretches.cut)
     }
 
     /// Re-adds `docs` under fresh opstamps after deleting whatever carried their terms: the delete
@@ -210,6 +537,7 @@ impl Writer {
         docs: impl IntoIterator<Item = (tantivy::Term, TantivyDocument)>,
     ) -> tantivy::Result<usize> {
         // A held document of one of these rows would be written after its copy here.
+        self.write_plain();
         self.write_held();
         let mut count = 0;
         for (term, doc) in docs {
@@ -231,6 +559,10 @@ impl Writer {
 
     fn has_uncommitted_docs(&self) -> bool {
         !self.uncommitted_docs_in_progress_guards.is_empty()
+            || self
+                .stretches
+                .as_ref()
+                .is_some_and(|stretches| stretches.rows > 0)
     }
 }
 
@@ -388,6 +720,8 @@ enum Change {
         in_progress: AsyncInProgress,
         /// The uncommitted documents at which the change commits.
         commit_threshold: usize,
+        /// What a row of a build brings, to be held by stretch of the order.
+        build: Option<BuildRow>,
     },
     Remove {
         primary_id: PrimaryId,
@@ -441,6 +775,8 @@ pub(crate) struct Index<E = ()> {
     /// The changes waiting for the writer on their workers now, the queue being full: see
     /// `let_writes_in`.
     writes_waiting: AtomicU64,
+    /// Whether a build's rows are held by stretch of the order: see `Stretches`.
+    pub(crate) held_by_stretch: std::sync::atomic::AtomicBool,
     pub(crate) reader: Reader,
     pub(crate) schema: Schema,
     pub(crate) state: E,
@@ -483,6 +819,7 @@ impl<E> Index<E> {
             writer,
             changes: Mutex::new(VecDeque::new()),
             writes_waiting: AtomicU64::new(0),
+            held_by_stretch: std::sync::atomic::AtomicBool::new(false),
             reader,
             schema,
             state,
@@ -560,6 +897,7 @@ impl<E> Index<E> {
             let Some(change) = self.changes.lock().unwrap().pop_front() else {
                 return;
             };
+            let tick = matches!(change, Change::Commit);
             let commit = match change {
                 Change::Add {
                     primary_id,
@@ -567,13 +905,18 @@ impl<E> Index<E> {
                     doc,
                     in_progress,
                     commit_threshold,
+                    build,
                 } => {
                     let pending = writer
-                        .add_document(primary_id, commit_key, doc, in_progress)
+                        .add_document(primary_id, commit_key, doc, in_progress, build)
                         .unwrap_or_else(|err| {
                             error!("tantivy: failed to add document {primary_id:?}: {err}");
                             writer.uncommitted_docs()
                         });
+                    if build.is_some() {
+                        self.held_by_stretch
+                            .store(writer.holds_by_stretch(), Ordering::Relaxed);
+                    }
                     pending >= commit_threshold
                 }
                 Change::Remove {
@@ -587,7 +930,13 @@ impl<E> Index<E> {
                 Change::Commit => writer.has_uncommitted_docs(),
             };
             if commit {
-                match off_the_runtime(|| writer.commit()) {
+                match off_the_runtime(|| {
+                    if tick {
+                        writer.commit_on_tick()
+                    } else {
+                        writer.commit()
+                    }
+                }) {
                     Ok((commit_opstamp, guards)) => self
                         .reader
                         .drop_guards_when_searchable(commit_opstamp, guards),
@@ -737,7 +1086,7 @@ where
         document: String,
         in_progress: AsyncInProgress,
     ) {
-        self.add_document_with(primary_id, in_progress, None, move |index| {
+        self.add_document_with(primary_id, in_progress, None, None, move |index| {
             create_doc(&index.schema, primary_id, &document)
         })
         .await;
@@ -751,6 +1100,7 @@ where
         primary_id: PrimaryId,
         in_progress: AsyncInProgress,
         commit_key: Option<CommitKey>,
+        build: Option<BuildRow>,
         make_doc: impl FnOnce(&Index<E>) -> TantivyDocument + Send + 'static,
     ) {
         let Some(index) = self.get_or_create() else {
@@ -773,6 +1123,7 @@ where
                     doc,
                     in_progress,
                     commit_threshold,
+                    build,
                 });
             })
             .await;
@@ -1005,21 +1356,21 @@ mod tests {
         {
             let mut writer = index.lock_writer();
             writer
-                .add_document(1.into(), key(30), doc(1, "one"), guard())
+                .add_document(1.into(), key(30), doc(1, "one"), guard(), None)
                 .unwrap();
             writer
-                .add_document(2.into(), key(10), doc(2, "gone"), guard())
+                .add_document(2.into(), key(10), doc(2, "gone"), guard(), None)
                 .unwrap();
             writer
-                .add_document(3.into(), key(20), doc(3, "old"), guard())
+                .add_document(3.into(), key(20), doc(3, "old"), guard(), None)
                 .unwrap();
             writer
-                .add_document(4.into(), key(5), doc(4, "four"), guard())
+                .add_document(4.into(), key(5), doc(4, "four"), guard(), None)
                 .unwrap();
             writer.rm_document(2.into(), term(2), guard());
             writer.rm_document(3.into(), term(3), guard());
             writer
-                .add_document(3.into(), key(20), doc(3, "new"), guard())
+                .add_document(3.into(), key(20), doc(3, "new"), guard(), None)
                 .unwrap();
             index.commit_and_reload(&mut writer).unwrap();
         }
@@ -1060,6 +1411,7 @@ mod tests {
             doc: create_doc(&index.schema, id.into(), text),
             in_progress: AsyncInProgress::none(),
             commit_threshold: 4,
+            build: None,
         };
         let held = index.lock_writer();
         index.change(add(1, "old"));
@@ -1079,5 +1431,152 @@ mod tests {
         index.reader.inner.reload().unwrap();
         let searcher = index.reader.searcher();
         assert_eq!(searcher.num_docs(), 2);
+    }
+
+    fn random(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    /// The tokens a scan has read so far -- the lowest of some ranges of the ring -- say how
+    /// many rows the table has; the rows of a few wide partitions do not.
+    #[test]
+    fn the_rows_of_a_table_are_estimated_from_the_tokens_a_scan_has_read() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15;
+        let mut table: Vec<u64> = (0..1_000_000).map(|_| random(&mut seed)).collect();
+        table.sort_unstable();
+        // 128 ranges of as many rows, 36 of them being read, 500 rows into each.
+        let mut read: Vec<u64> = table
+            .chunks(table.len() / 128)
+            .take(36)
+            .flat_map(|range| range[..500].to_vec())
+            .collect();
+        let rows = estimate_rows(&mut read).unwrap();
+        assert!((850_000..1_150_000).contains(&rows), "{rows}");
+
+        // Two rows a partition, in a table of 200,000 partitions.
+        let mut table: Vec<u64> = (0..200_000).map(|_| random(&mut seed)).collect();
+        table.sort_unstable();
+        let mut read: Vec<u64> = table
+            .chunks(table.len() / 128)
+            .take(36)
+            .flat_map(|range| range[..250].iter().flat_map(|&token| [token; 2]))
+            .collect();
+        let rows = estimate_rows(&mut read).unwrap();
+        assert!((340_000..460_000).contains(&rows), "{rows}");
+
+        // A hundred rows a partition come together, and lie together: nothing to cut.
+        let mut read: Vec<u64> = table[..200]
+            .iter()
+            .flat_map(|&token| [token; 100])
+            .collect();
+        assert_eq!(estimate_rows(&mut read), None);
+    }
+
+    /// The rows of a build, which come in no order, are held and written a stretch of the
+    /// order at a time: every segment holds the rows of one stretch, marked as placed. A row
+    /// keeps its guard until it is written, and one removed while held is not written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_rows_of_a_build_are_written_a_stretch_of_the_order_at_a_time() {
+        const ROWS: u64 = 60_000;
+        let mut schema = Schema::builder();
+        schema.add_u64_field("primary_id", INDEXED | STORED | FAST);
+        schema.add_text_field("text", TEXT | STORED);
+        schema.add_u64_field("key", FAST);
+        schema.add_u64_field("placed", FAST);
+        let index = Index::new(
+            schema.build(),
+            "default",
+            TextAnalyzer::from(SimpleTokenizer::default()),
+            &make_index_key(),
+            crate::worker::new(),
+        )
+        .unwrap();
+        // No merges: the segments are looked at as they were written.
+        index.set_merge_policy(Box::new(tantivy::indexer::NoMergePolicy));
+        let key_field = index.schema.get_field("key").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut seed = 0x2545_f491_4f6c_dd1d;
+        // A scan of one range over the whole ring: the tokens going up.
+        let mut tokens: Vec<u64> = (0..ROWS).map(|_| random(&mut seed)).collect();
+        tokens.sort_unstable();
+        let mut writer = index.lock_writer();
+        for id in 1..=ROWS {
+            let key = random(&mut seed);
+            let mut doc = create_doc(&index.schema, id.into(), "row");
+            doc.add_u64(key_field, key);
+            let build = BuildRow {
+                token: tokens[id as usize - 1],
+                stretch_rows: 6000,
+                placed: "placed",
+            };
+            let guard = AsyncInProgress::fullscan(tx.clone());
+            let uncommitted = writer
+                .add_document(
+                    id.into(),
+                    Some(CommitKey::from([key])),
+                    doc,
+                    guard,
+                    Some(build),
+                )
+                .unwrap();
+            if id == 5 || id == 30_000 {
+                let guard = AsyncInProgress::fullscan(tx.clone());
+                writer.rm_document(id.into(), create_term(&index.schema, id.into()), guard);
+            }
+            if uncommitted >= 10_000 {
+                index.commit_and_reload(&mut writer).unwrap();
+                // The guards left are of the rows not written yet.
+                let searchable = index.reader.searcher().num_docs();
+                let removed = u64::from(id >= 5) + u64::from(id >= 30_000);
+                assert_eq!(tx.strong_count() as u64 - 1, id - removed - searchable);
+            }
+        }
+        assert!(writer.holds_by_stretch());
+        let searchable = index.reader.searcher().num_docs();
+        assert!((1..ROWS - 2).contains(&searchable), "{searchable}");
+        // A tick after the last row writes them all.
+        let (opstamp, guards) = writer.commit_on_tick().unwrap();
+        index.reader.drop_guards_when_searchable(opstamp, guards);
+        let (opstamp, guards) = writer.commit_on_tick().unwrap();
+        index.reader.drop_guards_when_searchable(opstamp, guards);
+        index.reader.inner.reload().unwrap();
+        drop(writer);
+        assert_eq!(tx.strong_count(), 1);
+
+        let searcher = index.reader.searcher();
+        assert_eq!(searcher.num_docs(), ROWS - 2);
+        // The segments' spans, lowest first, fall into ten stretches that do not overlap.
+        let mut spans: Vec<(u64, u64, u64)> = searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| {
+                let placed = segment.fast_fields().u64("placed").unwrap();
+                assert_eq!(placed.min_value(), 1);
+                let keys = segment.fast_fields().u64("key").unwrap();
+                (
+                    keys.min_value(),
+                    keys.max_value(),
+                    u64::from(segment.num_docs()),
+                )
+            })
+            .collect();
+        spans.sort_unstable();
+        let mut stretches: Vec<(u64, u64)> = Vec::new();
+        for (min, max, rows) in spans {
+            match stretches.last_mut() {
+                Some((reach, held)) if min <= *reach => {
+                    *reach = (*reach).max(max);
+                    *held += rows;
+                }
+                _ => stretches.push((max, rows)),
+            }
+        }
+        assert_eq!(stretches.len(), 10, "{stretches:?}");
+        for (_, rows) in stretches {
+            assert!((4500..7500).contains(&rows), "{rows}");
+        }
     }
 }

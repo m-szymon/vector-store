@@ -296,6 +296,47 @@ const LAG_QUIET_TICKS: u32 = 5;
 /// second), one falling behind tens of seconds.
 const REPAIR_LAG_LIMIT: Duration = Duration::from_secs(3);
 
+/// The fewest segments of one stretch merged while a build held by stretch goes on: fewer
+/// merges of the same rows, and no more segments than a search-less build can carry.
+const STRETCH_MERGE_SEGMENTS: usize = 8;
+
+/// A benchmark test's switch: a build's rows written as they came, as before.
+#[cfg(test)]
+static BUILD_PLAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a row of a build brings to be held by stretch of the order (`tantivy::Stretches`),
+/// for an index whose rows a build brings in no order: one with a segment cap and a repair,
+/// in the scattered order of partitions. A stretch is to end with three fifths of the cap, so
+/// that its segments merge into one with room left beside it. In token order a scan brings
+/// the rows in the index's own order, and its segments are taken as they are.
+fn build_row(
+    table: &RwLock<impl TableSearch>,
+    options: &IndexOptionsPattern,
+    key_layout: &KeyLayout,
+    partition_id: PartitionId,
+    primary_id: PrimaryId,
+) -> Option<crate::tantivy::BuildRow> {
+    #[cfg(test)]
+    if BUILD_PLAIN.load(Relaxed) {
+        return None;
+    }
+    let cap = (*options.segment_max_docs.as_ref())?;
+    if !*options.rewrite_wide_segments.as_ref()
+        || options.partition_order != crate::PartitionOrder::Scattered
+    {
+        return None;
+    }
+    let primary_key = table
+        .read()
+        .unwrap()
+        .primary_key(partition_id, primary_id)?;
+    Some(crate::tantivy::BuildRow {
+        token: key_layout.token_key(&primary_key)?,
+        stretch_rows: cap.get() / 5 * 3,
+        placed: REPAIRED_FIELD,
+    })
+}
+
 /// How full a merge of ordered neighbours may make a segment: three quarters of the cap, so that
 /// fresh rows repaired into its stretch later fit beside it, and merge into it, before it has to
 /// be split.
@@ -1460,8 +1501,9 @@ impl PatternBackend {
 pub(crate) struct PatternRow<'a> {
     pub(crate) text: &'a str,
     pub(crate) prefix: Option<SortPrefix>,
-    /// Placed by a repair step rather than ingested: see `REPAIRED_FIELD`.
-    pub(crate) repaired: bool,
+    /// Placed by a repair step rather than ingested: see `REPAIRED_FIELD`. None for a row of
+    /// a build held by stretch of the order, which the writer marks as it writes it.
+    pub(crate) repaired: Option<bool>,
 }
 
 impl PatternBackend {
@@ -1511,10 +1553,12 @@ impl PatternBackend {
         for (slot, field) in self.slot_fields().iter().enumerate() {
             doc.add_u64(schema.get_field(field).unwrap(), prefix.0[slot]);
         }
-        doc.add_u64(
-            schema.get_field(REPAIRED_FIELD).unwrap(),
-            u64::from(row.repaired),
-        );
+        if let Some(repaired) = row.repaired {
+            doc.add_u64(
+                schema.get_field(REPAIRED_FIELD).unwrap(),
+                u64::from(repaired),
+            );
+        }
         doc
     }
 
@@ -1571,7 +1615,28 @@ impl PatternBackend {
         // The runs are still cut from every live segment, not from the idle ones alone, which
         // would make a busy segment's neighbours look adjacent and merge them across it into a
         // segment overlapping it.
-        let runs: Vec<(Vec<SegmentId>, bool)> = merge_runs(&pieces, max_docs.get())
+        let runs = merge_runs(&pieces, max_docs.get());
+        // While a build held by stretch goes on, a stretch's segments merge alone, and only
+        // once there are several: merged with its neighbours, as ordered segments otherwise
+        // are, a stretch would be part of a segment that the rows still to come overfill.
+        let building = state.held_by_stretch.load(Relaxed)
+            && (self.scan_rows.load(Relaxed)
+                || self.ticks_since_scan.load(Relaxed) < SCAN_QUIET_TICKS);
+        let runs = if building {
+            let tiers = ordered_tier(&pieces);
+            let cap = u64::from(max_docs.get());
+            clusters(&pieces, &tiers)
+                .into_iter()
+                .filter(|cluster| {
+                    cluster.docs <= cap && cluster.ids.len() >= STRETCH_MERGE_SEGMENTS
+                })
+                .map(|cluster| (cluster.ids, true))
+                .chain(runs.into_iter().filter(|(_, ordered)| !ordered))
+                .collect()
+        } else {
+            runs
+        };
+        let runs: Vec<(Vec<SegmentId>, bool)> = runs
             .into_iter()
             .filter(|(run, _)| !run.iter().any(|id| busy.contains(id)))
             .collect();
@@ -1796,7 +1861,7 @@ fn read_rows(
             PatternRow {
                 text,
                 prefix: Some(columns.prefix(doc_id)),
-                repaired: true,
+                repaired: Some(true),
             },
         );
         rows.push((
@@ -3565,6 +3630,17 @@ pub(crate) fn new(
                             }
                             let scanned = in_progress.is_fullscan();
                             let lag = in_progress.lag();
+                            // A build's row is held by stretch of the order, and the writer
+                            // says whether it was written where it belongs.
+                            let build = prefix.filter(|_| scanned).and_then(|_| {
+                                build_row(
+                                    table.as_ref(),
+                                    &index.options,
+                                    &index.key_layout,
+                                    partition_id,
+                                    primary_id,
+                                )
+                            });
                             indexes
                                 .add_document_with(
                                     primary_id,
@@ -3572,6 +3648,7 @@ pub(crate) fn new(
                                     prefix
                                         .filter(|_| !walk_off(OFF_SORTED_COMMITS))
                                         .map(|prefix| Box::from(prefix.0)),
+                                    build,
                                     move |index| {
                                     if scanned {
                                         index.backend().scan_rows.store(true, Relaxed);
@@ -3585,7 +3662,7 @@ pub(crate) fn new(
                                         PatternRow {
                                             text: &document,
                                             prefix,
-                                            repaired: false,
+                                            repaired: build.is_none().then_some(false),
                                         },
                                     )
                                     },
@@ -6425,7 +6502,9 @@ mod tests {
         let mut quiet = 0;
         loop {
             let stats = sender.stats(make_index_key()).await.unwrap();
-            let still = stats.rewrite.docs_rewritten > 0
+            // Rows were moved, or none had to be: a build held by stretch of the order leaves
+            // segments that overlap only until those of each stretch are merged.
+            let still = (stats.rewrite.docs_rewritten > 0 || stats.overlap.depth_max <= 1)
                 && !stats.rewrite.pending
                 && stats.merges.running == 0
                 && done(&stats);
@@ -7717,6 +7796,11 @@ mod tests {
         // each writer, when given.
         worker::BACKGROUND_CAP_IS.store(env("BUILD_CAP_IS", 0), Relaxed);
         crate::tantivy::WRITER_THREADS.store(env("BUILD_WRITER_THREADS", 0), Relaxed);
+        // BUILD_STRETCH=off: the builds' rows written as they came, as before.
+        BUILD_PLAIN.store(
+            std::env::var("BUILD_STRETCH").is_ok_and(|stretch| stretch == "off"),
+            Relaxed,
+        );
         crate::tantivy::TICK_COMMIT_INDEXING.store(
             std::env::var("BUILD_TICK").is_ok_and(|tick| tick == "indexing"),
             Relaxed,
@@ -7913,8 +7997,28 @@ mod tests {
             .iter()
             .map(|built| {
                 let built = built.clone();
+                // BUILD_SHUFFLE=scan: the rows in the order of their tokens, as a scan of the
+                // table brings them, which for a scattered index is no order at all; random: in
+                // an order drawn at random; else in a few sorted sweeps, interleaved.
+                let shuffle = std::env::var("BUILD_SHUFFLE").unwrap_or_default();
+                let random = shuffle == "random";
                 tokio::spawn(async move {
-                    for primary in shuffled(build_rows) {
+                    let mut order: Vec<u64> = shuffled(build_rows).collect();
+                    if random {
+                        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+                        for i in (1..order.len()).rev() {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            order.swap(i, (seed % (i as u64 + 1)) as usize);
+                        }
+                    }
+                    if shuffle == "scan" {
+                        order.sort_by_cached_key(|&id| {
+                            partition_place(id, crate::PartitionOrder::Token)
+                        });
+                    }
+                    for primary in order {
                         let (tx, _rx) = mpsc::channel(1);
                         built
                             .add_document(
@@ -7953,9 +8057,34 @@ mod tests {
             let before = reading();
             let started = Instant::now();
             for built in &built {
-                settled(built, 3600, |stats| stats.overlap.fresh_rows == 0).await;
+                // Nothing may be rewritten: settled once nothing is fresh, pending or being
+                // merged, and the segments have stayed the same for 8 s (past the ticks a
+                // scan counts as going on for).
+                let (mut quiet, mut segments) = (0, 0);
+                while quiet < 80 {
+                    let stats = built.stats(make_index_key()).await.unwrap();
+                    let still = !stats.rewrite.pending
+                        && stats.merges.running == 0
+                        && stats.overlap.fresh_rows == 0
+                        && stats.tantivy.segment_count == segments;
+                    segments = stats.tantivy.segment_count;
+                    quiet = if still { quiet + 1 } else { 0 };
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
             repaired = started.elapsed();
+            for built in &built {
+                let stats = built.stats(make_index_key()).await.unwrap();
+                println!(
+                    "BUILD layout: {} segments, depth max {}, mean {:.2}, {} rows rewritten in {} steps, {} merges",
+                    stats.tantivy.segment_count,
+                    stats.overlap.depth_max,
+                    stats.overlap.depth_rows as f64 / stats.overlap.rows.max(1) as f64,
+                    stats.rewrite.docs_rewritten,
+                    stats.rewrite.steps,
+                    stats.merges.started,
+                );
+            }
             spent("beside the repairs", &before, &reading(), repaired);
         }
         if let Some(trace) = worker::TRACE.lock().unwrap().take() {
