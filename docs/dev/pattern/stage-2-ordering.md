@@ -867,10 +867,62 @@ nothing to repair; scattered they arrive in no order, and the build is the load 
 no order measured above, about 90 s of indexing and 200 s of repair, each row written twice.
 Settled, a page of 20 costs the same (median 12 and 21 us over the matrix, one build each). So
 an index created on a large table pays for the spread of its reads with a build three times as
-long. What would take that away is rows dealt to a commit's segments by stretch of the order,
-not in turn: the keys of both orders are spread evenly over 64 bits, so the stretches are
-known before any row is, and the segments of one stretch from commit after commit would merge
-into ordered ones with no repair. Not started.
+long. That was so until the build's rows were held by stretch of the order, below.
+
+**A build's rows held by stretch of the order (2026-11-27).** The repair after a build writes
+every row a second time, and takes four times as long as the build. So the rows of a build
+are not committed as they come: the writer holds them (`tantivy::Stretches`), each in the
+bucket of the stretch of the order its key is in, and once 4096 a stretch are held, a commit
+writes the fullest bucket, about twice that, sorted, marked as placed (`repaired = 1`). Every
+segment then holds rows of one stretch; the segments of a stretch overlap one another and no
+other, which is a cluster of the ordered tier, and merge into the one segment the stretch
+ends as. Nothing is left for the repair.
+
+- *How many stretches.* As many as give each three fifths of the cap in the end, which takes
+  the number of rows the build brings, and nothing says it. It is estimated from the tokens
+  of the first 16,384 rows: a scan reads some ranges of the ring at once, each from its
+  lowest token up, so what it has read lies in as many clumps as dense as the table, and the
+  median gap between neighbouring tokens is ln 2 of the mean gap between partitions, whatever
+  lies between the clumps. The bounds of the stretches are then cut from those rows' keys, as
+  many of them to each, so the keys need not be spread evenly: an ordering column does as
+  well as the scattered place of a partition.
+- *When not.* An index in token order gets its rows in its own order and keeps them as they
+  come. So does a build whose rows mostly share partitions (under a quarter as many tokens
+  as rows: the rows of a partition come together and lie together), one the estimate gives a
+  single stretch, and one that ends before 16,384 rows: those are written as before, and
+  repaired as before. A build that brings more rows than estimated ends with stretches past
+  the cap, which the repair splits, as it does any cluster past the cap.
+- *The scan's count.* A row keeps its guard until the commit that writes it, so the scan
+  counts it as indexed only then, and reports itself finished when every row can be
+  searched. A row waits for about 8% of the build at most, which is how far the scan's
+  progress runs behind. The tick after the last row writes what is still held, a stretch a
+  commit; a scan that stalls for a second gets the same, which costs only smaller segments.
+- *Merges while it goes on.* Ordered segments otherwise merge with their neighbours up to
+  three quarters of the cap. During such a build that would join stretches that the rows
+  still to come then overfill, so until five ticks after the scan's last row the segments of
+  a stretch merge alone, and only once there are eight.
+- *What it holds.* About 3.4% of the build's rows at the default cap, as documents not yet
+  indexed, and no row is searchable sooner than its stretch's turn: an index being built is
+  not searched.
+
+Measured on 4 CPUs, one index of 10M rows sent in the order of their tokens, twice each
+(`BUILD_SHUFFLE=scan BUILD_ROWS=10000000 BUILD_REPAIR=1`, the old way with
+`BUILD_STRETCH=off`; the settled time includes 8 s of waiting to see nothing move):
+
+| | searchable in | settled after | rows rewritten | segments |
+| --- | --- | --- | --- | --- |
+| as they came | 58-59 s | 247-254 s | 9.95M in 50 steps | 70 |
+| by stretch | 82-83 s | 15 s | 0 | 84 |
+
+Three indexes of 3M at once: 48 s and 92 s as they came, 58 s and 32 s by stretch (24 s of
+that the waiting). The build itself is a third longer: a stretch is a commit of its own, 8000
+rows where a commit took 10,000 from every stretch, and the first rows wait for the cut.
+
+One more thing the measurement showed: the benchmark's rows "in no order" were a few sorted
+sweeps, interleaved (`i * 1_000_003 mod rows`), which commits every 10,000 rows cannot tell
+from no order, but bounds cut from the first rows can: they covered the start of each sweep
+and nothing else. A scan's rows are in the order of their tokens, which for scattered keys
+is no order at all, and `BUILD_SHUFFLE=scan` sends them so.
 
 
 #### A build beside the searches of other indexes (2026-11-24)
