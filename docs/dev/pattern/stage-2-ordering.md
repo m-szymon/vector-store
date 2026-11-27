@@ -1093,6 +1093,14 @@ searches gain; the repair pays, since it writes its rows through those threads (
 16 CPUs: 36, 40 and 50 s). A lower cap on background tasks helps the searches as much and
 slows the builds by a third to a half. Half the workers is the middle taken.
 
+The repair's share grows with the index. One index of 10M shuffled rows, built and repaired
+on an idle node of 4 CPUs (2026-11-27, `BUILD_ROWS=10000000 BUILD_REPAIR=1`, one searcher a
+second): with 2 threads the build took 50 s and the repair 247-253 s; with 4
+(`BUILD_WRITER_THREADS=4`) 58 s and 195 s. AWS run 471fcaa9 showed the same: three indexes of
+10M caught up in 636 s, where run 9a843776 with 4 threads took 681-696 s, and the one that
+needed a repair settled 471 s later instead of 280 s. Searches are served all through a
+repair, so the two threads are kept; what grows is the time until the pieces are narrow.
+
 **The budget for indexing stays at zero.** With `VECTOR_STORE_INDEXING_QUEUE_BUDGET` at
 100 ms, searches first unless a write has waited that long, the same load with 32 searchers
 took 643 s to index instead of 384, and the searches gained nothing: as many a second, p50
