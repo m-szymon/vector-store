@@ -94,8 +94,8 @@ commit written in the order of its keys" in `stage-2-ordering.md`. Left open:
   repaired: scattered writes through CDC, a bulk load through CDC. Holding them by stretch as
   a build's are (`tantivy::Stretches`) would delay when they can be searched, which a build's
   rows do not mind. Also left as before: a build in token order with ordering columns, whose
-  rows come in no order of the columns. Not yet run against a real scan: the estimate of the
-  build's size is tested on tokens made up as a scan would read them.
+  rows come in no order of the columns. Run against a real scan once, on one node with 600,000
+  rows; not yet on a cluster, nor at a size where the estimate matters more.
 - **A keyword in few rows on rows in no order** still costs nearly three times what the
   segment read whole does (1.45 ms for 0.55 ms, a page of 20 on 2M rows; 1.9 ms before the
   walk turned to a whole read after a pass that met few). Its bound on the matches is the

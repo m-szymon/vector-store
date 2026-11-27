@@ -918,6 +918,12 @@ Three indexes of 3M at once: 48 s and 92 s as they came, 58 s and 32 s by stretc
 that the waiting). The build itself is a third longer: a stretch is a commit of its own, 8000
 rows where a commit took 10,000 from every stretch, and the first rows wait for the cut.
 
+Against a real scan (one node of 2 shards, so six ranges read at once; 600,000 rows loaded,
+then the index created; the demo's compose file): serving 10 s after the `CREATE INDEX`, the
+rows in six or seven stretches where five were due (the estimate a fifth to two fifths
+high), 108 segments merged into those within a few ticks, `pattern_rewrite_docs_total` 0,
+depth 1. The scan's progress read 29% with 38% of the rows searchable.
+
 One more thing the measurement showed: the benchmark's rows "in no order" were a few sorted
 sweeps, interleaved (`i * 1_000_003 mod rows`), which commits every 10,000 rows cannot tell
 from no order, but bounds cut from the first rows can: they covered the start of each sweep
